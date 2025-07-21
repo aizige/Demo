@@ -1,0 +1,10 @@
+[ server_ext ]
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = dev.myubuntu.com
+IP.1 = 192.168.1.176
