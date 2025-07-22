@@ -2,8 +2,8 @@
 // Created by ubuntu on 2025/7/21.
 //
 
-#ifndef UNTITLED1_H2_CONNECTION_HPP
-#define UNTITLED1_H2_CONNECTION_HPP
+#ifndef UNTITLED1_H2C_CONNECTION_HPP
+#define UNTITLED1_H2C_CONNECTION_HPP
 #include "iconnection.hpp"
 #include <nghttp2/nghttp2.h>
 #include <boost/asio/experimental/promise.hpp>
@@ -17,21 +17,20 @@
 #include <iostream>
 #include <boost/asio/experimental/channel.hpp>
 
-using ResponseChannel = boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>;
-
-class Http2Connection : public IConnection, public std::enable_shared_from_this<Http2Connection> {
+class Http2cConnection : public IConnection, public std::enable_shared_from_this<Http2cConnection> {
 public:
-    using StreamType = boost::beast::ssl_stream<boost::beast::tcp_stream>;
+    using StreamType = boost::beast::tcp_stream;
     using StreamPtr = std::shared_ptr<StreamType>;
+    using ResponseChannel = boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>;
 
-    Http2Connection(StreamPtr stream, std::string pool_key);
-    ~Http2Connection() override;
+    Http2cConnection(StreamPtr stream, std::string pool_key);
+    ~Http2cConnection() override;
 
-    Http2Connection(const Http2Connection&) = delete;
-    Http2Connection& operator=(const Http2Connection&) = delete;
+    Http2cConnection(const Http2cConnection&) = delete;
+    Http2cConnection& operator=(const Http2cConnection&) = delete;
 
-    static std::shared_ptr<Http2Connection> create(StreamPtr stream, std::string key) {
-        return std::make_shared<Http2Connection>(std::move(stream), std::move(key));
+    static std::shared_ptr<Http2cConnection> create(StreamPtr stream, std::string key) {
+        return std::make_shared<Http2cConnection>(std::move(stream), std::move(key));
     }
 
     // --- IConnection 接口实现 ---
@@ -41,6 +40,8 @@ public:
     const std::string& id() const override { return id_; }
     const std::string& get_pool_key() const override { return pool_key_; }
     boost::asio::ip::tcp::socket& lowest_layer_socket() override;
+
+    boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> release_socket() override {co_return std::nullopt;}  // 明确地 override，并返回 nullopt
 
     // --- H2 客户端特定方法 ---
     void start(); // 启动器，非协程
@@ -77,7 +78,7 @@ private:
 
 
     // --- 成员变量 ---
-    StreamPtr   stream_;
+    StreamPtr stream_;
     std::string pool_key_;
     std::string id_;
     boost::asio::strand<boost::asio::any_io_executor> strand_;
@@ -89,4 +90,4 @@ private:
 };
 
 
-#endif //UNTITLED1_H2_CONNECTION_HPP
+#endif //UNTITLED1_H2C_CONNECTION_HPP

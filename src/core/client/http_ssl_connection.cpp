@@ -7,37 +7,48 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <spdlog/spdlog.h>
 
-HttpSslConnection::HttpSslConnection(boost::asio::ip::tcp::socket socket, boost::asio::ssl::context& ctx, std::string pool_key)
+/*HttpSslConnection::HttpSslConnection(boost::asio::ip::tcp::socket socket, boost::asio::ssl::context& ctx, std::string pool_key)
     : stream_(std::move(socket), ctx),
       id_(generate_simple_uuid()),
-      pool_key_(std::move(pool_key)) {}
+      pool_key_(std::move(pool_key)) {}*/
+
+HttpSslConnection::HttpSslConnection(StreamType stream, std::string pool_key)
+: stream_(std::move(stream)), // 直接移动传入的 stream
+     id_(generate_simple_uuid()),
+     pool_key_(std::move(pool_key)) {
+
+    SPDLOG_DEBUG("HttpSslConnection [{}] for pool [{}] created.", id_, pool_key_);
+}
 
 HttpSslConnection::~HttpSslConnection() { /* ... */ }
 
-boost::asio::awaitable<void> HttpSslConnection::handshake(std::string_view host) {
-    // 设置 SNI，这对于现代 HTTPS 至关重要
-    if (!SSL_set_tlsext_host_name(stream_.native_handle(), host.data())) {
 
-        // 1. 先创建一个 error_code 对象
-        boost::system::error_code ec{static_cast<int>(::ERR_get_error()), boost::asio::error::get_ssl_category()};
-        // 2. 然后用这个 error_code 对象来构造 system_error
-        throw boost::system::system_error{ec};
-    }
-    co_await stream_.async_handshake(boost::asio::ssl::stream_base::client, boost::asio::use_awaitable);
-}
 
-boost::asio::awaitable<HttpResponse> HttpSslConnection::execute(HttpRequest& request) {
+boost::asio::awaitable<HttpResponse> HttpSslConnection::execute(HttpRequest request) {
+
     try {
+        // 发送请求
         co_await http::async_write(stream_, request, boost::asio::use_awaitable);
+        SPDLOG_DEBUG("HttpsConnection [{}] request sent.", id_);
+
+        // 接收响应
         HttpResponse response;
         co_await http::async_read(stream_, buffer_, response, boost::asio::use_awaitable);
-        keep_alive_ = response.keep_alive();
+        SPDLOG_DEBUG("HttpsConnection [{}] response received with status {}.", id_, response.result_int());
 
+        // 检查是否应该保持连接
+        if ( response.result_int() >= 300) {
+            keep_alive_ = false;
+        } else {
+            keep_alive_ = response.keep_alive();
+        }
 
-
+        // 返回响应
         co_return response;
-    } catch (const std::exception& e) {
-        this->close();
+    } catch (const boost::system::system_error& e) {
+        SPDLOG_ERROR("HttpsConnection [{}] error: {}", id_, e.what());
+        close(); // 出错时关闭连接
+        // 将异常重新抛出，让调用者知道操作失败了
         throw;
     }
 }
@@ -46,11 +57,12 @@ bool HttpSslConnection::is_usable() const {
     return stream_.next_layer().socket().is_open() && keep_alive_;
 }
 
-void HttpSslConnection::close() {
+boost::asio::awaitable<void> HttpSslConnection::close() {
     keep_alive_ = false;
     boost::system::error_code ec;
     stream_.next_layer().socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
     stream_.next_layer().close();
+    co_return;
 }
 
 const std::string& HttpSslConnection::id() const { return id_; }

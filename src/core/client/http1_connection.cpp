@@ -21,7 +21,7 @@ Http1Connection::Http1Connection(tcp::socket socket, std::string pool_key)
 
 
 // 实现 execute 协程
-boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest& request) {
+boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest request) {
     try {
         // 发送请求
         co_await http::async_write(socket_, request, boost::asio::use_awaitable);
@@ -54,7 +54,7 @@ bool Http1Connection::is_usable() const {
     return socket_.socket().is_open() && keep_alive_;
 }
 
-void Http1Connection::close() {
+boost::asio::awaitable<void> Http1Connection::close() {
     if (socket_.socket().is_open()) {
         boost::beast::error_code ec;
         // Best effort shutdown
@@ -65,4 +65,10 @@ void Http1Connection::close() {
         }
     }
     keep_alive_ = false; // 标记为不可用
+    co_return;
+}
+
+boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> Http1Connection::release_socket() {
+    co_await this->close();
+    co_return std::move(socket_.socket());
 }

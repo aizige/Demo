@@ -113,19 +113,19 @@
       <window_info anchor="bottom" id="Database Changes" />
       <window_info anchor="bottom" id="TypeScript" />
       <window_info anchor="bottom" id="Python Packages" />
-      <window_info anchor="bottom" id="TODO" />
       <window_info anchor="bottom" id="File Transfer" />
       <window_info anchor="bottom" id="Vcpkg" />
       <window_info anchor="bottom" id="clangd" />
       <window_info anchor="bottom" id="Version Control" order="0" />
       <window_info anchor="bottom" id="Problems" order="1" />
-      <window_info anchor="bottom" id="Problems View" order="2" weight="0.35811782" />
-      <window_info anchor="bottom" id="Terminal" order="3" weight="0.5563937" />
-      <window_info anchor="bottom" id="Services" order="4" weight="0.5563937" />
-      <window_info anchor="bottom" id="CMake" order="5" weight="0.34015805" />
-      <window_info anchor="bottom" id="Messages" order="6" weight="0.34015805" />
-      <window_info anchor="bottom" id="Run" order="7" weight="0.47377872" />
-      <window_info anchor="bottom" id="Find" order="8" weight="0.5053879" />
+      <window_info anchor="bottom" id="Problems View" order="2" weight="0.3214799" />
+      <window_info anchor="bottom" id="Terminal" order="3" weight="0.3214799" />
+      <window_info anchor="bottom" id="Services" order="4" weight="0.3214799" />
+      <window_info anchor="bottom" id="CMake" order="5" weight="0.4285201" />
+      <window_info anchor="bottom" id="Messages" order="6" weight="0.4285201" />
+      <window_info anchor="bottom" id="Run" order="7" weight="0.4285201" />
+      <window_info anchor="bottom" id="Find" order="8" weight="0.3214799" />
+      <window_info anchor="bottom" id="TODO" order="9" weight="0.3214799" />
       <window_info anchor="right" id="make" side_tool="true" />
       <window_info anchor="right" id="Python Console" />
       <window_info anchor="right" id="Coverage" side_tool="true" />
@@ -164,7 +164,7 @@
       <workItem from="1753003286445" duration="14000" />
       <workItem from="1753003308505" duration="7594000" />
       <workItem from="1753029976026" duration="2210000" />
-      <workItem from="1753089593921" duration="27838000" />
+      <workItem from="1753089593921" duration="57080000" />
     </task>
     <servers />
   </component>
@@ -175,6 +175,17 @@
     <isAutomaticCheckingOnLaunch value="false" />
     <isAutomaticFoundErrors value="true" />
     <isAutomaticReloadCMake value="true" />
+  </component>
+  <component name="XDebuggerManager">
+    <breakpoint-manager>
+      <breakpoints>
+        <line-breakpoint enabled="true" type="com.jetbrains.cidr.execution.debugger.OCBreakpointType">
+          <url>file://$USER_HOME$/.conan2/p/b/libnge5158f2eb630e/p/include/nghttp2/nghttp2.h</url>
+          <line>776</line>
+          <option name="timeStamp" value="2" />
+        </line-breakpoint>
+      </breakpoints>
+    </breakpoint-manager>
   </component>
   <component name="XSLT-Support.FileAssociations.UIState">
     <expand />

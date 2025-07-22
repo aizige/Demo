@@ -38,9 +38,10 @@ add_executable(untitled1
         src/core/client/http_ssl_connection.cpp
         src/core/client/http_ssl_connection.hpp
         src/core/client/connection_helpers.hpp
-        src/core/client/h2_connection_base.hpp
         src/core/client/h2_connection.cpp
         src/core/client/h2_connection.hpp
+        src/core/client/h2c_connection.cpp
+        src/core/client/h2c_connection.hpp
 
 )
 

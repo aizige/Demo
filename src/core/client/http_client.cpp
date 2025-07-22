@@ -6,6 +6,8 @@
 #include <ada.h>
 #include <boost/asio/detail/impl/scheduler.ipp>
 
+#include "h2c_connection.hpp"
+#include "h2_connection.hpp"
 #include "iconnection.hpp"
 #include "utils/decompression_manager.hpp"
 
@@ -61,6 +63,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
     http::verb current_method = method;
     std::string current_body = std::move(body);
     Headers current_headers = headers;
+    bool is_first_request = true; // [新增] 标志位，用于判断是否是第一次请求
 
     while (redirects_left-- >= 0) {
         ParsedUrl target = parse_url(current_url);
@@ -83,6 +86,19 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
             req.set(field.name(), field.value());
         }
 
+        // --- **[新增]** H2C Upgrade 头部注入 ---
+        // 只在第一次请求、明文HTTP、且是幂等方法时尝试升级
+        if (is_first_request && target.scheme == "http" && (current_method == http::verb::get || current_method == http::verb::head))
+        {
+            req.set(http::field::connection, "Upgrade, HTTP2-Settings");
+            req.set(http::field::upgrade, "h2c");
+
+            // HTTP2-Settings header: base64url 编码的空 SETTINGS 帧 payload
+            // 对于客户端请求，一个空的 settings payload "AAAAAA==" 是常见且安全的
+            req.set(http::field::http2_settings, "AAAAAA==");
+        }
+        is_first_request = false; // 后续重定向不再是第一次请求
+
         // 设置 body
         if (!current_body.empty()) {
             if (req.find(http::field::content_type) == req.end()) {
@@ -93,7 +109,35 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
         }
 
         // 2. 执行一次请求
-        HttpResponse res = co_await execute_internal(req, target);
+        auto [res, conn] = co_await execute_internal(req, target);
+
+        // --- **[新增]** H2C Upgrade 响应处理 ---
+        if (res.result() == http::status::switching_protocols &&res.count(http::field::upgrade) &&boost::beast::iequals(res.at(http::field::upgrade), "h2c"))
+        {
+            spdlog::info("H2C Upgrade successful for {}. Replacing connection.", current_url);
+
+
+
+            // a. 从 Http1Connection 中“窃取” socket
+            auto socket_opt = co_await  conn->release_socket();
+            if (!socket_opt || !socket_opt->is_open()) {
+                throw std::runtime_error("Failed to release socket for H2C upgrade.");
+            }
+
+            // b. 创建一个新的 H2cConnection
+            auto h2c_stream = std::make_shared<Http2cConnection::StreamType>(std::move(*socket_opt));
+            auto h2c_conn = std::make_shared<Http2cConnection>(h2c_stream, conn->get_pool_key());
+            // c. 启动 H2C 会话（发送 preface settings）
+            h2c_conn->start();
+
+            // d. 在连接池中用新连接替换旧连接
+            manager_->replace_connection(conn, h2c_conn);
+
+            // e. 在【新的 H2C 连接】上【重新发送】原始请求
+            //    我们直接 co_return，因为升级后不会再有重定向
+            co_return co_await h2c_conn->execute(req);
+        }
+
 
         // 3. 检查是否是重定向状态码
         auto status_code = res.result_int();
@@ -161,7 +205,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
     }
 
     // 不可达，但为了编译器满意
-    throw std::runtime_error("Redirect loop finished unexpectedly.");
+    throw std::runtime_error("Too many redirects.");
 }
 
 // 创建一个辅助函数来检查错误码，让代码更干净
@@ -172,7 +216,7 @@ bool is_retryable_network_error(const boost::system::error_code& ec) {
 }
 
 // 统一的内部执行函数，负责连接管理
-boost::asio::awaitable<HttpResponse> HttpClient::execute_internal(HttpRequest& request, const ParsedUrl& target) {
+boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_internal(HttpRequest& request, const ParsedUrl& target) {
     // --- 使用 for 循环来实现重试逻辑 ---
     for (int attempt = 1; attempt <= 2; ++attempt) {
         // 1. 获取连接及其来源信息
@@ -191,9 +235,9 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute_internal(HttpRequest& r
 
         try {
             // 3. 执行请求
-            HttpResponse response = co_await conn->execute(request);
+            HttpResponse response = co_await conn->execute(std::move(request));
             // **成功，立即返回，跳出循环**
-            co_return response;
+           co_return  std::make_pair(std::move(response), conn);
         } catch (const boost::system::system_error& e) {
             // 4.  在 catch 块中，我们只做决策，不 co_await
 

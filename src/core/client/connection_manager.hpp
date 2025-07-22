@@ -25,6 +25,8 @@ public:
     // 构造函数，需要一个 io_context 的引用
     explicit ConnectionManager(boost::asio::io_context& ioc);
 
+    void replace_connection(std::shared_ptr<IConnection> old_conn, std::shared_ptr<IConnection> new_conn);
+
     // 析构和移动操作（如果需要的话，但通常默认的就行）
     ~ConnectionManager() = default;
     ConnectionManager(ConnectionManager&&) noexcept = default;

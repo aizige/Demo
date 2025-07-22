@@ -35,9 +35,9 @@ public:
     Http1Connection& operator=(const Http1Connection&);
 
 
-    boost::asio::awaitable<HttpResponse> execute(HttpRequest& request) override;
+    boost::asio::awaitable<HttpResponse> execute(HttpRequest request) override;
     bool is_usable() const override;
-    void close() override;
+    boost::asio::awaitable<void> close() override;
     const std::string& id() const override { return id_; }
     const std::string& get_pool_key() const { return pool_key_; }
 
@@ -45,6 +45,8 @@ public:
     boost::asio::ip::tcp::socket& lowest_layer_socket() override {
         return socket_.socket(); // beast::tcp_stream -> tcp::socket
     }
+
+    boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> release_socket() override;
 
 private:
     // 辅助函数，生成一个简单的伪UUID

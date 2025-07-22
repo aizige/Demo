@@ -16,13 +16,16 @@
 
 class HttpSslConnection : public IConnection, public std::enable_shared_from_this<HttpSslConnection> {
 public:
-    explicit HttpSslConnection(boost::asio::ip::tcp::socket socket, boost::asio::ssl::context& ctx, std::string pool_key);
+    using StreamType = boost::beast::ssl_stream<boost::beast::tcp_stream>;
+
+    //explicit HttpSslConnection(boost::asio::ip::tcp::socket socket, boost::asio::ssl::context& ctx, std::string pool_key);
+    explicit HttpSslConnection(StreamType stream, std::string pool_key);
     ~HttpSslConnection() override;
 
-    boost::asio::awaitable<void> handshake(std::string_view host);
-    boost::asio::awaitable<HttpResponse> execute(HttpRequest& request) override;
+
+    boost::asio::awaitable<HttpResponse> execute(HttpRequest request) override;
     bool is_usable() const override;
-    void close() override;
+    boost::asio::awaitable<void> close() override;
     const std::string& id() const override;
     const std::string& get_pool_key() const override;
 
@@ -34,7 +37,7 @@ public:
 
 private:
     static std::string generate_simple_uuid();
-    boost::beast::ssl_stream<boost::beast::tcp_stream> stream_;
+    StreamType stream_;
 
     boost::beast::flat_buffer buffer_;
     std::string id_;
