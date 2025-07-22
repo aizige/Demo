@@ -71,14 +71,20 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
         // 1. 创建 Request 对象
         HttpRequest req{current_method, target.target, 11};
         req.set(http::field::host, target.host);
-        req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36");
+        req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
         // 设置通用头 (Accept, etc.)
         if (current_headers.find(http::field::accept) == current_headers.end()) {
-            req.set(http::field::accept, "application/json,text/plain,*/*");
+            req.set(http::field::accept, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
         }
         if (current_headers.find(http::field::accept_encoding) == current_headers.end()) {
             req.set(http::field::accept_encoding, "gzip, deflate");
+        }
+        if (current_headers.find(http::field::accept_language) == current_headers.end()) {
+            req.set(http::field::accept_language, "en-US,en;q=0.9");
+        }
+        if (current_headers.find(http::field::connection) == current_headers.end()) {
+            req.set(http::field::connection, "keep-alive");
         }
 
         // 合并用户头

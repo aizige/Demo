@@ -24,12 +24,23 @@ public:
     using StreamType = boost::beast::ssl_stream<boost::beast::tcp_stream>;
     using StreamPtr = std::shared_ptr<StreamType>;
 
+    /**
+       * @brief 构造一个 Http2Connection.
+       * @param stream 已完成 SSL 握手并协商出 h2 协议的流.
+       * @param pool_key 连接池用于索引此连接的键.
+       */
     Http2Connection(StreamPtr stream, std::string pool_key);
+
     ~Http2Connection() override;
 
     Http2Connection(const Http2Connection&) = delete;
     Http2Connection& operator=(const Http2Connection&) = delete;
+    Http2Connection(Http2Connection&&) = delete;
+    Http2Connection& operator=(Http2Connection&&) = delete;
 
+    /**
+       * @brief 工厂函数，创建并返回一个 Http2Connection 的 shared_ptr.
+       */
     static std::shared_ptr<Http2Connection> create(StreamPtr stream, std::string key) {
         return std::make_shared<Http2Connection>(std::move(stream), std::move(key));
     }
@@ -43,7 +54,7 @@ public:
     boost::asio::ip::tcp::socket& lowest_layer_socket() override;
 
     // --- H2 客户端特定方法 ---
-    boost::asio::awaitable<void> start(); // 启动器，非协程
+    boost::asio::awaitable<void> start();
 
 private:
 
@@ -55,17 +66,23 @@ private:
         {}
 
         ResponseChannel response_channel;
-        HttpResponse response_in_progress; // 正在组装的响应
-        std::string request_body; // 请求体的拷贝，用于数据提供者回调
-        size_t request_body_offset = 0; // 请求体发送偏移量
+        HttpResponse response_in_progress;      // 正在组装的响应
+        std::string request_body;               // 请求体的拷贝，用于数据提供者回调
+        size_t request_body_offset = 0;         // 请求体发送偏移量
+
+        // **关键**: 用于存储头部字符串，防止悬垂指针。
+        // 所有动态生成的、需要传递给 nghttp2_nv 指针的字符串都必须存储在这里。
+        std::vector<std::string> header_storage;
 
 
     };
 
     void init_nghttp2_session();
     boost::asio::awaitable<void> session_loop(); // 负责网络 I/O 的主协程
+    boost::asio::awaitable<void> do_read();
     boost::asio::awaitable<void> do_write();
-    void prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req);
+    // 准备 nghttp2_nv 数组，并安全地管理字符串内存
+    void prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req, StreamContext& stream_ctx);
 
     // --- nghttp2 C-style 静态回调函数 ---
     static int on_begin_headers_callback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data);
@@ -83,7 +100,11 @@ private:
     boost::asio::strand<boost::asio::any_io_executor> strand_;
     nghttp2_session* session_ = nullptr;
     std::unordered_map<int32_t, std::unique_ptr<StreamContext>> streams_;
-    std::atomic<bool> is_closing_ = false;
+    // 原子标志，用于线程安全地检查连接是否正在关闭
+    std::atomic<bool> is_closing_{false};
+
+    // 原子标志，用于 start() 协程判断 HTTP/2 握手是否完成
+    std::atomic<bool> handshake_completed_{false};
 
     static std::string generate_simple_uuid();
 };

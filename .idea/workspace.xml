@@ -107,9 +107,9 @@
       <window_info id="Commit_Guest" show_stripe_button="false" />
       <window_info id="Pull Requests" />
       <window_info id="Learn" />
-      <window_info active="true" content_ui="combo" id="Project" order="0" sideWeight="0.50037825" visible="true" weight="0.12398256" />
+      <window_info active="true" content_ui="combo" id="Project" order="0" visible="true" weight="0.12398256" />
       <window_info id="Commit" order="1" sideWeight="0.50037825" weight="0.12398256" />
-      <window_info active="true" id="Structure" order="2" sideWeight="0.49962178" side_tool="true" visible="true" weight="0.12398256" />
+      <window_info id="Structure" order="2" side_tool="true" weight="0.12398256" />
       <window_info anchor="bottom" id="Database Changes" />
       <window_info anchor="bottom" id="TypeScript" />
       <window_info anchor="bottom" id="Python Packages" />
@@ -120,11 +120,11 @@
       <window_info anchor="bottom" id="Problems" order="1" />
       <window_info anchor="bottom" id="Problems View" order="2" weight="0.3214799" />
       <window_info anchor="bottom" id="Terminal" order="3" weight="0.3214799" />
-      <window_info anchor="bottom" id="Services" order="4" weight="0.3214799" />
+      <window_info anchor="bottom" id="Services" order="4" weight="0.45007184" />
       <window_info anchor="bottom" id="CMake" order="5" weight="0.4285201" />
-      <window_info anchor="bottom" id="Messages" order="6" weight="0.18785919" />
-      <window_info anchor="bottom" id="Run" order="7" weight="0.5736351" />
-      <window_info anchor="bottom" id="Find" order="8" weight="0.3214799" />
+      <window_info anchor="bottom" id="Messages" order="6" weight="0.24102011" />
+      <window_info anchor="bottom" id="Run" order="7" weight="0.39547414" />
+      <window_info anchor="bottom" id="Find" order="8" weight="0.5714799" />
       <window_info anchor="bottom" id="TODO" order="9" weight="0.3214799" />
       <window_info anchor="right" id="make" side_tool="true" />
       <window_info anchor="right" id="Python Console" />
@@ -164,7 +164,7 @@
       <workItem from="1753003286445" duration="14000" />
       <workItem from="1753003308505" duration="7594000" />
       <workItem from="1753029976026" duration="2210000" />
-      <workItem from="1753089593921" duration="69900000" />
+      <workItem from="1753089593921" duration="79551000" />
     </task>
     <servers />
   </component>
