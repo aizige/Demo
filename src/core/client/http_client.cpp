@@ -75,7 +75,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
         // 设置通用头 (Accept, etc.)
         if (current_headers.find(http::field::accept) == current_headers.end()) {
-            req.set(http::field::accept, "*/*");
+            req.set(http::field::accept, "application/json,text/plain,*/*");
         }
         if (current_headers.find(http::field::accept_encoding) == current_headers.end()) {
             req.set(http::field::accept_encoding, "gzip, deflate");

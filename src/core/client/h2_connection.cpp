@@ -30,8 +30,8 @@ Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
     : stream_(std::move(stream)),
       pool_key_(std::move(pool_key)),
       id_(generate_simple_uuid()),
-      strand_(stream_->get_executor())
-{}
+      strand_(stream_->get_executor()) {
+}
 
 Http2Connection::~Http2Connection() {
     if (session_) nghttp2_session_del(session_);
@@ -51,27 +51,22 @@ boost::asio::ip::tcp::socket& Http2Connection::lowest_layer_socket() {
 void Http2Connection::start() {
     co_spawn(strand_, [self = shared_from_this()]() -> boost::asio::awaitable<void> {
         try {
+            // 1. 初始化
+            self->init_nghttp2_session();
 
+            // 2. 准备并发送客户端的初始帧 (preface + settings)
+            nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+                          nghttp2_submit_settings(self->session_, NGHTTP2_FLAG_NONE, iv, 1);
+            co_await self->do_write();
 
-              // 1. 初始化
-              self->init_nghttp2_session();
-
-              // 2. 准备并发送客户端的初始帧 (preface + settings)
-              nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
-              nghttp2_submit_settings(self->session_, NGHTTP2_FLAG_NONE, iv, 1);
-              co_await self->do_write();
-
-              // 3. 在发送完成后，启动主 I/O 循环
-              co_await self->session_loop();
+            // 3. 在发送完成后，启动主 I/O 循环
+            co_await self->session_loop();
         } catch (const std::exception& e) {
             SPDLOG_ERROR("H2 Client Connection [{}] loop failed: {}", self->id(), e.what());
         }
         co_await self->close();
     }, boost::asio::detached);
 }
-
-
-
 
 
 /**
@@ -116,7 +111,10 @@ boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest reques
     );
 
     if (stream_id < 0) {
+        SPDLOG_ERROR("nghttp2_submit_request failed with error: {}", nghttp2_strerror(stream_id));
         throw std::runtime_error("nghttp2_submit_request failed: " + std::string(nghttp2_strerror(stream_id)));
+    } else {
+        SPDLOG_DEBUG("Submitted HTTP/2 request with stream ID: {}", stream_id);
     }
 
     // 6. 从 channel 获取一个 awaitable 的 future，以便我们等待结果
@@ -146,7 +144,8 @@ void Http2Connection::init_nghttp2_session() {
     nghttp2_session_callbacks* callbacks;
     nghttp2_session_callbacks_new(&callbacks);
 
-    // --- **[已修复]** ---
+    SPDLOG_DEBUG("Binding HTTP/2 session callbacks...");
+
     // 设置所有【实际存在】的回调
     nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, &on_begin_headers_callback);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, &on_header_callback);
@@ -154,15 +153,14 @@ void Http2Connection::init_nghttp2_session() {
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, &on_stream_close_callback);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, &on_frame_recv_callback);
 
-    // **移除不存在的回调**
-    // nghttp2_session_callbacks_set_on_goaway_callback(callbacks, &on_goaway_callback); // <-- 移除
+    SPDLOG_DEBUG("HTTP/2 session callbacks bound successfully.");
 
     nghttp2_session_client_new(&session_, callbacks, this);
     nghttp2_session_callbacks_del(callbacks);
 }
 
 boost::asio::awaitable<void> Http2Connection::session_loop() {
-    std::array<char, 8192> buf;
+    std::array<char, 8192> buf{};
     while (is_usable()) {
         auto [ec, n] = co_await stream_->async_read_some(boost::asio::buffer(buf), boost::asio::as_tuple(boost::asio::use_awaitable));
         if (ec) {
@@ -210,11 +208,12 @@ boost::asio::awaitable<void> Http2Connection::close() {
     // 尽力发送 GOAWAY
     if (session_ && stream_->lowest_layer().is_open()) {
         nghttp2_submit_goaway(session_,
-                NGHTTP2_FLAG_NONE,
-                nghttp2_session_get_last_proc_stream_id(session_),
-                NGHTTP2_NO_ERROR,
-                nullptr, 0);
-        try { co_await do_write(); } catch (...) {}
+                              NGHTTP2_FLAG_NONE,
+                              nghttp2_session_get_last_proc_stream_id(session_),
+                              NGHTTP2_NO_ERROR,
+                              nullptr, 0);
+        try { co_await do_write(); } catch (...) {
+        }
     }
 
     // 取消等待者
@@ -230,24 +229,30 @@ boost::asio::awaitable<void> Http2Connection::close() {
         boost::system::error_code ec;
         try {
             co_await stream_->async_shutdown(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-        } catch (...) {}
-        stream_->lowest_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-        stream_->lowest_layer().close(ec);
-        spdlog::debug("H2 Connection [{}]: Socket closed.", id_);
+        } catch (...) {
+        }
+        auto error_code = stream_->lowest_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+        auto close = stream_->lowest_layer().close(ec);
+        SPDLOG_DEBUG("H2 Connection [{}]: Socket closed.", id_);
+        SPDLOG_DEBUG("H2 Connection [{}]: Socket closed.", id_);
     }
-
 }
 
 void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req) {
+    SPDLOG_DEBUG("Preparing headers for request with target: {}", req.target());
+
     // 1. 手动计算大小
     size_t header_count = 0;
     for (const auto& field : req) {
         if (field.name() != http::field::host && field.name() != http::field::connection) {
             header_count++;
+        } else {
+            SPDLOG_DEBUG("Filtered header: {}", field.name_string());
         }
     }
 
     // 2. 进行 reserve
+    SPDLOG_DEBUG("Reserving space for {} headers ({} regular + 4 pseudo-headers).", header_count, header_count + 4);
     nva.reserve(header_count + 4); // 4 个伪头
 
 
@@ -256,9 +261,16 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
     if (path.empty()) path = "/";
 
     nva.push_back({(uint8_t*)":method", (uint8_t*)req.method_string().data(), 7, req.method_string().length(), NGHTTP2_NV_FLAG_NONE});
+    SPDLOG_DEBUG("Added pseudo-header: :method = {}", req.method_string());
+
     nva.push_back({(uint8_t*)":scheme", (uint8_t*)"https", 7, 5, NGHTTP2_NV_FLAG_NONE});
+    SPDLOG_DEBUG("Added pseudo-header: :scheme = https");
+
     nva.push_back({(uint8_t*)":authority", (uint8_t*)authority.c_str(), 10, authority.length(), NGHTTP2_NV_FLAG_NONE});
+    SPDLOG_DEBUG("Added pseudo-header: :authority = {}", authority);
+
     nva.push_back({(uint8_t*)":path", (uint8_t*)path.c_str(), 5, path.length(), NGHTTP2_NV_FLAG_NONE});
+    SPDLOG_DEBUG("Added pseudo-header: :path = {}", path);
 
     for (const auto& field : req) {
         http::field name_enum = field.name();
@@ -268,15 +280,20 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
             name_enum == http::field::upgrade ||
             name_enum == http::field::proxy_connection ||
             name_enum == http::field::transfer_encoding ||
-            name_enum == http::field::keep_alive)
-        {
+            name_enum == http::field::keep_alive ||
+            name_enum == http::field::accept_encoding) {
+            SPDLOG_DEBUG("Skipping connection-specific header: {}", field.name_string());
             continue;
         }
         // --- 将头部名称转换为小写 ---
         std::string name_lower = boost::algorithm::to_lower_copy(std::string(field.name_string()));
 
-        nva.push_back({(uint8_t*)name_lower.c_str(), (uint8_t*)field.value().data(),
-                       name_lower.length(), field.value().length(), NGHTTP2_NV_FLAG_NONE});
+        nva.push_back({
+            (uint8_t*)name_lower.c_str(), (uint8_t*)field.value().data(),
+            name_lower.length(), field.value().length(), NGHTTP2_NV_FLAG_NONE
+        });
+
+        SPDLOG_DEBUG("Added header: {} = {}", name_lower, field.value());
     }
 }
 
@@ -286,8 +303,8 @@ int Http2Connection::on_begin_headers_callback(nghttp2_session* session, const n
     if (frame->hd.type != NGHTTP2_HEADERS) return 0;
 
     auto stream_ctx = static_cast<StreamContext*>(
-       nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)
-   );
+        nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)
+    );
     if (!stream_ctx) return 0;
 
     stream_ctx->response_in_progress.version(20);
@@ -295,39 +312,27 @@ int Http2Connection::on_begin_headers_callback(nghttp2_session* session, const n
 }
 
 
-
-/**
- * @brief nghttp2 回调：当一个响应头名/值对被接收时调用。
- * @param session The nghttp2 session.
- * @param frame The frame containing the header.
- * @param name Pointer to the header name.
- * @param namelen Length of the header name.
- * @param value Pointer to the header value.
- * @param valuelen Length of the header value.
- * @param flags Frame flags.
- * @param user_data Pointer to the Http2Connection instance.
- * @return 0 on success.
- */
-int Http2Connection::on_header_callback(nghttp2_session* session,const nghttp2_frame* frame,const uint8_t* name, size_t namelen,const uint8_t* value, size_t valuelen,uint8_t flags, void* user_data) {
+int Http2Connection::on_header_callback(nghttp2_session* session, const nghttp2_frame* frame, const uint8_t* name, size_t namelen, const uint8_t* value, size_t valuelen, uint8_t flags, void* user_data) {
     // 这个回调不需要 Http2Connection 的 user_data，因为我们可以从 stream 中获取所有东西
     // auto self = static_cast<Http2Connection*>(user_data);
     (void)user_data;
     auto stream_ctx = static_cast<StreamContext*>(
-       nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)
-   );
+        nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)
+    );
     if (!stream_ctx) return 0;
 
     std::string_view key((const char*)name, namelen);
     if (key == ":status") {
         try {
             stream_ctx->response_in_progress.result(std::stoi(std::string((const char*)value, valuelen)));
-        } catch (...) { /* ignore */ }
+        } catch (...) {
+            /* ignore */
+        }
     } else if (!key.empty() && key[0] != ':') {
         stream_ctx->response_in_progress.set(key, std::string_view((const char*)value, valuelen));
     }
     return 0;
 }
-
 
 
 int Http2Connection::on_data_chunk_recv_callback(nghttp2_session* session, uint8_t, int32_t stream_id, const uint8_t* data, size_t len, void* user_data) {
@@ -369,9 +374,24 @@ int Http2Connection::on_stream_close_callback(nghttp2_session* session, int32_t 
 
 int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
     auto self = static_cast<Http2Connection*>(user_data);
+    SPDLOG_DEBUG("Frame received: type = {}, stream ID = {}, error code = {}",
+                 frame->hd.type,
+                 frame->hd.stream_id,
+                 frame->rst_stream.error_code); // 如果是 RST_STREAM
+
+    SPDLOG_DEBUG("Frame received: type = {}, stream ID = {}, flags = {}, length = {}",
+                 frame->hd.type, frame->hd.stream_id, frame->hd.flags, frame->hd.length);
+
+
     if (frame->hd.type == NGHTTP2_GOAWAY) {
-        SPDLOG_WARN("H2 client connection [{}] received GOAWAY from server. Shutting down.", self->id_);
+        SPDLOG_WARN("GOAWAY received with error code: {}, debug data: {}", frame->goaway.error_code, std::string((char*)frame->goaway.opaque_data, frame->goaway.opaque_data_len));
+
         self->is_closing_ = true;
+        // 主动唤醒所有挂起的请求
+        for (auto& [id, ctx] : self->streams_) {
+            if (ctx) ctx->response_channel.try_send(boost::asio::error::operation_aborted, HttpResponse{});
+        }
+        self->streams_.clear();
     }
     return 0;
 }
@@ -380,16 +400,21 @@ int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_fram
 ssize_t Http2Connection::read_request_body_callback(nghttp2_session*, int32_t, uint8_t* buf, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void*) {
     //  source->ptr 获取
     auto stream_ctx = static_cast<StreamContext*>(source->ptr);
-    if (!stream_ctx) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    if (!stream_ctx) {
+        SPDLOG_ERROR("read_request_body_callback failed: StreamContext is null.");
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
 
     size_t remaining = stream_ctx->request_body.size() - stream_ctx->request_body_offset;
     size_t n = std::min(length, remaining);
     if (n > 0) {
         memcpy(buf, stream_ctx->request_body.data() + stream_ctx->request_body_offset, n);
         stream_ctx->request_body_offset += n;
+        SPDLOG_DEBUG("Sent {} bytes of request body, offset: {}/{}", n, stream_ctx->request_body_offset, stream_ctx->request_body.size());
     }
     if (stream_ctx->request_body_offset == stream_ctx->request_body.size()) {
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        SPDLOG_DEBUG("Request body fully sent.");
     }
     return n;
 }
