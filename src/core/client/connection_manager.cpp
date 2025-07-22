@@ -141,7 +141,8 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
             if (proto && std::string_view((const char*)proto, len) == "h2") {
                 SPDLOG_INFO("ALPN selected h2 for {}. Creating Http2Connection.", host);
                 auto conn = Http2Connection::create(stream, key);
-                conn->start();
+               co_await conn->start();
+
                 co_return conn;
             } else {
                 SPDLOG_INFO("ALPN selected http/1.1 for {}. Creating HttpSslConnection.", host);

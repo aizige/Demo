@@ -47,26 +47,50 @@ boost::asio::ip::tcp::socket& Http2Connection::lowest_layer_socket() {
 }
 
 // --- Core Logic ---
+// In h2_connection.cpp
 
-void Http2Connection::start() {
+// THIS IS THE KEY CHANGE. start() is now a coroutine.
+boost::asio::awaitable<void> Http2Connection::start() {
+    // 1. Ensure all operations within start() happen on the connection's strand.
+    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+
+    // 2. Perform synchronous initialization.
+    init_nghttp2_session();
+
+    // 3. Queue the initial SETTINGS frame.
+    nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 1);
+
+    // 4. ***Crucially, perform the initial write NOW***.
+    // This sends the client connection preface and the SETTINGS frame.
+    // The connection is not considered "started" until this is sent.
+    co_await do_write();
+
+    // 5. NOW that the initial handshake is sent, spawn the background
+    //    I/O loop to handle all future reads and writes.
     co_spawn(strand_, [self = shared_from_this()]() -> boost::asio::awaitable<void> {
         try {
-            // 1. 初始化
-            self->init_nghttp2_session();
-
-            // 2. 准备并发送客户端的初始帧 (preface + settings)
-            nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
-                          nghttp2_submit_settings(self->session_, NGHTTP2_FLAG_NONE, iv, 1);
-            co_await self->do_write();
-
-            // 3. 在发送完成后，启动主 I/O 循环
+            // The loop now ONLY handles reading. Writes will be triggered
+            // by execute() or other session events.
             co_await self->session_loop();
-        } catch (const std::exception& e) {
-            SPDLOG_ERROR("H2 Client Connection [{}] loop failed: {}", self->id(), e.what());
+        } catch (const boost::system::system_error& e) {
+            // Handle expected errors gracefully
+            if (e.code() != boost::asio::error::operation_aborted &&
+                e.code() != boost::asio::ssl::error::stream_truncated &&
+                e.code() != boost::asio::error::eof) {
+                 SPDLOG_ERROR("H2 Connection [{}] I/O loop failed: {}", self->id(), e.what());
+            }
         }
+        catch (const std::exception& e) {
+            SPDLOG_ERROR("H2 Connection [{}] I/O loop failed with unexpected exception: {}", self->id(), e.what());
+        }
+        // No matter how the loop exits, ensure the connection is closed.
         co_await self->close();
     }, boost::asio::detached);
 }
+
+// The old start() implementation should be completely replaced by the one above.
+// The rest of your Http2Connection code is fine.
 
 
 /**
@@ -252,7 +276,8 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
     }
 
     // 2. 进行 reserve
-    SPDLOG_DEBUG("Reserving space for {} headers ({} regular + 4 pseudo-headers).", header_count, header_count + 4);
+
+    SPDLOG_DEBUG("Reserving space for {} headers ({} regular + 4 pseudo-headers).", header_count + 4, header_count);
     nva.reserve(header_count + 4); // 4 个伪头
 
 
@@ -388,9 +413,9 @@ int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_fram
 
         self->is_closing_ = true;
         // 主动唤醒所有挂起的请求
-        for (auto& [id, ctx] : self->streams_) {
-            if (ctx) ctx->response_channel.try_send(boost::asio::error::operation_aborted, HttpResponse{});
-        }
+       for (auto& [id, ctx] : self->streams_) {
+           if (ctx) ctx->response_channel.try_send(boost::asio::error::operation_aborted, HttpResponse{});
+       }
         self->streams_.clear();
     }
     return 0;

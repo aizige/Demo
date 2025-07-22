@@ -43,7 +43,7 @@ public:
     boost::asio::ip::tcp::socket& lowest_layer_socket() override;
 
     // --- H2 客户端特定方法 ---
-    void start(); // 启动器，非协程
+    boost::asio::awaitable<void> start(); // 启动器，非协程
 
 private:
 
