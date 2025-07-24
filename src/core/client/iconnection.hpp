@@ -32,6 +32,9 @@ public:
     //  暴露底层的 socket 以便进行健康检查
     virtual boost::asio::ip::tcp::socket& lowest_layer_socket() = 0;
 
+    virtual boost::asio::awaitable<bool> ping() = 0; // 新增 ping 接口
+    virtual std::chrono::steady_clock::time_point get_last_used_time() const = 0; // 新增时间戳接口
+
     /**
  * @brief 释放并返回底层 TCP socket 的所有权。
  * 这个方法主要用于 H2C Upgrade 流程，当一个 HTTP/1.1 连接需要

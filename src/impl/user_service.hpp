@@ -17,21 +17,22 @@ public:
     boost::asio::awaitable<void> get_user_by_id(RequestContext& ctx) {
         SPDLOG_INFO("User ID:");
         // 从 ctx 中获取路径参数
-        auto id_str = ctx.path_param("id");
-        if (!id_str) {
-            // 如果参数不存在，填充一个 400 Bad Request 响应
-            ctx.string(http::status::bad_request, "Missing user ID");
-            co_return;
-        }
-
-        // ... 业务逻辑 ...
-        nlohmann::json result = {
-            {"id", id_str},
-            {"data", {"Tom", "Jerry", "Spike"}} // 示例数据
-        };
-        SPDLOG_INFO("User ID: {}", id_str.value());
-        // 使用便利函数填充 200 OK 响应
-        ctx.json(http::status::ok, result);
+       // auto id_str = ctx.path_param("id");
+       // if (!id_str) {
+       //     // 如果参数不存在，填充一个 400 Bad Request 响应
+       //     ctx.string(http::status::bad_request, "Missing user ID");
+       //     co_return;
+       // }
+//
+       // // ... 业务逻辑 ...
+       // nlohmann::json result = {
+       //     {"id", id_str},
+       //     {"data", {"Tom", "Jerry", "Spike"}} // 示例数据
+       // };
+       // SPDLOG_INFO("User ID: {}", id_str.value());
+       // // 使用便利函数填充 200 OK 响应
+       // ctx.json(http::status::ok, result);
+        ctx.string(http::status::ok, "Hello, World!");
 
         co_return;
     }
@@ -63,8 +64,9 @@ public:
         //co_return ;
         try {
             // 直接使用注入的 http_client_ 实例
+            SPDLOG_DEBUG("准备对：{} 发起请求",value);
             HttpResponse response = co_await http_client_->get(value, {});
-            SPDLOG_DEBUG("进来了");
+
             if (response.result() == http::status::ok) {
                 SPDLOG_DEBUG("请求成功");
                 std::string_view content_type;

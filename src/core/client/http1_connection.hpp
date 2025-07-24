@@ -48,7 +48,10 @@ public:
 
     boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> release_socket() override;
 
+    boost::asio::awaitable<bool> ping() override;
+    std::chrono::steady_clock::time_point get_last_used_time() const override { return last_used_time_; }
 private:
+    std::atomic<std::chrono::steady_clock::time_point> last_used_time_; // 原子时间点
     // 辅助函数，生成一个简单的伪UUID
     static std::string generate_simple_uuid() {
         // 在实际项目中，使用一个真正的UUID库

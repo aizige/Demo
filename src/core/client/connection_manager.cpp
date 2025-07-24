@@ -7,17 +7,17 @@
 #include <spdlog/spdlog.h>
 #include "iconnection.hpp"         // << 提供 IConnection 的完整定义
 #include "http_ssl_connection.hpp"
-#include "connection_helpers.hpp"
 #include "h2_connection.hpp"
 
 
-ConnectionManager::ConnectionManager(boost::asio::io_context& ioc)
+ConnectionManager::ConnectionManager(boost::asio::io_context& ioc, bool enable_maintenance)
     : ioc_(ioc),
+      strand_(ioc.get_executor()),
       ssl_ctx_(boost::asio::ssl::context::sslv23_client),
-      resolver_(ioc) {
+      resolver_(ioc),
+      maintenance_timer_(ioc) {
 
-    // **[新增]** 明确禁用不安全的旧协议版本，如 SSLv2, SSLv3, TLSv1.0, TLSv1.1
-    // 这会让我们的客户端既有良好的兼容性（支持 TLS 1.2, 1.3），又保持了安全性。
+    // 配置 SSL 上下文
     ssl_ctx_.set_options(
         boost::asio::ssl::context::default_workarounds |
         boost::asio::ssl::context::no_sslv2 |
@@ -26,102 +26,151 @@ ConnectionManager::ConnectionManager(boost::asio::io_context& ioc)
         boost::asio::ssl::context::no_tlsv1_1 |
         boost::asio::ssl::context::single_dh_use
     );
-
-
-    // **在构造函数体中，对 ssl_ctx_ 进行配置**
     ssl_ctx_.set_default_verify_paths();
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
 
-    // --- **[新增]** 配置 ALPN ---
-    // 设置我们客户端支持的应用层协议列表，优先级从高到低
-    // "h2" 代表 HTTP/2, "http/1.1" 是备选
     const unsigned char supported_protos[] = {
-        2, 'h', '2', // 2字节长的 "h2"
-        8, 'h', 't', 't', 'p', '/', '1', '.', '1' // 8字节长的 "http/1.1"
+        //2, 'h', '2',
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
-    SSL_CTX_set_alpn_protos(ssl_ctx_.native_handle(),
-                            supported_protos, sizeof(supported_protos));
+    SSL_CTX_set_alpn_protos(ssl_ctx_.native_handle(),supported_protos, sizeof(supported_protos));
 
+    if (enable_maintenance) {
+        start_maintenance();
+    }
+}
+
+ConnectionManager::~ConnectionManager() {
+    stop();
+}
+
+void ConnectionManager::stop() {
+    // 使用 post 确保在 strand 上安全地修改 stopped_ 标志
+    boost::asio::post(strand_, [this] {
+        if (!stopped_) {
+            stopped_ = true;
+            maintenance_timer_.cancel();
+        }
+    });
 }
 
 
-boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::string_view scheme, std::string_view host, uint16_t port) {
+void ConnectionManager::start_maintenance() {
+    // 启动后台协程，它将独立运行
+    boost::asio::co_spawn(ioc_, run_maintenance(), boost::asio::detached);
+}
+
+
+boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
+    while (!stopped_) {
+        maintenance_timer_.expires_after(std::chrono::seconds(15)); // 每 15 秒维护一次
+
+        // 使用 redirect_error 来忽略 timer 被 cancel 时的异常
+        boost::system::error_code ec;
+        co_await maintenance_timer_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+
+        // 检查是否是由于 stop() 导致的退出
+        if (stopped_) co_return;
+
+        // 将维护工作 post 到 strand 上
+        co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+
+        //SPDLOG_DEBUG("ConnectionManager: Running maintenance task...");
+        auto now = std::chrono::steady_clock::now();
+
+        // 遍历所有连接池
+        for (auto& [key, queue] : pool_) {
+            ConnectionDeque healthy_queue;
+            while (!queue.empty()) {
+                auto conn = std::move(queue.front());
+                queue.pop_front();
+
+                // 规则1：如果连接已经不可用，直接丢弃
+                if (!conn->is_usable()) {
+                    SPDLOG_DEBUG("Maintenance: Pruning dead connection {}.", conn->id());
+                    continue;
+                }
+
+                // 规则2：如果连接空闲时间太长（例如超过60秒），主动关闭它
+                if (now - conn->get_last_used_time() > std::chrono::seconds(60)) {
+                    SPDLOG_INFO("Maintenance: Closing connection {} due to long inactivity.", conn->id());
+                    boost::asio::co_spawn(strand_, conn->close(), boost::asio::detached); // 在后台关闭
+                    continue;
+                }
+
+                // 规则3：如果连接空闲超过一个阈值（例如10秒），发送 PING 保活
+                if (now - conn->get_last_used_time() > std::chrono::seconds(10)) {
+                    // (此处需要 IConnection 有 ping() 接口)
+                    co_await conn->ping();
+                }
+                healthy_queue.push_back(std::move(conn));
+            }
+            // 用维护过的健康连接队列替换旧的
+            queue = std::move(healthy_queue);
+        }
+    }
+}
+
+
+boost::asio::awaitable<PooledConnection>  ConnectionManager::get_connection(std::string_view scheme, std::string_view host, uint16_t port) {
+
     std::string key = std::string(scheme) + "//" + std::string(host) + ":" + std::to_string(port);
-    SPDLOG_DEBUG("Requesting connection for key: {}", key);
 
-    { // --- 临界区 1: 快速检查空闲连接池 ---
-        std::lock_guard<std::mutex> lock(pool_mutex_);
-        auto& idle_queue = pool_[key];
-        while (!idle_queue.empty()) {
-            auto conn = idle_queue.front();
-            idle_queue.pop();
-            if (conn->is_usable() && is_connection_healthy(conn->lowest_layer_socket())) {
-                SPDLOG_DEBUG("ConnectionManager: Reusing healthy connection {} for {}", conn->id(), key);
-                co_return PooledConnection{conn, true};
-            } else {
-                SPDLOG_DEBUG("ConnectionManager: Pruning stale connection {} from pool for {}", conn->id(), key);
-            }
+    // **核心**: 将所有操作都调度到 strand 上，保证绝对的线程安全
+    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+
+    // --- 我们现在在 strand 上，可以安全地访问 pool_ ---
+
+    auto& idle_queue = pool_[key];
+    SPDLOG_DEBUG("idle_queue size = {}",idle_queue.size());
+    // 循环检查池中所有连接，直到找到一个可用的，或者池子变空
+    while (!idle_queue.empty()) {
+        auto conn = std::move(idle_queue.front());
+        SPDLOG_DEBUG("s_usable = {}",conn->is_usable());
+        idle_queue.pop_front();
+        // **取出时校验**
+        if (conn->is_usable()) {
+            SPDLOG_DEBUG("对键 {} 重复使用连接 {}", conn->id(), key);
+            co_return PooledConnection{conn, true};
+        } else {
+            SPDLOG_DEBUG("从连接池中删除为 {} 的陈旧连接 {}", conn->id(), key);
+            // 连接失效，继续循环检查下一个
         }
     }
 
+    // 池中无可用连接，创建新的
+    SPDLOG_DEBUG("池中没有可用于 {} 的连接，正在创建新的连接。", key);
+    std::shared_ptr<IConnection> connection = co_await create_new_connection(key, scheme, host, port);
 
-    // --- 池中无可用连接，进入序列化的创建流程 ---
-    boost::asio::strand<boost::asio::any_io_executor> creation_strand(ioc_.get_executor());
-    { // --- 临界区 2: 获取或创建该 key 专属的 strand ---
-        std::lock_guard<std::mutex> lock(pool_mutex_);
-        auto it = creation_strands_.find(key);
-        if (it == creation_strands_.end()) {
-            creation_strands_.emplace(key, boost::asio::strand<boost::asio::any_io_executor>(ioc_.get_executor()));
-        }
-        creation_strand = creation_strands_.at(key);
-    }
-
-    co_await post(creation_strand, boost::asio::use_awaitable);
-
-    // --- 现在处于序列化执行的上下文中 ---
-    { // --- 双重检查 ---
-        std::lock_guard<std::mutex> lock(pool_mutex_);
-        auto& idle_queue = pool_[key];
-        if (!idle_queue.empty()) {
-            auto conn = idle_queue.front();
-            idle_queue.pop();
-            if (conn->is_usable()) {
-                SPDLOG_DEBUG("ConnectionManager: Picked up connection created by another coroutine for {}", key);
-                co_return PooledConnection{conn, true};
-            }
-        }
-    }
-
-    // 如果连接池仍然为空，说明我是这个 strand 队列中第一个需要创建连接的。
-    SPDLOG_DEBUG("ConnectionManager: No usable connection in pool for {}, creating new one inside strand.", key);
-    auto new_conn = co_await create_new_connection(scheme, host, port);
-    co_return PooledConnection{new_conn, false};
+    co_return PooledConnection{connection, true};
 }
 
 void ConnectionManager::release_connection(std::shared_ptr<IConnection> conn) {
-    if (!conn || !conn->is_usable()) {
-        SPDLOG_DEBUG("ConnectionManager: Connection {} is not usable, discarding.", conn ? conn->id() : "null");
-        // 不可用的连接直接析构，不放回池中
-        return;
-    }
-    //  直接在 IConnection 接口上操作
-    if (!conn->is_usable()) {
-        spdlog::debug("ConnectionManager: Connection {} is not usable, discarding.", conn->id());
-        return;
-    }
 
-    const auto& key = conn->get_pool_key();
-    SPDLOG_DEBUG("ConnectionManager: Releasing connection {} back to pool [{}].", conn->id(), key);
+    // 同样，将释放操作调度到 strand 上
+    boost::asio::post(strand_, [this, conn]() {
+        // 在 lambda 内部，我们是线程安全的
+        if (!conn->is_usable()) {
+            SPDLOG_DEBUG("丢弃连接 {}", conn->id());
+            // conn 的 shared_ptr 在 lambda 结束时被销毁，自动触发关闭
+            return;
+        }
+        const auto& key = conn->get_pool_key();
 
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-    pool_[key].push(conn);
+        pool_[key].push_back(conn); // 放回队尾，实现 LIFO/FIFO 策略
+        SPDLOG_DEBUG("将连接 {} 存入连接池 [{}],当前连接池状况Key = {}， {}", conn->id(), key, pool_[key].size(),pool_[key].back()->get_pool_key());
+    });
 }
 
-boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_new_connection(std::string_view scheme, std::string_view host, uint16_t port) {
-    std::string key = std::string(scheme) + "//" + std::string(host) + ":" + std::to_string(port);
+
+
+boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_new_connection(const std::string& key, std::string_view scheme, std::string_view host, uint16_t port){
+    // 这个函数总是被 get_connection 在 strand 上调用，所以内部是安全的
+
     try {
         // 1. DNS 解析
         auto endpoints = co_await resolver_.async_resolve(host, std::to_string(port), boost::asio::use_awaitable);
+
         if (scheme == "http:") {
             tcp::socket socket(ioc_);
             co_await async_connect(socket, endpoints, boost::asio::use_awaitable);
@@ -141,8 +190,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
             if (proto && std::string_view((const char*)proto, len) == "h2") {
                 SPDLOG_INFO("ALPN selected h2 for {}. Creating Http2Connection.", host);
                 auto conn = Http2Connection::create(stream, key);
-               co_await conn->start();
-
+                co_await conn->start();
                 co_return conn;
             } else {
                 SPDLOG_INFO("ALPN selected http/1.1 for {}. Creating HttpSslConnection.", host);
@@ -156,13 +204,4 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
     }
 }
 
-void ConnectionManager::replace_connection(std::shared_ptr<IConnection> old_conn, std::shared_ptr<IConnection> new_conn) {
-    if (!new_conn) return;
 
-     std::lock_guard<std::mutex> lock(pool_mutex_);
-    const auto& key = new_conn->get_pool_key();
-    pool_[key].push(new_conn);
-    SPDLOG_DEBUG("Replaced connection in pool for key [{}]. Old conn id: {}, New conn id: {}",
-                  key, old_conn ? old_conn->id() : "null", new_conn->id());
-
-}

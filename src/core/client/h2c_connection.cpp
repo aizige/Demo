@@ -153,10 +153,7 @@ boost::asio::awaitable<void> Http2cConnection::do_write() {
 bool Http2cConnection::is_usable() const {
     // 我们的 is_closing_ 标志现在是关键
     // 它会在 close() 被调用时，或者在 on_frame_recv_callback 收到 GOAWAY 时被设置为 true
-    return
-        !is_closing_ &&
-        stream_->socket().is_open() &&
-        session_ != nullptr;
+    return!is_closing_ &&stream_->socket().is_open() && session_ != nullptr;
 }
 
 boost::asio::awaitable<void> Http2cConnection::close() {
@@ -296,6 +293,29 @@ int Http2cConnection::on_frame_recv_callback(nghttp2_session*, const nghttp2_fra
     return 0; // 客户端通常不需要对其他帧做特殊处理
 }
 
+boost::asio::awaitable<bool> Http2cConnection::ping() {
+    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+    if (!is_usable()) co_return false;
+
+    // 使用 promise 来等待 PONG
+
+
+    // 在 nghttp2 回调中，收到 PONG 时需要 set_value
+    // 这需要你扩展回调逻辑，或者用一个 map<ping_payload, promise>
+    // 一个简化的方法是：只要能成功提交 PING 并且连接没断，就认为它活着
+    nghttp2_submit_ping(session_, NGHTTP2_FLAG_NONE, nullptr);
+
+    try {
+        co_await do_write(); // 尝试发送
+    } catch (const std::exception& e) {
+        // 如果在写入时发生任何异常 (如连接被重置, SSL错误等),
+        // 都意味着这个连接不再健康。
+        spdlog::warn("H2C Connection [{}]: Health check failed during write: {}", id_, e.what());
+        is_closing_ = true; // 标记此连接为不可用
+        co_return false;
+    }
+    co_return true; // 简化版：只要能写出去就认为健康
+}
 
 ssize_t Http2cConnection::read_request_body_callback(nghttp2_session*, int32_t, uint8_t* buf, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void*) {
     auto stream_ctx = static_cast<StreamContext*>(source->ptr);

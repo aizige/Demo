@@ -46,7 +46,10 @@ public:
     // --- H2 客户端特定方法 ---
     void start(); // 启动器，非协程
 
+    boost::asio::awaitable<bool> ping() override;
+    std::chrono::steady_clock::time_point get_last_used_time() const override { return last_used_time_; }
 private:
+    std::atomic<std::chrono::steady_clock::time_point> last_used_time_; // 原子时间点
 
     // 上下文，用于存储一个客户端发起的流（请求-响应对）的状态
     struct StreamContext {

@@ -11,6 +11,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/experimental/promise.hpp>
 #include <boost/asio/ssl/context.hpp>
+
 // 向前声明
 class IConnection;
 
@@ -18,57 +19,80 @@ struct PooledConnection {
     std::shared_ptr<IConnection> connection;
     bool is_reused; // true 表示是从池中复用的
 };
-
-
-class ConnectionManager {
+/**
+ * @brief 一个现代化的、基于 strand 和协程的 HTTP/1.1 & HTTP/2 连接池管理器。
+ *
+ * 该管理器线程安全，并提供可选的后台维护任务以实现主动保活和陈旧连接清理。
+ */
+class ConnectionManager  : public std::enable_shared_from_this<ConnectionManager> {
 public:
-    // 构造函数，需要一个 io_context 的引用
-    explicit ConnectionManager(boost::asio::io_context& ioc);
+    /**
+     * @brief 构造函数。
+     * @param ioc io_context 的引用。
+     * @param enable_maintenance 是否启用后台维护任务（PING保活和清理）。
+     */
+    explicit ConnectionManager(boost::asio::io_context& ioc, bool enable_maintenance = true);
 
-    void replace_connection(std::shared_ptr<IConnection> old_conn, std::shared_ptr<IConnection> new_conn);
+    ~ConnectionManager();
 
-    // 析构和移动操作（如果需要的话，但通常默认的就行）
-    ~ConnectionManager() = default;
-    ConnectionManager(ConnectionManager&&) noexcept = default;
-    ConnectionManager& operator=(ConnectionManager&&) noexcept = default;
+    // 禁止拷贝和移动，因为它管理着后台任务和状态。
+    ConnectionManager(const ConnectionManager&) = delete;
+    ConnectionManager& operator=(const ConnectionManager&) = delete;
 
-    // 核心功能：异步获取一个连接
-    // scheme: "http" or "https"
-    // host: "example.com"
-    // port: 80 or 443
-    boost::asio::awaitable<PooledConnection> get_connection(
-        std::string_view scheme,
-        std::string_view host,
-        uint16_t port
-    );
+    /**
+     * @brief 异步获取一个到指定目标的健康连接。
+     *        此方法是线程安全的。
+     * @param scheme "http" 或 "https".
+     * @param host 主机名，例如 "www.google.com".
+     * @param port 端口号。
+     * @return 一个 awaitable，其结果是一个 IConnection 的 shared_ptr。
+     */
+    boost::asio::awaitable<PooledConnection>  get_connection(
+        std::string_view scheme, std::string_view host, uint16_t port);
 
-    // 将使用完毕的连接归还给池子
+    /**
+     * @brief 将一个连接释放回池中以供复用。
+     *        此方法是线程安全的。
+     * @param conn 要释放的连接。
+     */
     void release_connection(std::shared_ptr<IConnection> conn);
-
 private:
-    // 异步创建新连接的私有方法
-    boost::asio::awaitable<std::shared_ptr<IConnection>> create_new_connection(
-        std::string_view scheme,
-        std::string_view host,
-        uint16_t port
-    );
 
+
+    // 在 strand 上创建新连接的私有协程
+    boost::asio::awaitable<std::shared_ptr<IConnection>> create_new_connection(
+        const std::string& key, std::string_view scheme, std::string_view host, uint16_t port);
+
+    // 启动后台维护任务
+    void start_maintenance();
+
+    // 后台维护任务的协程实现
+    boost::asio::awaitable<void> run_maintenance();
+
+    // 停止后台任务（在析构时调用）
+    void stop();
+
+    // --- 核心数据成员 ---
+
+    // I/O 上下文
     boost::asio::io_context& ioc_;
-    // **直接持有 ssl::context 对象**
+
+    // **单一同步原语**: 所有对 pool_ 的访问都必须通过此 strand
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+
+    // SSL 上下文（整个管理器共享一个）
     boost::asio::ssl::context ssl_ctx_;
+
+    // DNS 解析器（整个管理器共享一个）
     boost::asio::ip::tcp::resolver resolver_;
 
+    // 连接池本体
+    using ConnectionDeque = std::deque<std::shared_ptr<IConnection>>;
+    std::unordered_map<std::string, ConnectionDeque> pool_;
 
-
-    // 连接池的核心数据结构
-    // Key: "http://example.com:80"
-    // Value: 一个该目标可用的空闲连接队列
-    std::map<std::string, std::queue<std::shared_ptr<IConnection>>> pool_;
-
-    std::map<std::string, boost::asio::strand<boost::asio::any_io_executor>> creation_strands_;
-
-    std::mutex pool_mutex_; // 用于保护连接池的互斥锁
-
+    // --- 后台维护任务相关 ---
+    boost::asio::steady_timer maintenance_timer_;
+    bool stopped_ = false;
 };
 
 

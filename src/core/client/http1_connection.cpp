@@ -18,7 +18,19 @@ Http1Connection::Http1Connection(tcp::socket socket, std::string pool_key)
     SPDLOG_DEBUG("Http1Connection [{}] for pool [{}] created.", id_, pool_key_);
 }
 
-
+boost::asio::awaitable<void> Http1Connection::close() {
+    if (socket_.socket().is_open()) {
+        boost::beast::error_code ec;
+        // Best effort shutdown
+        socket_.socket().shutdown(tcp::socket::shutdown_both, ec);
+        socket_.close();
+        if (ec) {
+            SPDLOG_WARN("Http1Connection [{}] error on close: {}", id_, ec.message());
+        }
+    }
+    keep_alive_ = false; // 标记为不可用
+    co_return;
+}
 
 // 实现 execute 协程
 boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest request) {
@@ -43,7 +55,7 @@ boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest reques
         co_return response;
     } catch (const boost::system::system_error& e) {
         SPDLOG_ERROR("Http1Connection [{}] error: {}", id_, e.what());
-        close(); // 出错时关闭连接
+        //close(); // 出错时关闭连接
         // 将异常重新抛出，让调用者知道操作失败了
         throw;
     }
@@ -54,19 +66,11 @@ bool Http1Connection::is_usable() const {
     return socket_.socket().is_open() && keep_alive_;
 }
 
-boost::asio::awaitable<void> Http1Connection::close() {
-    if (socket_.socket().is_open()) {
-        boost::beast::error_code ec;
-        // Best effort shutdown
-        socket_.socket().shutdown(tcp::socket::shutdown_both, ec);
-        socket_.close();
-        if (ec) {
-            SPDLOG_WARN("Http1Connection [{}] error on close: {}", id_, ec.message());
-        }
-    }
-    keep_alive_ = false; // 标记为不可用
-    co_return;
+boost::asio::awaitable<bool> Http1Connection::ping() {
+   co_return is_usable();
 }
+
+
 
 boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> Http1Connection::release_socket() {
     co_await this->close();

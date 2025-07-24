@@ -32,6 +32,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::post(std::string_view url, std:
     auto response = co_await execute(http::verb::post, url, std::move(body), headers);
     co_return response;
 }
+
 //  一个辅助函数来解析和组合 URL
 std::string HttpClient::resolve_url(const std::string& base_url, const std::string& location) {
     if (location.find("://") != std::string::npos) {
@@ -52,10 +53,10 @@ std::string HttpClient::resolve_url(const std::string& base_url, const std::stri
         return parsed_base.scheme + "//" + parsed_base.host + ":" + std::to_string(parsed_base.port) + base_path + location;
     }
 }
+
 // 实现接口中的 execute 方法，这是所有请求的最终入口
 
 boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std::string_view url, std::string body, const Headers& headers) {
-
     int redirects_left = follow_redirects_ ? max_redirects_ : 0;
 
     // --- **[关键]** 将请求参数保存起来，以便在循环中修改 ---
@@ -67,8 +68,9 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
     while (redirects_left-- >= 0) {
         ParsedUrl target = parse_url(current_url);
+        SPDLOG_DEBUG("正在对 {} 发起请求", url);
 
-        // 1. 创建 Request 对象
+            // 1. 创建 Request 对象
         HttpRequest req{current_method, target.target, 11};
         req.set(http::field::host, target.host);
         req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
@@ -94,8 +96,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
         // --- **[新增]** H2C Upgrade 头部注入 ---
         // 只在第一次请求、明文HTTP、且是幂等方法时尝试升级
-        if (is_first_request && target.scheme == "http" && (current_method == http::verb::get || current_method == http::verb::head))
-        {
+        if (is_first_request && target.scheme == "http" && (current_method == http::verb::get || current_method == http::verb::head)) {
             req.set(http::field::connection, "Upgrade, HTTP2-Settings");
             req.set(http::field::upgrade, "h2c");
 
@@ -118,14 +119,12 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
         auto [res, conn] = co_await execute_internal(req, target);
 
         // --- **[新增]** H2C Upgrade 响应处理 ---
-        if (res.result() == http::status::switching_protocols &&res.count(http::field::upgrade) &&boost::beast::iequals(res.at(http::field::upgrade), "h2c"))
-        {
+        if (res.result() == http::status::switching_protocols && res.count(http::field::upgrade) && boost::beast::iequals(res.at(http::field::upgrade), "h2c")) {
             spdlog::info("H2C Upgrade successful for {}. Replacing connection.", current_url);
 
 
-
             // a. 从 Http1Connection 中“窃取” socket
-            auto socket_opt = co_await  conn->release_socket();
+            auto socket_opt = co_await conn->release_socket();
             if (!socket_opt || !socket_opt->is_open()) {
                 throw std::runtime_error("Failed to release socket for H2C upgrade.");
             }
@@ -137,7 +136,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
             h2c_conn->start();
 
             // d. 在连接池中用新连接替换旧连接
-            manager_->replace_connection(conn, h2c_conn);
+            manager_->release_connection(conn);
 
             // e. 在【新的 H2C 连接】上【重新发送】原始请求
             //    我们直接 co_return，因为升级后不会再有重定向
@@ -148,7 +147,6 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
         // 3. 检查是否是重定向状态码
         auto status_code = res.result_int();
         if (status_code >= 300 && status_code < 400) {
-
             auto loc_it = res.find(http::field::location);
             if (loc_it == res.end()) {
                 // 重定向响应没有 Location 头，这是一个服务器错误，我们直接返回
@@ -225,6 +223,8 @@ bool is_retryable_network_error(const boost::system::error_code& ec) {
 boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_internal(HttpRequest& request, const ParsedUrl& target) {
     // --- 使用 for 循环来实现重试逻辑 ---
     for (int attempt = 1; attempt <= 2; ++attempt) {
+        SPDLOG_DEBUG("去连接池获取连接");
+
         // 1. 获取连接及其来源信息
         PooledConnection pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
         auto conn = pooled_conn.connection;
@@ -234,6 +234,7 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
             manager_.get(),
             [&, c = conn](ConnectionManager* mgr) {
                 if (c) {
+                    SPDLOG_DEBUG("HttpClient拿到连接准备存储连接");
                     mgr->release_connection(c);
                 }
             }
@@ -243,7 +244,7 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
             // 3. 执行请求
             HttpResponse response = co_await conn->execute(std::move(request));
             // **成功，立即返回，跳出循环**
-           co_return  std::make_pair(std::move(response), conn);
+            co_return std::make_pair(std::move(response), conn);
         } catch (const boost::system::system_error& e) {
             // 4.  在 catch 块中，我们只做决策，不 co_await
 
@@ -285,7 +286,6 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
 
     // 如果解析失败，则补全协议并重试
     if (!url) {
-
         SPDLOG_WARN("Parsing failed for URL: {}, attempting with protocol...", url_strv);
         if (url_string.find("http://") != 0 && url_string.find("https://") != 0) {
             url_string = "http://" + url_string;

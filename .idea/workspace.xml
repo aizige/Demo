@@ -32,8 +32,23 @@
     </configurations>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="601a8088-a132-4a12-9581-6672e2fc76d7" name="Changes" comment="">
+    <list default="true" id="601a8088-a132-4a12-9581-6672e2fc76d7" name="Changes" comment="Changes">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/CMakeLists.txt" beforeDir="false" afterPath="$PROJECT_DIR$/CMakeLists.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/connection_manager.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/connection_manager.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/connection_manager.hpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/connection_manager.hpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/h2_connection.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/h2_connection.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/h2_connection.hpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/h2_connection.hpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/h2c_connection.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/h2c_connection.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/h2c_connection.hpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/h2c_connection.hpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/http1_connection.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/http1_connection.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/http1_connection.hpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/http1_connection.hpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/http_client.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/http_client.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/http_ssl_connection.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/http_ssl_connection.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/http_ssl_connection.hpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/http_ssl_connection.hpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/core/client/iconnection.hpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/core/client/iconnection.hpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/impl/user_service.hpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/impl/user_service.hpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/src/main.cpp" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -107,9 +122,9 @@
       <window_info id="Commit_Guest" show_stripe_button="false" />
       <window_info id="Pull Requests" />
       <window_info id="Learn" />
-      <window_info active="true" content_ui="combo" id="Project" order="0" visible="true" weight="0.12398256" />
+      <window_info active="true" content_ui="combo" id="Project" order="0" visible="true" weight="0.11700581" />
       <window_info id="Commit" order="1" sideWeight="0.50037825" weight="0.12398256" />
-      <window_info id="Structure" order="2" side_tool="true" weight="0.12398256" />
+      <window_info id="Structure" order="2" side_tool="true" weight="0.11700581" />
       <window_info anchor="bottom" id="Database Changes" />
       <window_info anchor="bottom" id="TypeScript" />
       <window_info anchor="bottom" id="Python Packages" />
@@ -118,14 +133,14 @@
       <window_info anchor="bottom" id="clangd" />
       <window_info anchor="bottom" id="Version Control" order="0" />
       <window_info anchor="bottom" id="Problems" order="1" />
-      <window_info anchor="bottom" id="Problems View" order="2" weight="0.3214799" />
+      <window_info anchor="bottom" id="Problems View" order="2" weight="0.36386496" />
       <window_info anchor="bottom" id="Terminal" order="3" weight="0.3214799" />
-      <window_info anchor="bottom" id="Services" order="4" weight="0.45007184" />
-      <window_info anchor="bottom" id="CMake" order="5" weight="0.4285201" />
-      <window_info anchor="bottom" id="Messages" order="6" weight="0.24102011" />
-      <window_info anchor="bottom" id="Run" order="7" weight="0.39547414" />
-      <window_info anchor="bottom" id="Find" order="8" weight="0.5714799" />
-      <window_info anchor="bottom" id="TODO" order="9" weight="0.3214799" />
+      <window_info anchor="bottom" id="Services" order="4" weight="0.39834768" />
+      <window_info anchor="bottom" id="CMake" order="5" weight="0.3825431" />
+      <window_info active="true" anchor="bottom" id="Run" order="6" visible="true" weight="0.46515805" />
+      <window_info anchor="bottom" id="Messages" order="7" weight="0.28268677" />
+      <window_info anchor="bottom" id="Find" order="8" weight="0.3825431" />
+      <window_info anchor="bottom" id="TODO" order="9" weight="0.3825431" />
       <window_info anchor="right" id="make" side_tool="true" />
       <window_info anchor="right" id="Python Console" />
       <window_info anchor="right" id="Coverage" side_tool="true" />
@@ -164,7 +179,10 @@
       <workItem from="1753003286445" duration="14000" />
       <workItem from="1753003308505" duration="7594000" />
       <workItem from="1753029976026" duration="2210000" />
-      <workItem from="1753089593921" duration="79551000" />
+      <workItem from="1753089593921" duration="98490000" />
+      <workItem from="1753326475733" duration="1017000" />
+      <workItem from="1753337592592" duration="958000" />
+      <workItem from="1753338944047" duration="276000" />
     </task>
     <servers />
   </component>

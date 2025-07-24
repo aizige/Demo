@@ -27,17 +27,22 @@
 #include <boost/algorithm/string/case_conv.hpp>
 // --- Constructor, Destructor, and Helpers ---
 Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
-    : stream_(std::move(stream)),
-      pool_key_(std::move(pool_key)),
-      id_(generate_simple_uuid()),
-      strand_(stream_->get_executor()) {
+: stream_(std::move(stream)),
+  pool_key_(std::move(pool_key)),
+  id_(generate_simple_uuid()),
+  strand_(stream_->get_executor()),
+  last_used_time_(std::chrono::steady_clock::now()) {
     SPDLOG_DEBUG("Http2Connection [{}] created.", id_);
 }
 
 Http2Connection::~Http2Connection() {
-    if (session_) nghttp2_session_del(session_);
+    if (session_) {
+        nghttp2_session_del(session_);
+        session_ = nullptr; // 关键: 置为 nullptr
+    }
     SPDLOG_DEBUG("Http2Connection [{}] destroyed.", id_);
 }
+
 
 std::string Http2Connection::generate_simple_uuid() {
     static std::atomic<uint64_t> counter = 0;
@@ -48,6 +53,27 @@ boost::asio::ip::tcp::socket& Http2Connection::lowest_layer_socket() {
     return stream_->next_layer().socket();
 }
 
+boost::asio::awaitable<bool> Http2Connection::ping() {
+    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+    if (!is_usable()) {
+        co_return false;
+    }
+
+    nghttp2_submit_ping(session_, NGHTTP2_FLAG_NONE, nullptr);
+
+    try {
+        co_await do_write();
+    } catch (const std::exception& e) {
+        spdlog::warn("H2 Connection [{}]: Ping failed during write: {}", id_, e.what());
+        is_closing_ = true;
+        co_return false;
+    }
+
+    last_used_time_ = std::chrono::steady_clock::now();
+    co_return true;
+}
+
+// in Http2Connection.cpp
 
 boost::asio::awaitable<void> Http2Connection::start() {
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
@@ -133,11 +159,14 @@ boost::asio::awaitable<void> Http2Connection::start() {
 }
 
 
+
+
 boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest request) {
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+    last_used_time_ = std::chrono::steady_clock::now();
 
     if (!is_usable()) {
-        throw boost::system::system_error(boost::asio::error::operation_aborted, "Connection is not usable");
+        throw boost::system::system_error(boost::asio::error::not_connected, "H2 connection is not usable");
     }
 
     auto ex = co_await boost::asio::this_coro::executor;
@@ -145,8 +174,6 @@ boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest reques
 
     std::vector<nghttp2_nv> nva;
     prepare_headers(nva, request, *stream_ctx_ptr);
-
-
 
     nghttp2_data_provider provider{};
     if (!request.body().empty()) {
@@ -156,20 +183,14 @@ boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest reques
     }
 
     int32_t stream_id = nghttp2_submit_request(
-        session_,
-        nullptr,
-        nva.data(),
-        nva.size(),
+        session_, nullptr, nva.data(), nva.size(),
         stream_ctx_ptr->request_body.empty() ? nullptr : &provider,
         stream_ctx_ptr.get()
     );
 
     if (stream_id < 0) {
-        SPDLOG_ERROR("nghttp2_submit_request failed: {}", nghttp2_strerror(stream_id));
         throw std::runtime_error("nghttp2_submit_request failed: " + std::string(nghttp2_strerror(stream_id)));
     }
-
-    SPDLOG_DEBUG("H2 Connection [{}]: Submitted request on stream_id={}", id_, stream_id);
 
     auto future = stream_ctx_ptr->response_channel.async_receive(boost::asio::as_tuple(boost::asio::use_awaitable));
     streams_.emplace(stream_id, std::move(stream_ctx_ptr));
@@ -188,19 +209,21 @@ boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest reques
 void Http2Connection::init_nghttp2_session() {
     nghttp2_session_callbacks* callbacks;
     nghttp2_session_callbacks_new(&callbacks);
-    SPDLOG_DEBUG("Binding HTTP/2 session callbacks...");
     nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, &on_begin_headers_callback);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, &on_header_callback);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, &on_data_chunk_recv_callback);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, &on_stream_close_callback);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, &on_frame_recv_callback);
-    SPDLOG_DEBUG("HTTP/2 session callbacks bound successfully.");
     nghttp2_session_client_new(&session_, callbacks, this);
     nghttp2_session_callbacks_del(callbacks);
 }
 
 boost::asio::awaitable<void> Http2Connection::session_loop() {
+    auto self_weak = weak_from_this();
     while (is_usable()) {
+        if (self_weak.expired()) {
+            co_return; // 对象已销毁，安全退出
+        }
         try {
             if (nghttp2_session_want_read(session_) == 0 && nghttp2_session_want_write(session_) == 0) {
                 // 如果没有 I/O 事件，让出执行权，避免空转
@@ -228,9 +251,10 @@ boost::asio::awaitable<void> Http2Connection::session_loop() {
 
 // *** 新增的 do_read 辅助函数 ***
 boost::asio::awaitable<void> Http2Connection::do_read() {
+    auto self_weak = weak_from_this();
     std::array<char, 8192> read_buf_{};
     auto [ec, n] = co_await stream_->async_read_some(boost::asio::buffer(read_buf_), boost::asio::as_tuple(boost::asio::use_awaitable));
-
+    if (self_weak.expired()) co_return;
     if (ec) {
         if (ec != boost::asio::error::eof && ec != boost::asio::ssl::error::stream_truncated) {
             SPDLOG_WARN("H2 Connection [{}] read error: {}", id_, ec.message());
@@ -239,64 +263,56 @@ boost::asio::awaitable<void> Http2Connection::do_read() {
         co_return;
     }
 
-    ssize_t rv = nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t*>(read_buf_.data()), n);
-    if (rv < 0) {
-        SPDLOG_ERROR("nghttp2_session_mem_recv failed for [{}]: {}", id_, nghttp2_strerror(rv));
-        is_closing_ = true; // 标记连接已损坏
+    if (session_) {
+        ssize_t rv = nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t*>(read_buf_.data()), n);
+        if (rv < 0) {
+            is_closing_ = true;
+        }
     }
 }
 
 boost::asio::awaitable<void> Http2Connection::do_write() {
-    while (nghttp2_session_want_write(session_)) {
+    auto self_weak = weak_from_this();
+
+    while (session_ &&  nghttp2_session_want_write(session_)) {
+        if (self_weak.expired()) co_return;
         const uint8_t* data = nullptr;
         ssize_t len = nghttp2_session_mem_send(session_, &data);
         if (len < 0) {
             SPDLOG_ERROR("nghttp2_session_mem_send failed with error: {}", nghttp2_strerror(len));
             break;
         }
-        if (len == 0) {
-            break;
-        }
         auto [ec, n] = co_await boost::asio::async_write(*stream_, boost::asio::buffer(data, len), boost::asio::as_tuple(boost::asio::use_awaitable));
+
+        if (self_weak.expired()) {
+            // 对象在我们写入网络期间被销毁了，立即退出，不要再访问任何成员
+            co_return;
+        }
+
         if (ec) {
-            SPDLOG_WARN("H2 client connection [{}] write error: {}", id_, ec.message());
+            is_closing_ = true; // 标记连接失效
             throw boost::system::system_error(ec);
         }
     }
 }
 
 bool Http2Connection::is_usable() const {
-    // 我们的 is_closing_ 标志现在是关键
-    // 它会在 close() 被调用时，或者在 on_frame_recv_callback 收到 GOAWAY 时被设置为 true
-    return
-        !is_closing_ &&
-        stream_->lowest_layer().is_open() &&
-        session_ != nullptr;
+    return !is_closing_ && stream_ && stream_->lowest_layer().is_open() && session_ != nullptr;
 }
 
 boost::asio::awaitable<void> Http2Connection::close() {
-    // 修复: close 操作也必须在 strand 上执行，以防止与 I/O 循环或并发的 execute 调用发生竞争。
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
 
-
-    if (is_closing_.exchange(true)) {
+    if (close_called_.exchange(true)) {
         co_return;
     }
+    is_closing_ = true;
 
-    SPDLOG_DEBUG("H2 Connection [{}]: Closing...", id_);
-
-
-    // 礼貌地告诉服务器我们要离开了。
-    if (session_ && stream_->lowest_layer().is_open()) {
+    if (session_ && stream_ && stream_->lowest_layer().is_open()) {
         nghttp2_submit_goaway(session_, NGHTTP2_FLAG_NONE, nghttp2_session_get_last_proc_stream_id(session_), NGHTTP2_NO_ERROR, nullptr, 0);
-        try {
-            co_await do_write();
-        } catch (const std::exception& e) {
-            SPDLOG_WARN("H2 Connection [{}]: Exception during GOAWAY write: {}", id_, e.what());
-        }
+        try { co_await do_write(); } catch (...) {}
     }
 
-    // 取消所有挂起的流。这必须在 strand 上完成。
     auto streams_to_cancel = std::move(streams_);
     for (auto& [id, stream_ctx_ptr] : streams_to_cancel) {
         if (stream_ctx_ptr) {
@@ -304,8 +320,12 @@ boost::asio::awaitable<void> Http2Connection::close() {
         }
     }
 
-    // 优雅地关闭套接字。
-    if (stream_->lowest_layer().is_open()) {
+    if (session_) {
+        nghttp2_session_del(session_);
+        session_ = nullptr; // 关键: 置为 nullptr
+    }
+
+    if (stream_ && stream_->lowest_layer().is_open()) {
         boost::system::error_code ec;
         co_await stream_->async_shutdown(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
         stream_->lowest_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
@@ -453,31 +473,14 @@ int Http2Connection::on_stream_close_callback(nghttp2_session* session, int32_t 
 
 int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
     auto self = static_cast<Http2Connection*>(user_data);
-
-
     if (frame->hd.type == NGHTTP2_SETTINGS && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
-        SPDLOG_DEBUG("H2 Connection [{}]: Server's SETTINGS frame received. Handshake is complete.", self->id_);
         self->handshake_completed_ = true;
     }
     if (frame->hd.type == NGHTTP2_GOAWAY) {
-        SPDLOG_WARN("GOAWAY received with error code: {}, debug data: {}", frame->goaway.error_code, std::string((char*)frame->goaway.opaque_data, frame->goaway.opaque_data_len));
+        SPDLOG_WARN("GOAWAY received on [{}], error code: {}", self->id_, frame->goaway.error_code);
         self->is_closing_ = true;
-
-        // 收到 GOAWAY 意味着握手失败（如果还在握手阶段）
-        // 或者连接被终止（如果在请求处理阶段）
-        // is_usable() 会变为 false，从而终止 I/O 循环
-
-        // 主动唤醒所有挂起的请求
-        for (auto& [id, ctx] : self->streams_) {
-            if (ctx) ctx->response_channel.try_send(boost::asio::error::operation_aborted, HttpResponse{});
-        }
-        self->streams_.clear();
     }
-    // 你原来的其他日志代码可以保留
-    SPDLOG_DEBUG("Frame received: type = {}, stream ID = {}, flags = {}, length = {}, error code = {}",
-                 frame->hd.type, frame->hd.stream_id, frame->hd.flags, frame->hd.length, frame->rst_stream.error_code);
-
-
+    return 0;
     return 0;
 }
 

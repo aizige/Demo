@@ -35,7 +35,13 @@ public:
         return stream_.next_layer().socket();
     }
 
+    boost::asio::awaitable<bool> ping() override;
+    std::chrono::steady_clock::time_point get_last_used_time() const override { return last_used_time_.load(); }
+    void update_last_used_time() ;
+
+
 private:
+    std::atomic<std::chrono::steady_clock::time_point> last_used_time_; // 原子时间点
     static std::string generate_simple_uuid();
     StreamType stream_;
 
