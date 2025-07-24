@@ -21,13 +21,14 @@
 #include <deque>
 #include <boost/asio/co_spawn.hpp>
 #include <ranges>
-
+#include "utils/utils.hpp"
 // --- Constructor, Destructor, and Helpers ---
 Http2cConnection::Http2cConnection(StreamPtr stream, std::string pool_key)
     : stream_(std::move(stream)),
       pool_key_(std::move(pool_key)),
       id_(generate_simple_uuid()),
-      strand_(stream_->get_executor())
+strand_(stream_->get_executor()),
+last_used_timestamp_ms_(steady_clock_ms_since_epoch())
 {}
 
 Http2cConnection::~Http2cConnection() {
@@ -39,9 +40,7 @@ std::string Http2cConnection::generate_simple_uuid() {
     return "h2-client-conn-" + std::to_string(++counter);
 }
 
-boost::asio::ip::tcp::socket& Http2cConnection::lowest_layer_socket() {
-    return stream_->socket();
-}
+
 
 
 // --- Core Logic ---
@@ -68,7 +67,7 @@ void Http2cConnection::start() {
 
 boost::asio::awaitable<HttpResponse> Http2cConnection::execute(HttpRequest request) { // <-- 改回按值传递以匹配接口
     if (!is_usable()) throw std::runtime_error("H2 connection is not usable.");
-
+    last_used_timestamp_ms_ = steady_clock_ms_since_epoch();
     std::vector<nghttp2_nv> nva;
     prepare_headers(nva, request);
 
@@ -102,8 +101,6 @@ boost::asio::awaitable<HttpResponse> Http2cConnection::execute(HttpRequest reque
 
     if (ec) throw boost::system::system_error(ec);
 
-    // 这里可以加上解压逻辑，因为它现在是 H2 连接的 execute
-    // ...
 
     co_return response;
 }

@@ -42,8 +42,8 @@ public:
     boost::asio::awaitable<void> close() override;
     const std::string& id() const override { return id_; }
     const std::string& get_pool_key() const override { return pool_key_; }
-    boost::asio::ip::tcp::socket& lowest_layer_socket() override;
-    std::chrono::steady_clock::time_point get_last_used_time() const override{ return last_used_time_.load(); }
+    size_t get_active_streams() const override { return active_streams_.load(); }
+    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
     boost::asio::awaitable<bool> ping() override;
 
     // --- H2 客户端特定方法 ---
@@ -90,10 +90,13 @@ private:
     std::atomic<bool> handshake_completed_{false};
     std::atomic<bool> close_called_{false}; // 用于防止 close() 重入
 
-    // 用于记录最后一次活动时间
-    std::atomic<std::chrono::steady_clock::time_point> last_used_time_;
+
 
     static std::string generate_simple_uuid();
+
+    std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
+    // 用于记录最后一次活动时间
+    int64_t last_used_timestamp_ms_;
 };
 
 

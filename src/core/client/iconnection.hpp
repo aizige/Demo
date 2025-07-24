@@ -29,11 +29,14 @@ public:
 
     virtual const std::string& get_pool_key() const = 0;
 
-    //  暴露底层的 socket 以便进行健康检查
-    virtual boost::asio::ip::tcp::socket& lowest_layer_socket() = 0;
-
+    //  健康检查
+    /**
+     * @brief 返回当前连接上正在处理的并发请求（流）的数量。
+     * @return 对于 H1.1，这个值是 0 或 1。对于 H2，可以是 0 到 max_concurrent_streams。
+     */
+    virtual size_t get_active_streams() const = 0;
     virtual boost::asio::awaitable<bool> ping() = 0; // 新增 ping 接口
-    virtual std::chrono::steady_clock::time_point get_last_used_time() const = 0; // 新增时间戳接口
+    virtual int64_t get_last_used_timestamp_ms() const = 0; // 新增时间戳接口
 
     /**
  * @brief 释放并返回底层 TCP socket 的所有权。
@@ -51,4 +54,4 @@ public:
 };
 
 
-#endif //CONNECTION_HPP
+#endif //ICONNECTION_HPP

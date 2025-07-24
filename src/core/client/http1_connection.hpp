@@ -31,27 +31,24 @@ public:
     }
 
     // 禁止拷贝和移动，因为我们用 shared_ptr 管理
-    Http1Connection(const Http1Connection&);
-    Http1Connection& operator=(const Http1Connection&);
+    Http1Connection(const Http1Connection&) = delete;
+    Http1Connection& operator=(const Http1Connection&) = delete;
 
 
     boost::asio::awaitable<HttpResponse> execute(HttpRequest request) override;
     bool is_usable() const override;
     boost::asio::awaitable<void> close() override;
     const std::string& id() const override { return id_; }
-    const std::string& get_pool_key() const { return pool_key_; }
+    const std::string& get_pool_key() const override { return pool_key_; }
 
-    // in Http1Connection
-    boost::asio::ip::tcp::socket& lowest_layer_socket() override {
-        return socket_.socket(); // beast::tcp_stream -> tcp::socket
-    }
+    size_t get_active_streams() const override;
 
     boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> release_socket() override;
 
     boost::asio::awaitable<bool> ping() override;
-    std::chrono::steady_clock::time_point get_last_used_time() const override { return last_used_time_; }
+    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
 private:
-    std::atomic<std::chrono::steady_clock::time_point> last_used_time_; // 原子时间点
+
     // 辅助函数，生成一个简单的伪UUID
     static std::string generate_simple_uuid() {
         // 在实际项目中，使用一个真正的UUID库
@@ -59,12 +56,13 @@ private:
         return "conn-" + std::to_string(++counter);
     }
 
+
     boost::beast::tcp_stream socket_;
     boost::beast::flat_buffer buffer_; // 可重用的缓冲区
     std::string id_;
     bool keep_alive_ = true;
     std::string pool_key_;
-
-
+    std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
+    int64_t last_used_timestamp_ms_;
 };
 #endif //UNTITLED1_HTTP1_CONNECTION_HPP

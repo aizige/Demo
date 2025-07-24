@@ -30,7 +30,7 @@ ConnectionManager::ConnectionManager(boost::asio::io_context& ioc, bool enable_m
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
 
     const unsigned char supported_protos[] = {
-        //2, 'h', '2',
+      // 2, 'h', '2',
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
     SSL_CTX_set_alpn_protos(ssl_ctx_.native_handle(),supported_protos, sizeof(supported_protos));
@@ -87,20 +87,29 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
 
                 // 规则1：如果连接已经不可用，直接丢弃
                 if (!conn->is_usable()) {
-                    SPDLOG_DEBUG("Maintenance: Pruning dead connection {}.", conn->id());
+                    SPDLOG_DEBUG("Pruning dead connection {}.", conn->id());
+                    continue;
+                }
+
+                // 我们通过 active_streams() 来判断连接是否空闲
+                if (conn->get_active_streams() > 0) {
+                    // 连接正在处理一个或多个请求，绝对是活的，直接保留
+                    healthy_queue.push_back(std::move(conn));
                     continue;
                 }
 
                 // 规则2：如果连接空闲时间太长（例如超过60秒），主动关闭它
+                SPDLOG_DEBUG("当前时间 {}",now);
+                SPDLOG_INFO("最后的活动时间 {}", conn->get_last_used_time());
                 if (now - conn->get_last_used_time() > std::chrono::seconds(60)) {
-                    SPDLOG_INFO("Maintenance: Closing connection {} due to long inactivity.", conn->id());
+                    SPDLOG_INFO("关闭闲置时间过长的连接", conn->id());
                     boost::asio::co_spawn(strand_, conn->close(), boost::asio::detached); // 在后台关闭
                     continue;
                 }
 
                 // 规则3：如果连接空闲超过一个阈值（例如10秒），发送 PING 保活
                 if (now - conn->get_last_used_time() > std::chrono::seconds(10)) {
-                    // (此处需要 IConnection 有 ping() 接口)
+                    SPDLOG_INFO("ping {} ", conn->id());
                     co_await conn->ping();
                 }
                 healthy_queue.push_back(std::move(conn));
@@ -200,7 +209,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
         throw std::runtime_error("Unsupported scheme: " + std::string(scheme));
     } catch (const boost::system::system_error& e) {
         SPDLOG_ERROR("Failed to create new connection to {}: {}", key, e.what());
-        throw; // 将异常向上传递
+        throw;
     }
 }
 

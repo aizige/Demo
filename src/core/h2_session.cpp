@@ -103,7 +103,7 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
     nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 1);
     co_await do_write();
 
-    std::array<char, 8192> buf;
+    std::array<char, 8192> buf{};
 
     using namespace boost::asio::experimental::awaitable_operators;
     while (stream_->next_layer().is_open()) {
@@ -323,8 +323,7 @@ int Http2Session::on_stream_close_callback(nghttp2_session*, int32_t stream_id, 
     return 0;
 }
 
-// ======================= Http2Session.cpp (增加优雅关闭实现) =======================
-// ... (其他函数不变) ...
+
 
 void Http2Session::graceful_shutdown() {
     // 使用 post 确保操作在 session 的 strand 上执行，保证线程安全

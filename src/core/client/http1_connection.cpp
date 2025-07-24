@@ -7,12 +7,14 @@
 #include <boost/asio/use_awaitable.hpp>
 
 #include "http/http_common_types.hpp"
+#include "utils/utils.hpp"
 
 
 Http1Connection::Http1Connection(tcp::socket socket, std::string pool_key)
     : socket_(std::move(socket)),
       id_(generate_simple_uuid()),
-      pool_key_(std::move(pool_key))
+      pool_key_(std::move(pool_key)),
+      last_used_timestamp_ms_(steady_clock_ms_since_epoch())
 // 初始化新成员
 {
     SPDLOG_DEBUG("Http1Connection [{}] for pool [{}] created.", id_, pool_key_);
@@ -35,6 +37,9 @@ boost::asio::awaitable<void> Http1Connection::close() {
 // 实现 execute 协程
 boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest request) {
     try {
+        // **在进入时，增加并发流计数**
+        ++active_streams_;
+        last_used_timestamp_ms_ = steady_clock_ms_since_epoch();
         // 发送请求
         co_await http::async_write(socket_, request, boost::asio::use_awaitable);
         SPDLOG_DEBUG("Http1Connection [{}] request sent.", id_);
@@ -45,13 +50,14 @@ boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest reques
         SPDLOG_DEBUG("Http1Connection [{}] response received with status {}.", id_, response.result_int());
 
         // 检查是否应该保持连接
-       if ( response.result_int() >= 300) {
-           keep_alive_ = false;
-       } else {
-           keep_alive_ = response.keep_alive();
-       }
+        if (response.result_int() >= 300) {
+            keep_alive_ = false;
+        } else {
+            keep_alive_ = response.keep_alive();
+        }
 
         // 返回响应
+        --active_streams_;
         co_return response;
     } catch (const boost::system::system_error& e) {
         SPDLOG_ERROR("Http1Connection [{}] error: {}", id_, e.what());
@@ -64,13 +70,16 @@ boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest reques
 bool Http1Connection::is_usable() const {
     // 连接必须是打开的，并且上一次通信允许 keep-alive
     return socket_.socket().is_open() && keep_alive_;
+    // 对于 H1.1 连接，只要 socket 打开并且我们没有主动标记它为关闭，就认为是可用的
 }
 
 boost::asio::awaitable<bool> Http1Connection::ping() {
-   co_return is_usable();
+    co_return is_usable();
 }
 
-
+size_t Http1Connection::get_active_streams() const {
+    return active_streams_.load();
+}
 
 boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> Http1Connection::release_socket() {
     co_await this->close();

@@ -20,8 +20,8 @@ find_package(ada)
 
 
 # 调试用的是hhhh
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
-#set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+set(CMAKE_BUILD_TYPE Debug)
 
 add_executable(untitled1
         src/main.cpp
@@ -42,6 +42,7 @@ add_executable(untitled1
         src/core/client/h2_connection.hpp
         src/core/client/h2c_connection.cpp
         src/core/client/h2c_connection.hpp
+        src/utils/utils.hpp
 
 )
 

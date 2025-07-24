@@ -25,13 +25,14 @@
 #include <boost/asio/co_spawn.hpp>
 #include <ranges>
 #include <boost/algorithm/string/case_conv.hpp>
+#include "utils/utils.hpp"
 // --- Constructor, Destructor, and Helpers ---
 Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
 : stream_(std::move(stream)),
   pool_key_(std::move(pool_key)),
   id_(generate_simple_uuid()),
   strand_(stream_->get_executor()),
-  last_used_time_(std::chrono::steady_clock::now()) {
+  last_used_timestamp_ms_(steady_clock_ms_since_epoch()) {
     SPDLOG_DEBUG("Http2Connection [{}] created.", id_);
 }
 
@@ -49,9 +50,7 @@ std::string Http2Connection::generate_simple_uuid() {
     return "h2-client-conn-" + std::to_string(++counter);
 }
 
-boost::asio::ip::tcp::socket& Http2Connection::lowest_layer_socket() {
-    return stream_->next_layer().socket();
-}
+
 
 boost::asio::awaitable<bool> Http2Connection::ping() {
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
@@ -69,7 +68,6 @@ boost::asio::awaitable<bool> Http2Connection::ping() {
         co_return false;
     }
 
-    last_used_time_ = std::chrono::steady_clock::now();
     co_return true;
 }
 
@@ -93,6 +91,7 @@ boost::asio::awaitable<void> Http2Connection::start() {
             init_nghttp2_session();
 
             // 1. 提交客户端的 SETTINGS 帧
+            // TODO:配置足够大的流量控制窗口（SETTINGS_INITIAL_WINDOW_SIZE）？如果窗口太小（比如默认的 64KB），那么在传输大文件时，客户端和服务器会频繁地来回发送 WINDOW_UPDATE 帧，这会增加额外的延迟。
             nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
             nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 1);
 
@@ -163,7 +162,7 @@ boost::asio::awaitable<void> Http2Connection::start() {
 
 boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest request) {
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
-    last_used_time_ = std::chrono::steady_clock::now();
+    last_used_timestamp_ms_ = steady_clock_ms_since_epoch();
 
     if (!is_usable()) {
         throw boost::system::system_error(boost::asio::error::not_connected, "H2 connection is not usable");
@@ -480,7 +479,6 @@ int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_fram
         SPDLOG_WARN("GOAWAY received on [{}], error code: {}", self->id_, frame->goaway.error_code);
         self->is_closing_ = true;
     }
-    return 0;
     return 0;
 }
 

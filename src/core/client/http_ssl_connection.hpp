@@ -29,19 +29,15 @@ public:
     const std::string& id() const override;
     const std::string& get_pool_key() const override;
 
-    // in HttpSslConnection
-    boost::asio::ip::tcp::socket& lowest_layer_socket() override {
-        // beast::ssl_stream -> beast::tcp_stream -> tcp::socket
-        return stream_.next_layer().socket();
-    }
+    size_t get_active_streams() const override { return active_streams_.load(); }
 
     boost::asio::awaitable<bool> ping() override;
-    std::chrono::steady_clock::time_point get_last_used_time() const override { return last_used_time_.load(); }
+    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
     void update_last_used_time() ;
 
 
 private:
-    std::atomic<std::chrono::steady_clock::time_point> last_used_time_; // 原子时间点
+
     static std::string generate_simple_uuid();
     StreamType stream_;
 
@@ -49,6 +45,8 @@ private:
     std::string id_;
     std::string pool_key_;
     bool keep_alive_ = true;
+    std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
+    int64_t last_used_timestamp_ms_;
 };
 
 

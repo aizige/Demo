@@ -39,7 +39,7 @@ public:
     boost::asio::awaitable<void> close() override;
     const std::string& id() const override { return id_; }
     const std::string& get_pool_key() const override { return pool_key_; }
-    boost::asio::ip::tcp::socket& lowest_layer_socket() override;
+    size_t get_active_streams() const override { return active_streams_.load(); }
 
     boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> release_socket() override {co_return std::nullopt;}  // 明确地 override，并返回 nullopt
 
@@ -47,9 +47,9 @@ public:
     void start(); // 启动器，非协程
 
     boost::asio::awaitable<bool> ping() override;
-    std::chrono::steady_clock::time_point get_last_used_time() const override { return last_used_time_; }
+    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
 private:
-    std::atomic<std::chrono::steady_clock::time_point> last_used_time_; // 原子时间点
+    int64_t last_used_timestamp_ms_;
 
     // 上下文，用于存储一个客户端发起的流（请求-响应对）的状态
     struct StreamContext {
@@ -90,6 +90,7 @@ private:
     std::atomic<bool> is_closing_ = false;
 
     static std::string generate_simple_uuid();
+    std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
 };
 
 

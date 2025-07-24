@@ -4,15 +4,17 @@
 
 #include "http_ssl_connection.hpp"
 
+#include <boost/asio/redirect_error.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <spdlog/spdlog.h>
-
+#include <ada.h>
+#include "utils/utils.hpp"
 
 HttpSslConnection::HttpSslConnection(StreamType stream, std::string pool_key)
     : stream_(std::move(stream)), // 直接移动传入的 stream
       id_(generate_simple_uuid()),
-      pool_key_(std::move(pool_key)),
-      last_used_time_(std::chrono::steady_clock::now()) {
+pool_key_(std::move(pool_key)),
+last_used_timestamp_ms_(steady_clock_ms_since_epoch()) {
     SPDLOG_DEBUG("HttpSslConnection [{}] for pool [{}] created.", id_, pool_key_);
 }
 
@@ -21,7 +23,41 @@ HttpSslConnection::~HttpSslConnection() {
 }
 
 boost::asio::awaitable<bool> HttpSslConnection::ping() {
-    co_return is_usable();
+
+    if (!is_usable()) {
+        co_return false;
+    }
+    try {
+        auto url = ada::parse<ada::url_aggregator>(pool_key_);
+       if (!url) {
+           co_return false;
+       }
+        HttpRequest req{http::verb::options, "/", 11};
+        req.set(http::field::host, url->get_host());
+        req.set(http::field::user_agent, "Chrome/120.0.0.0");
+        req.set(http::field::accept, "*/*");
+        req.set(http::field::connection, "keep-alive");
+
+        co_await http::async_write(stream_, req, boost::asio::use_awaitable);
+
+        // 3. 读取响应头
+        //    我们使用一个独立的 buffer，不干扰 execute() 使用的 buffer_
+        boost::beast::flat_buffer ping_buffer;
+        HttpResponse response;
+        co_await http::async_read(stream_, ping_buffer, response, boost::asio::use_awaitable);
+        // 4. 检查响应
+        //    只要能收到一个合法的 HTTP 响应（即使是 4xx 或 5xx），
+        //    都证明了整个网络链路是通畅的。
+        if (response.result_int() > 0) {
+            update_last_used_time();
+            co_return true;
+        }
+        // 如果收到无效响应，则认为连接有问题
+        co_return false;
+    } catch (const std::exception& e) {
+        keep_alive_ = false;
+        co_return false;
+    }
 }
 
 boost::asio::awaitable<HttpResponse> HttpSslConnection::execute(HttpRequest request) {
@@ -47,7 +83,7 @@ boost::asio::awaitable<HttpResponse> HttpSslConnection::execute(HttpRequest requ
         co_return response;
     } catch (const boost::system::system_error& e) {
         SPDLOG_ERROR("HttpsConnection [{}] error: {}", id_, e.what());
-        close(); // 出错时关闭连接
+        keep_alive_ = false;
         // 将异常重新抛出，让调用者知道操作失败了
         throw;
     }
@@ -66,7 +102,7 @@ boost::asio::awaitable<void> HttpSslConnection::close() {
 }
 
 void HttpSslConnection::update_last_used_time() {
-    last_used_time_ = std::chrono::steady_clock::now();
+    last_used_timestamp_ms_ = steady_clock_ms_since_epoch();
 }
 
 const std::string& HttpSslConnection::id() const { return id_; }

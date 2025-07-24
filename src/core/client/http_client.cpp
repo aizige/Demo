@@ -70,14 +70,14 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
         ParsedUrl target = parse_url(current_url);
         SPDLOG_DEBUG("正在对 {} 发起请求", url);
 
-            // 1. 创建 Request 对象
+        // 1. 创建 Request 对象
         HttpRequest req{current_method, target.target, 11};
         req.set(http::field::host, target.host);
         req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
         // 设置通用头 (Accept, etc.)
         if (current_headers.find(http::field::accept) == current_headers.end()) {
-            req.set(http::field::accept, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
+            req.set(http::field::accept, "*/*");
         }
         if (current_headers.find(http::field::accept_encoding) == current_headers.end()) {
             req.set(http::field::accept_encoding, "gzip, deflate");
@@ -214,7 +214,8 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
 // 创建一个辅助函数来检查错误码，让代码更干净
 bool is_retryable_network_error(const boost::system::error_code& ec) {
-    return ec == boost::asio::error::eof || // 当你尝试读取一个对方已关闭发送的连接时
+    return ec == boost::beast::http::error::end_of_stream || // 当尝试写入一个对方已关闭接收的连接时
+        ec == boost::asio::error::eof || // 当你尝试读取一个对方已关闭发送的连接时
         ec == boost::asio::error::connection_reset || //对一个已关闭的端口发送数据
         ec == boost::asio::error::broken_pipe; // 当尝试写入一个对方已关闭接收的连接时
 }
@@ -224,50 +225,36 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
     // --- 使用 for 循环来实现重试逻辑 ---
     for (int attempt = 1; attempt <= 2; ++attempt) {
         SPDLOG_DEBUG("去连接池获取连接");
-
-        // 1. 获取连接及其来源信息
-        PooledConnection pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
-        auto conn = pooled_conn.connection;
-
-        // 2. 准备 RAII guard
-        std::unique_ptr<ConnectionManager, std::function<void(ConnectionManager*)>> guard(
-            manager_.get(),
-            [&, c = conn](ConnectionManager* mgr) {
-                if (c) {
-                    SPDLOG_DEBUG("HttpClient拿到连接准备存储连接");
-                    mgr->release_connection(c);
-                }
-            }
-        );
-
+        PooledConnection pooled_conn ;
+        std::shared_ptr<IConnection> conn;
         try {
+            // 1. 获取连接及其来源信息
+            pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
+            conn = pooled_conn.connection;
+
+            if (!conn) throw std::runtime_error("Failed to acquire a connection.");
+
             // 3. 执行请求
-            HttpResponse response = co_await conn->execute(std::move(request));
+            HttpResponse response = co_await conn->execute(request);
+            manager_->release_connection(conn);
             // **成功，立即返回，跳出循环**
             co_return std::make_pair(std::move(response), conn);
         } catch (const boost::system::system_error& e) {
             // 4.  在 catch 块中，我们只做决策，不 co_await
-
+            SPDLOG_WARN("连接过期了 {}", e.code().value());
             // 如果不满足重试条件，则立即重新抛出异常，终止循环
             if (attempt > 1 || !pooled_conn.is_reused || !is_retryable_network_error(e.code())) {
                 throw; // 向上抛出
             }
 
             // 如果满足重试条件，记录日志，然后什么也不做，让循环自然进入下一次迭代
-            spdlog::warn("Stale connection [{}] detected. Retrying request (attempt {}/2)...",
-                         conn->id(),
-                         attempt);
+            SPDLOG_WARN("Stale connection [{}] detected. Retrying request (attempt {}/2)...",
+                        conn->id(),
+                        attempt);
 
             // **注意**：这里没有 co_await！catch 块正常结束。
         }
     }
-
-    // 如果循环两次都失败了，程序会执行到这里。
-    // 这意味着第二次尝试也抛出了异常，但被 catch 住后没有重新抛出。
-    // 这实际上是一个逻辑错误，但为了编译器满意，我们需要在这里抛出一个最终的异常。
-    // 更好的做法是在 catch 中，如果是第二次尝试，就必须 throw。
-    // 上面的 if (attempt > 1 ...) 已经处理了这种情况。
-    // 所以理论上这段代码是不可达的。
     throw std::runtime_error("HttpClient: All retry attempts failed.");
 }
 
@@ -294,7 +281,7 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
 
         // 再次尝试解析
         url = ada::parse<ada::url_aggregator>(url_string);
-        if (!url.has_value()) {
+        if (!url) {
             throw std::runtime_error("Parsing failed for URL: " + url_string);
         }
     }

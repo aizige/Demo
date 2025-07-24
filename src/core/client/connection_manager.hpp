@@ -17,7 +17,7 @@ class IConnection;
 
 struct PooledConnection {
     std::shared_ptr<IConnection> connection;
-    bool is_reused; // true 表示是从池中复用的
+    bool is_reused = false; // true 表示是从池中复用的
 };
 /**
  * @brief 一个现代化的、基于 strand 和协程的 HTTP/1.1 & HTTP/2 连接池管理器。
