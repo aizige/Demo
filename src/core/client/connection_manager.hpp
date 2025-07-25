@@ -55,7 +55,7 @@ public:
      *        此方法是线程安全的。
      * @param conn 要释放的连接。
      */
-    void release_connection(std::shared_ptr<IConnection> conn);
+    void release_connection(const std::shared_ptr<IConnection>& conn);
 private:
 
 
@@ -87,8 +87,12 @@ private:
     boost::asio::ip::tcp::resolver resolver_;
 
     // 连接池本体
-    using ConnectionDeque = std::deque<std::shared_ptr<IConnection>>;
-    std::unordered_map<std::string, ConnectionDeque> pool_;
+    using H1ConnectionDeque = std::deque<std::shared_ptr<IConnection>>;
+    std::unordered_map<std::string, H1ConnectionDeque> pool_;
+
+    // 存储可共享的 H2 连接。每个主机可以有多个 H2 连接以提高吞吐量上限。
+    using H2ConnectionVector = std::vector<std::shared_ptr<IConnection>>;
+    std::unordered_map<std::string, H2ConnectionVector> h2_pool_;
 
     // --- 后台维护任务相关 ---
     boost::asio::steady_timer maintenance_timer_;

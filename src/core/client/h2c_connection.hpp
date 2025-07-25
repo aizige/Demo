@@ -48,6 +48,12 @@ public:
 
     boost::asio::awaitable<bool> ping() override;
     int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
+
+    size_t get_max_concurrent_streams() const override{return max_concurrent_streams_.load();};
+
+    void update_last_used_time() override;
+    bool supports_multiplexing() const override { return true; }
+
 private:
     int64_t last_used_timestamp_seconds_;
 
@@ -90,7 +96,8 @@ private:
     std::atomic<bool> is_closing_ = false;
 
     static std::string generate_simple_uuid();
-    std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
+    std::atomic<size_t> active_streams_{0};
+    std::atomic<size_t> max_concurrent_streams_{100}; // 默认值
 };
 
 

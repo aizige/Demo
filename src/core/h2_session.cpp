@@ -59,7 +59,7 @@ boost::asio::awaitable<void> Http2Session::start() {
         // 并行运行 I/O 循环和请求处理循环
         co_await (session_loop() && dispatcher_loop());
     } catch (const std::exception& e) {
-        spdlog::debug("H2 session ended: {}", e.what());
+        SPDLOG_DEBUG("H2 session ended: {}", e.what());
     }
 }
 
@@ -124,9 +124,9 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
             // as_tuple(use_awaitable) 会让 timer_op 返回 std::tuple<error_code>
             auto [ec_timer] = std::get<1>(result);
             if (!ec_timer) {
-                spdlog::info("H2 connection idle timeout.");
+                SPDLOG_INFO("H2 connection idle timeout.");
             } else if (ec_timer != boost::asio::error::operation_aborted) {
-                spdlog::warn("H2 timer error: {}", ec_timer.message());
+                SPDLOG_WARN("H2 timer error: {}", ec_timer.message());
             }
             dispatch_channel_.close();
             break;
@@ -139,7 +139,7 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
         // 2. 检查读取操作的 error_code
         if (ec) {
             if (ec != boost::asio::error::eof) {
-                spdlog::warn("H2 session_loop read error: {}", ec.message());
+                SPDLOG_WARN("H2 session_loop read error: {}", ec.message());
             }
             dispatch_channel_.close();
             break;
@@ -151,7 +151,7 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
         // 4. 将数据喂给 nghttp2
         ssize_t rv = nghttp2_session_mem_recv(session_, (const uint8_t*)buf.data(), n);
         if (rv < 0) {
-            spdlog::error("nghttp2_session_mem_recv() failed: {}", nghttp2_strerror(rv));
+            SPDLOG_ERROR("nghttp2_session_mem_recv() failed: {}", nghttp2_strerror(rv));
             dispatch_channel_.close();
             break;
         }
@@ -208,7 +208,7 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
     try {
         co_await match.handler(ctx);
     } catch (const std::exception& e) {
-        spdlog::error("Exception in H2 handler for [{}]: {}", ctx.request().target(), e.what());
+        SPDLOG_ERROR("Exception in H2 handler for [{}]: {}", ctx.request().target(), e.what());
         ctx.json(http::status::internal_server_error, "error Internal Server Error");
     }
 

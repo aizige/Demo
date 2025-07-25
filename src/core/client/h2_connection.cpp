@@ -26,13 +26,17 @@
 #include <ranges>
 #include <boost/algorithm/string/case_conv.hpp>
 #include "utils/utils.hpp"
+struct finally {
+    std::function<void()> func;
+    ~finally() { func(); }
+};
 // --- Constructor, Destructor, and Helpers ---
 Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
-: stream_(std::move(stream)),
-  pool_key_(std::move(pool_key)),
-  id_(generate_simple_uuid()),
-  strand_(stream_->get_executor()),
-  last_used_timestamp_seconds_(steady_clock_seconds_since_epoch()) {
+    : stream_(std::move(stream)),
+      pool_key_(std::move(pool_key)),
+      id_(generate_simple_uuid()),
+      strand_(stream_->get_executor()),
+      last_used_timestamp_seconds_(steady_clock_seconds_since_epoch()) {
     SPDLOG_DEBUG("Http2Connection [{}] created.", id_);
 }
 
@@ -52,6 +56,10 @@ std::string Http2Connection::generate_simple_uuid() {
 
 
 
+void Http2Connection::update_last_used_time() {
+    last_used_timestamp_seconds_ = steady_clock_seconds_since_epoch();
+}
+
 boost::asio::awaitable<bool> Http2Connection::ping() {
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
     if (!is_usable()) {
@@ -65,7 +73,7 @@ boost::asio::awaitable<bool> Http2Connection::ping() {
 
     try {
         co_await do_write();
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         spdlog::warn("H2 Connection [{}]: Ping failed during write: {}", id_, e.what());
         is_closing_ = true;
         co_return false;
@@ -94,9 +102,12 @@ boost::asio::awaitable<void> Http2Connection::start() {
             init_nghttp2_session();
 
             // 1. 提交客户端的 SETTINGS 帧
-            // TODO:配置足够大的流量控制窗口（SETTINGS_INITIAL_WINDOW_SIZE）？如果窗口太小（比如默认的 64KB），那么在传输大文件时，客户端和服务器会频繁地来回发送 WINDOW_UPDATE 帧，这会增加额外的延迟。
-            nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
-            nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 1);
+
+            nghttp2_settings_entry iv[] = {
+                {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
+                {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, (1 << 24)} // 设置 16MB 窗口
+            };
+            nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, std::size(iv));
 
             // 2. 启动握手 I/O 循环
             while (!handshake_completed_ && is_usable()) {
@@ -122,7 +133,7 @@ boost::asio::awaitable<void> Http2Connection::start() {
                 // **失败**: 不取消定时器，让它自然超时。
                 SPDLOG_WARN("Handshake I/O loop exited but handshake not complete.");
             }
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             SPDLOG_ERROR("Exception in handshake I/O coroutine: {}", e.what());
             // 出现异常，让定时器自然超时。
         }
@@ -161,11 +172,11 @@ boost::asio::awaitable<void> Http2Connection::start() {
 }
 
 
-
-
 boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest request) {
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
-    last_used_timestamp_seconds_ = steady_clock_seconds_since_epoch();
+   ++ active_streams_;
+    auto guard = finally([this] { --active_streams_; });
+    update_last_used_time();
 
     if (!is_usable()) {
         throw boost::system::system_error(boost::asio::error::not_connected, "H2 connection is not usable");
@@ -209,7 +220,7 @@ boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest reques
 }
 
 void Http2Connection::init_nghttp2_session() {
-    nghttp2_session_callbacks* callbacks;
+    nghttp2_session_callbacks *callbacks;
     nghttp2_session_callbacks_new(&callbacks);
     nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, &on_begin_headers_callback);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, &on_header_callback);
@@ -239,12 +250,12 @@ boost::asio::awaitable<void> Http2Connection::session_loop() {
             if (nghttp2_session_want_read(session_)) {
                 co_await do_read();
             }
-        } catch (const boost::system::system_error& e) {
+        } catch (const boost::system::system_error &e) {
             if (e.code() != boost::asio::error::operation_aborted) {
                 SPDLOG_WARN("H2 Connection [{}] loop error: {}", id_, e.what());
             }
             break; // 出现无法恢复的错误，退出循环
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             SPDLOG_ERROR("H2 Connection [{}] loop unexpected error: {}", id_, e.what());
             break;
         }
@@ -266,7 +277,7 @@ boost::asio::awaitable<void> Http2Connection::do_read() {
     }
 
     if (session_) {
-        ssize_t rv = nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t*>(read_buf_.data()), n);
+        ssize_t rv = nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t *>(read_buf_.data()), n);
         if (rv < 0) {
             is_closing_ = true;
         }
@@ -276,9 +287,9 @@ boost::asio::awaitable<void> Http2Connection::do_read() {
 boost::asio::awaitable<void> Http2Connection::do_write() {
     auto self_weak = weak_from_this();
 
-    while (session_ &&  nghttp2_session_want_write(session_)) {
+    while (session_ && nghttp2_session_want_write(session_)) {
         if (self_weak.expired()) co_return;
-        const uint8_t* data = nullptr;
+        const uint8_t *data = nullptr;
         ssize_t len = nghttp2_session_mem_send(session_, &data);
         if (len < 0) {
             SPDLOG_ERROR("nghttp2_session_mem_send failed with error: {}", nghttp2_strerror(len));
@@ -312,11 +323,12 @@ boost::asio::awaitable<void> Http2Connection::close() {
 
     if (session_ && stream_ && stream_->lowest_layer().is_open()) {
         nghttp2_submit_goaway(session_, NGHTTP2_FLAG_NONE, nghttp2_session_get_last_proc_stream_id(session_), NGHTTP2_NO_ERROR, nullptr, 0);
-        try { co_await do_write(); } catch (...) {}
+        try { co_await do_write(); } catch (...) {
+        }
     }
 
     auto streams_to_cancel = std::move(streams_);
-    for (auto& [id, stream_ctx_ptr] : streams_to_cancel) {
+    for (auto &[id, stream_ctx_ptr]: streams_to_cancel) {
         if (stream_ctx_ptr) {
             stream_ctx_ptr->response_channel.try_send(boost::asio::error::operation_aborted, HttpResponse{});
         }
@@ -336,9 +348,9 @@ boost::asio::awaitable<void> Http2Connection::close() {
     SPDLOG_DEBUG("H2 Connection [{}]: Closed.", id_);
 }
 
-void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req, StreamContext& stream_ctx) {
+void Http2Connection::prepare_headers(std::vector<nghttp2_nv> &nva, const HttpRequest &req, StreamContext &stream_ctx) {
     size_t header_count = 0;
-    for (const auto& field : req) {
+    for (const auto &field: req) {
         if (field.name() != http::field::host && field.name() != http::field::connection) {
             header_count++;
         } else {
@@ -346,29 +358,29 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
         }
     }
 
-    auto& storage = stream_ctx.header_storage;
+    auto &storage = stream_ctx.header_storage;
     // 预估大小，减少 vector 重分配的可能。每个头需要2个string(k,v)，伪头部需要1个string。
-    storage.reserve((header_count  * 2) + 4);
+    storage.reserve((header_count * 2) + 4);
 
     // --- 伪头部 ---
     // 对于伪头部，它们的名称是常量字符串，可以直接使用。值则需要存储。
     storage.emplace_back(req.method_string()); // e.g., "GET"
-    nva.push_back({(uint8_t*)":method", (uint8_t*)storage.back().data(), 7, storage.back().length(), NGHTTP2_NV_FLAG_NONE});
+    nva.push_back({(uint8_t *) ":method", (uint8_t *) storage.back().data(), 7, storage.back().length(), NGHTTP2_NV_FLAG_NONE});
 
     storage.emplace_back("https");
-    nva.push_back({(uint8_t*)":scheme", (uint8_t*)storage.back().data(), 7, 5, NGHTTP2_NV_FLAG_NONE});
+    nva.push_back({(uint8_t *) ":scheme", (uint8_t *) storage.back().data(), 7, 5, NGHTTP2_NV_FLAG_NONE});
 
     storage.emplace_back(req.at(http::field::host));
-    nva.push_back({(uint8_t*)":authority", (uint8_t*)storage.back().data(), 10, storage.back().length(), NGHTTP2_NV_FLAG_NONE});
+    nva.push_back({(uint8_t *) ":authority", (uint8_t *) storage.back().data(), 10, storage.back().length(), NGHTTP2_NV_FLAG_NONE});
 
     std::string_view path_sv = req.target();
     if (path_sv.empty()) path_sv = "/";
     storage.emplace_back(path_sv);
-    nva.push_back({(uint8_t*)":path", (uint8_t*)storage.back().data(), 5, storage.back().length(), NGHTTP2_NV_FLAG_NONE});
+    nva.push_back({(uint8_t *) ":path", (uint8_t *) storage.back().data(), 5, storage.back().length(), NGHTTP2_NV_FLAG_NONE});
 
 
     // --- 常规头部 ---
-    for (const auto& field : req) {
+    for (const auto &field: req) {
         http::field name_enum = field.name();
         // 过滤头部
         if (name_enum == http::field::host || name_enum == http::field::connection ||
@@ -378,7 +390,6 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
         }
 
 
-
         // 1. 存储小写的 header name
         storage.emplace_back(boost::algorithm::to_lower_copy(std::string(field.name_string())));
 
@@ -386,25 +397,25 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
         storage.emplace_back(field.value());
 
         // 3. 使用指向 storage 末尾两个元素的指针
-        const auto& name_str = *(storage.end() - 2);
-        const auto& value_str = *(storage.end() - 1);
+        const auto &name_str = *(storage.end() - 2);
+        const auto &value_str = *(storage.end() - 1);
 
         nva.push_back({
-           (uint8_t*)name_str.data(),
-           (uint8_t*)value_str.data(),
-           name_str.length(),
-           value_str.length(),
-           NGHTTP2_NV_FLAG_NONE // **移除 NO_COPY 标志**
-       });
+            (uint8_t *) name_str.data(),
+            (uint8_t *) value_str.data(),
+            name_str.length(),
+            value_str.length(),
+            NGHTTP2_NV_FLAG_NONE // **移除 NO_COPY 标志**
+        });
     }
 }
 
 // --- Callbacks Implementation ---
-int Http2Connection::on_begin_headers_callback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
-    (void)user_data;
+int Http2Connection::on_begin_headers_callback(nghttp2_session *session, const nghttp2_frame *frame, void *user_data) {
+    (void) user_data;
     if (frame->hd.type != NGHTTP2_HEADERS) return 0;
 
-    auto stream_ctx = static_cast<StreamContext*>(
+    auto stream_ctx = static_cast<StreamContext *>(
         nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)
     );
     if (!stream_ctx) return 0;
@@ -414,42 +425,42 @@ int Http2Connection::on_begin_headers_callback(nghttp2_session* session, const n
 }
 
 
-int Http2Connection::on_header_callback(nghttp2_session* session, const nghttp2_frame* frame, const uint8_t* name, size_t namelen, const uint8_t* value, size_t valuelen, uint8_t flags, void* user_data) {
+int Http2Connection::on_header_callback(nghttp2_session *session, const nghttp2_frame *frame, const uint8_t *name, size_t namelen, const uint8_t *value, size_t valuelen, uint8_t flags, void *user_data) {
     // 这个回调不需要 Http2Connection 的 user_data，因为我们可以从 stream 中获取所有东西
     // auto self = static_cast<Http2Connection*>(user_data);
-    (void)user_data;
-    auto stream_ctx = static_cast<StreamContext*>(
+    (void) user_data;
+    auto stream_ctx = static_cast<StreamContext *>(
         nghttp2_session_get_stream_user_data(session, frame->hd.stream_id)
     );
     if (!stream_ctx) return 0;
 
-    std::string_view key((const char*)name, namelen);
+    std::string_view key((const char *) name, namelen);
     if (key == ":status") {
         try {
-            stream_ctx->response_in_progress.result(std::stoi(std::string((const char*)value, valuelen)));
+            stream_ctx->response_in_progress.result(std::stoi(std::string((const char *) value, valuelen)));
         } catch (...) {
             /* ignore */
         }
     } else if (!key.empty() && key[0] != ':') {
-        stream_ctx->response_in_progress.set(key, std::string_view((const char*)value, valuelen));
+        stream_ctx->response_in_progress.set(key, std::string_view((const char *) value, valuelen));
     }
     return 0;
 }
 
 
-int Http2Connection::on_data_chunk_recv_callback(nghttp2_session* session, uint8_t, int32_t stream_id, const uint8_t* data, size_t len, void* user_data) {
-    (void)user_data;
-    auto stream_ctx = static_cast<StreamContext*>(
+int Http2Connection::on_data_chunk_recv_callback(nghttp2_session *session, uint8_t, int32_t stream_id, const uint8_t *data, size_t len, void *user_data) {
+    (void) user_data;
+    auto stream_ctx = static_cast<StreamContext *>(
         nghttp2_session_get_stream_user_data(session, stream_id)
     );
     if (!stream_ctx) return 0;
 
-    stream_ctx->response_in_progress.body().append((const char*)data, len);
+    stream_ctx->response_in_progress.body().append((const char *) data, len);
     return 0;
 }
 
-int Http2Connection::on_stream_close_callback(nghttp2_session* session, int32_t stream_id, uint32_t error_code, void* user_data) {
-    auto self = static_cast<Http2Connection*>(user_data);
+int Http2Connection::on_stream_close_callback(nghttp2_session *session, int32_t stream_id, uint32_t error_code, void *user_data) {
+    auto self = static_cast<Http2Connection *>(user_data);
 
     // 因为回调总是在strand上执行，所以可以直接访问streams_
     auto it = self->streams_.find(stream_id);
@@ -473,10 +484,21 @@ int Http2Connection::on_stream_close_callback(nghttp2_session* session, int32_t 
     return 0;
 }
 
-int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
-    auto self = static_cast<Http2Connection*>(user_data);
+int Http2Connection::on_frame_recv_callback(nghttp2_session *, const nghttp2_frame *frame, void *user_data) {
+    auto self = static_cast<Http2Connection *>(user_data);
     if (frame->hd.type == NGHTTP2_SETTINGS && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
         self->handshake_completed_ = true;
+
+        // 从服务器的 SETTINGS 帧中获取正确的最大并发流数
+        uint32_t max_streams = nghttp2_session_get_remote_settings(
+            self->session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
+        );
+
+        // nghttp2 规范说默认值是无限，但通常实现会给个值，我也设置了一个合理的默认上限
+        if (max_streams > 0) { // 有些实现可能返回 0 或未指定
+            self->max_concurrent_streams_ = max_streams;
+            SPDLOG_INFO("H2 [{}]: Server updated max_concurrent_streams to {}", self->id_, max_streams);
+        }
     }
     if (frame->hd.type == NGHTTP2_GOAWAY) {
         SPDLOG_WARN("GOAWAY received on [{}], error code: {}", self->id_, frame->goaway.error_code);
@@ -486,9 +508,9 @@ int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_fram
 }
 
 
-ssize_t Http2Connection::read_request_body_callback(nghttp2_session*, int32_t, uint8_t* buf, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void*) {
+ssize_t Http2Connection::read_request_body_callback(nghttp2_session *, int32_t, uint8_t *buf, size_t length, uint32_t *data_flags, nghttp2_data_source *source, void *) {
     //  source->ptr 获取
-    auto stream_ctx = static_cast<StreamContext*>(source->ptr);
+    auto stream_ctx = static_cast<StreamContext *>(source->ptr);
     if (!stream_ctx) {
         SPDLOG_ERROR("read_request_body_callback failed: StreamContext is null.");
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;

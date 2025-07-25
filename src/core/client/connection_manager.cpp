@@ -75,12 +75,10 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
         // 将维护工作 post 到 strand 上
         co_await boost::asio::post(strand_, boost::asio::use_awaitable);
 
-        //SPDLOG_DEBUG("ConnectionManager: Running maintenance task...");
-        auto now = steady_clock_seconds_since_epoch();
 
         // 遍历所有连接池
         for (auto &[key, queue]: pool_) {
-            ConnectionDeque healthy_queue;
+            H1ConnectionDeque healthy_queue;
             while (!queue.empty()) {
                 auto conn = std::move(queue.front());
                 queue.pop_front();
@@ -99,7 +97,7 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
                 }
 
                 // 规则2：如果连接空闲时间太长（例如超过60秒），主动关闭它
-
+                const auto now = steady_clock_seconds_since_epoch();
                 if (now - conn->get_last_used_timestamp_seconds() > 60) {
                     SPDLOG_INFO("关闭闲置时间过长的连接 {}", conn->id());
                     boost::asio::co_spawn(
@@ -134,35 +132,83 @@ boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
 
     // --- 我们现在在 strand 上，可以安全地访问 pool_ ---
+    // --- 策略 1: 优先复用一个现有的 H2 连接 ---
+    auto h2_it = h2_pool_.find(key);
+    if (h2_it != h2_pool_.end()) {
+        auto &h2_conns = h2_it->second;
+        SPDLOG_DEBUG("H2 connection pool [{}], size = {}", key, h2_conns.size());
+        std::shared_ptr<IConnection> best_conn = nullptr;
+        size_t min_streams = SIZE_MAX;
 
-    auto &idle_queue = pool_[key];
-    SPDLOG_DEBUG("idle_queue size = {}", idle_queue.size());
-    // 循环检查池中所有连接，直到找到一个可用的，或者池子变空
-    while (!idle_queue.empty()) {
-        auto conn = std::move(idle_queue.front());
-        SPDLOG_DEBUG("s_usable = {}", conn->is_usable());
-        idle_queue.pop_front();
-        // **取出时校验**
-        if (conn->is_usable()) {
-            SPDLOG_DEBUG("对键 {} 重复使用连接 {}", conn->id(), key);
-            co_return PooledConnection{conn, true};
-        } else {
+        // 遍历该主机的所有 H2 连接，找到最空闲的一个
+        for (const auto &conn: h2_conns) {
+            if (conn->is_usable()) {
+                size_t current_streams = conn->get_active_streams();
+                if (current_streams < conn->get_max_concurrent_streams() && current_streams < min_streams) {
+                    best_conn = conn;
+                    min_streams = current_streams;
+                }
+            }
+        }
+        if (best_conn) {
+            SPDLOG_DEBUG("Multiplexing on H2 connection {} ({} active streams)", best_conn->id(), min_streams);
+            co_return PooledConnection{best_conn, true};
+        }
+    }
+
+    // --- 策略 2: 其次，从池中取一个空闲的 H1.1 连接 ---
+    auto h1_it = pool_.find(key);
+    if (h1_it != pool_.end()) {
+        auto &h1_queue = h1_it->second;
+        SPDLOG_DEBUG("H1 connection pool [{}], size = {}", key, h1_queue.size());
+        while (!h1_queue.empty()) {
+            auto conn = std::move(h1_queue.front());
+            h1_queue.pop_front();
+            if (conn->is_usable() && conn->get_active_streams() < 0) {
+                SPDLOG_DEBUG("Reusing H1 connection {} from pool", conn->id());
+                co_return PooledConnection{conn, true};
+            }
             SPDLOG_DEBUG("从连接池中删除为 {} 的陈旧连接 {}", conn->id(), key);
-            // 连接失效，继续循环检查下一个
         }
     }
 
     // 池中无可用连接，创建新的
-    SPDLOG_DEBUG("池中没有可用于 {} 的连接，正在创建新的连接。", key);
-    std::shared_ptr<IConnection> connection = co_await create_new_connection(key, scheme, host, port);
+    SPDLOG_DEBUG("连接池中没有可用于主机: {} 的连接，正在创建新的连接。", key);
+    std::shared_ptr<IConnection> new_connection = co_await create_new_connection(key, scheme, host, port);
 
-    co_return PooledConnection{connection, true};
+    // **根据新连接类型决定如何处理**
+    if (new_connection->supports_multiplexing()) {
+        // 新的 H2 连接，放入 H2 连接列表以供共享, H1 连接直接返回给调用者使用，用完后会被 release_connection 放回 H1 池
+        h2_pool_[key].push_back(new_connection);
+    }
+
+    co_return PooledConnection{new_connection, true};
 }
 
-void ConnectionManager::release_connection(std::shared_ptr<IConnection> conn) {
+void ConnectionManager::release_connection(const std::shared_ptr<IConnection> &conn) {
     // 同样，将释放操作调度到 strand 上
     boost::asio::post(strand_, [this, conn]() {
-        // 在 lambda 内部，我们是线程安全的
+        // 对于 H2 连接，release 实际上是空操作，因为它的状态由内部计数器管理
+        // 我们只需要处理丢弃逻辑
+        if (conn->supports_multiplexing()) {
+            if (!conn->is_usable()) {
+                SPDLOG_DEBUG("Discarding H2 connection {}.", conn->id());
+                // 从 H2 列表中移除
+                auto it = h2_pool_.find(conn->get_pool_key());
+                if (it != h2_pool_.end()) {
+                    auto &h2_conns = it->second;
+                    std::erase(h2_conns, conn);
+
+                    // 如果 vector 变为空，选择删除整个 key
+                    if (h2_conns.empty()) {
+                        h2_pool_.erase(it);
+                    }
+                }
+            }
+            return; // H2 连接不归还，它一直在“池”里
+        }
+
+        // 对于 H1.1 连接
         if (!conn->is_usable()) {
             SPDLOG_DEBUG("丢弃连接 {}", conn->id());
             // conn 的 shared_ptr 在 lambda 结束时被销毁，自动触发关闭

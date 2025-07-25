@@ -20,25 +20,35 @@ public:
 
     //explicit HttpSslConnection(boost::asio::ip::tcp::socket socket, boost::asio::ssl::context& ctx, std::string pool_key);
     explicit HttpSslConnection(StreamType stream, std::string pool_key);
+
     ~HttpSslConnection() override;
 
 
     boost::asio::awaitable<HttpResponse> execute(HttpRequest request) override;
+
     bool is_usable() const override;
+
     boost::asio::awaitable<void> close() override;
-    const std::string& id() const override;
-    const std::string& get_pool_key() const override;
+
+    const std::string &id() const override;
+
+    const std::string &get_pool_key() const override;
 
     size_t get_active_streams() const override { return active_streams_.load(); }
 
     boost::asio::awaitable<bool> ping() override;
-    int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
-    void update_last_used_time() ;
 
+    int64_t get_last_used_timestamp_seconds() const override { return last_used_timestamp_seconds_; }
+
+    size_t get_max_concurrent_streams() const override { return 1; }
+
+    void update_last_used_time() override;
+
+    bool supports_multiplexing() const override { return false; }
 
 private:
-
     static std::string generate_simple_uuid();
+
     StreamType stream_;
 
     boost::beast::flat_buffer buffer_;

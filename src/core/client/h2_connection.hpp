@@ -46,6 +46,11 @@ public:
     int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
     boost::asio::awaitable<bool> ping() override;
 
+    bool supports_multiplexing() const override { return true; }
+    size_t get_max_concurrent_streams() const override{ return max_concurrent_streams_.load();}
+
+    void update_last_used_time() override;
+
     // --- H2 客户端特定方法 ---
     boost::asio::awaitable<void> start();
 
@@ -95,8 +100,11 @@ private:
     static std::string generate_simple_uuid();
 
     std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
+
     // 用于记录最后一次活动时间
     int64_t last_used_timestamp_seconds_;
+
+    std::atomic<size_t> max_concurrent_streams_{100}; // 默认值
 
 };
 

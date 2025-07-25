@@ -20,6 +20,8 @@ Http1Connection::Http1Connection(tcp::socket socket, std::string pool_key)
     SPDLOG_DEBUG("Http1Connection [{}] for pool [{}] created.", id_, pool_key_);
 }
 
+
+
 boost::asio::awaitable<void> Http1Connection::close() {
     if (socket_.socket().is_open()) {
         boost::beast::error_code ec;
@@ -80,7 +82,7 @@ boost::asio::awaitable<HttpResponse> Http1Connection::execute(HttpRequest reques
     try {
         // **在进入时，增加并发流计数**
         ++active_streams_;
-        last_used_timestamp_seconds_ = steady_clock_ms_since_epoch();
+        update_last_used_time();
         // 发送请求
         co_await http::async_write(socket_, request, boost::asio::use_awaitable);
         SPDLOG_DEBUG("Http1Connection [{}] request sent.", id_);
@@ -114,7 +116,9 @@ bool Http1Connection::is_usable() const {
     // 对于 H1.1 连接，只要 socket 打开并且我们没有主动标记它为关闭，就认为是可用的
 }
 
-
+void Http1Connection::update_last_used_time(){
+    last_used_timestamp_seconds_ = steady_clock_ms_since_epoch();
+}
 
 size_t Http1Connection::get_active_streams() const {
     return active_streams_.load();

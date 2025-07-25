@@ -47,6 +47,12 @@ public:
 
     boost::asio::awaitable<bool> ping() override;
     int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
+
+    size_t get_max_concurrent_streams() const override{return 1;}
+
+    void update_last_used_time() override;
+    bool supports_multiplexing() const override { return false; }
+
 private:
 
     // 辅助函数，生成一个简单的伪UUID

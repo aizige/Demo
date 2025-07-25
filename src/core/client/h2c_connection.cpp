@@ -67,10 +67,9 @@ void Http2cConnection::start() {
 
 boost::asio::awaitable<HttpResponse> Http2cConnection::execute(HttpRequest request) { // <-- 改回按值传递以匹配接口
     if (!is_usable()) throw std::runtime_error("H2 connection is not usable.");
-    last_used_timestamp_seconds_ = steady_clock_ms_since_epoch();
     std::vector<nghttp2_nv> nva;
     prepare_headers(nva, request);
-
+    update_last_used_time();
     auto ex = co_await boost::asio::this_coro::executor;
 
     auto stream_ctx_ptr = std::make_unique<StreamContext>(ex);
@@ -288,6 +287,11 @@ int Http2cConnection::on_frame_recv_callback(nghttp2_session*, const nghttp2_fra
     }
 
     return 0; // 客户端通常不需要对其他帧做特殊处理
+}
+
+void Http2cConnection::update_last_used_time() {
+    last_used_timestamp_seconds_ = steady_clock_seconds_since_epoch();
+
 }
 
 boost::asio::awaitable<bool> Http2cConnection::ping() {

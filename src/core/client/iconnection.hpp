@@ -36,7 +36,21 @@ public:
      */
     virtual size_t get_active_streams() const = 0;
     virtual boost::asio::awaitable<bool> ping() = 0; // 新增 ping 接口
-    virtual int64_t get_last_used_timestamp_seconds() const = 0; // 新增时间戳接口
+    virtual int64_t get_last_used_timestamp_seconds() const = 0; //  获取连接的最后使用的时间戳
+
+    /**
+ * @brief 该连接是否支持应用层多路复用 (H2/H3 支持, H1.1 不支持)。
+ */
+    virtual bool supports_multiplexing() const { return false; }
+
+    /**
+     * @brief 获取服务器允许的最大并发流数。
+     */
+    virtual size_t get_max_concurrent_streams() const = 0;
+    /**
+  * @brief 更新连接的最后使用时间戳。
+  */
+    virtual void update_last_used_time() = 0;
 
     /**
  * @brief 释放并返回底层 TCP socket 的所有权。
@@ -51,6 +65,8 @@ public:
         // 默认实现返回一个空的 optional
         co_return std::nullopt;
     }
+
+
 };
 
 

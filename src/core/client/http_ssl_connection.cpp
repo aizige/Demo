@@ -120,3 +120,4 @@ std::string HttpSslConnection::generate_simple_uuid() {
     static std::atomic<uint64_t> counter = 0;
     return "conn-ssl-" + std::to_string(++counter);
 }
+
