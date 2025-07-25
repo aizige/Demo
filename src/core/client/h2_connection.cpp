@@ -32,7 +32,7 @@ Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
   pool_key_(std::move(pool_key)),
   id_(generate_simple_uuid()),
   strand_(stream_->get_executor()),
-  last_used_timestamp_ms_(steady_clock_ms_since_epoch()) {
+  last_used_timestamp_seconds_(steady_clock_seconds_since_epoch()) {
     SPDLOG_DEBUG("Http2Connection [{}] created.", id_);
 }
 
@@ -57,7 +57,10 @@ boost::asio::awaitable<bool> Http2Connection::ping() {
     if (!is_usable()) {
         co_return false;
     }
-
+    if (active_streams_.load() > 0) {
+        // 已经有业务在用了，那肯定是活的，直接返回成功，不要去添乱
+        co_return true;
+    }
     nghttp2_submit_ping(session_, NGHTTP2_FLAG_NONE, nullptr);
 
     try {
@@ -162,7 +165,7 @@ boost::asio::awaitable<void> Http2Connection::start() {
 
 boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest request) {
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
-    last_used_timestamp_ms_ = steady_clock_ms_since_epoch();
+    last_used_timestamp_seconds_ = steady_clock_seconds_since_epoch();
 
     if (!is_usable()) {
         throw boost::system::system_error(boost::asio::error::not_connected, "H2 connection is not usable");

@@ -36,4 +36,26 @@ inline int64_t steady_clock_ns_since_epoch() {
     // steady_clock 的精度通常就是纳秒，所以可能不需要 cast
     return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 }
+
+/**
+ * @brief 获取当前时间的 Unix 时间戳（秒）。
+ * system_clock 基于现实世界的 UTC 时间，可能会被调整。
+ * 适合用于日志记录、与外部系统通信等场景。
+ * @return int64_t 类型的秒级 Unix 时间戳 (10位数)。
+ */
+inline int64_t system_clock_seconds_since_epoch() {
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+}
+
+/**
+ * @brief 获取当前时间的 Unix 时间戳（毫秒）。
+ * @return int64_t 类型的毫秒级 Unix 时间戳 (13位数)。
+ */
+inline int64_t system_clock_ms_since_epoch() {
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
+
 #endif //UNTITLED1_UTILS_HPP

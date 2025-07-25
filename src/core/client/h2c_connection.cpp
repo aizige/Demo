@@ -28,7 +28,7 @@ Http2cConnection::Http2cConnection(StreamPtr stream, std::string pool_key)
       pool_key_(std::move(pool_key)),
       id_(generate_simple_uuid()),
 strand_(stream_->get_executor()),
-last_used_timestamp_ms_(steady_clock_ms_since_epoch())
+last_used_timestamp_seconds_(steady_clock_seconds_since_epoch())
 {}
 
 Http2cConnection::~Http2cConnection() {
@@ -67,7 +67,7 @@ void Http2cConnection::start() {
 
 boost::asio::awaitable<HttpResponse> Http2cConnection::execute(HttpRequest request) { // <-- 改回按值传递以匹配接口
     if (!is_usable()) throw std::runtime_error("H2 connection is not usable.");
-    last_used_timestamp_ms_ = steady_clock_ms_since_epoch();
+    last_used_timestamp_seconds_ = steady_clock_ms_since_epoch();
     std::vector<nghttp2_nv> nva;
     prepare_headers(nva, request);
 

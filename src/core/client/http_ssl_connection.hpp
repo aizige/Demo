@@ -32,7 +32,7 @@ public:
     size_t get_active_streams() const override { return active_streams_.load(); }
 
     boost::asio::awaitable<bool> ping() override;
-    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
+    int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
     void update_last_used_time() ;
 
 
@@ -46,7 +46,7 @@ private:
     std::string pool_key_;
     bool keep_alive_ = true;
     std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
-    int64_t last_used_timestamp_ms_;
+    int64_t last_used_timestamp_seconds_;
 };
 
 

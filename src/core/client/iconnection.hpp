@@ -36,7 +36,7 @@ public:
      */
     virtual size_t get_active_streams() const = 0;
     virtual boost::asio::awaitable<bool> ping() = 0; // 新增 ping 接口
-    virtual int64_t get_last_used_timestamp_ms() const = 0; // 新增时间戳接口
+    virtual int64_t get_last_used_timestamp_seconds() const = 0; // 新增时间戳接口
 
     /**
  * @brief 释放并返回底层 TCP socket 的所有权。

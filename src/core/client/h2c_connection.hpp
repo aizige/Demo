@@ -47,9 +47,9 @@ public:
     void start(); // 启动器，非协程
 
     boost::asio::awaitable<bool> ping() override;
-    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
+    int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
 private:
-    int64_t last_used_timestamp_ms_;
+    int64_t last_used_timestamp_seconds_;
 
     // 上下文，用于存储一个客户端发起的流（请求-响应对）的状态
     struct StreamContext {

@@ -46,7 +46,7 @@ public:
     boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> release_socket() override;
 
     boost::asio::awaitable<bool> ping() override;
-    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
+    int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
 private:
 
     // 辅助函数，生成一个简单的伪UUID
@@ -63,6 +63,6 @@ private:
     bool keep_alive_ = true;
     std::string pool_key_;
     std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
-    int64_t last_used_timestamp_ms_;
+    int64_t last_used_timestamp_seconds_;
 };
 #endif //UNTITLED1_HTTP1_CONNECTION_HPP

@@ -43,7 +43,7 @@ public:
     const std::string& id() const override { return id_; }
     const std::string& get_pool_key() const override { return pool_key_; }
     size_t get_active_streams() const override { return active_streams_.load(); }
-    int64_t get_last_used_timestamp_ms() const override{ return last_used_timestamp_ms_; }
+    int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
     boost::asio::awaitable<bool> ping() override;
 
     // --- H2 客户端特定方法 ---
@@ -96,7 +96,8 @@ private:
 
     std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
     // 用于记录最后一次活动时间
-    int64_t last_used_timestamp_ms_;
+    int64_t last_used_timestamp_seconds_;
+
 };
 
 

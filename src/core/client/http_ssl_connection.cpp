@@ -14,7 +14,7 @@ HttpSslConnection::HttpSslConnection(StreamType stream, std::string pool_key)
     : stream_(std::move(stream)), // 直接移动传入的 stream
       id_(generate_simple_uuid()),
 pool_key_(std::move(pool_key)),
-last_used_timestamp_ms_(steady_clock_ms_since_epoch()) {
+last_used_timestamp_seconds_(steady_clock_seconds_since_epoch()) {
     SPDLOG_DEBUG("HttpSslConnection [{}] for pool [{}] created.", id_, pool_key_);
 }
 
@@ -27,6 +27,11 @@ boost::asio::awaitable<bool> HttpSslConnection::ping() {
     if (!is_usable()) {
         co_return false;
     }
+    if (active_streams_.load() > 0) {
+        // 已经有业务在用了，那肯定是活的，直接返回成功，不要去添乱
+        co_return true;
+    }
+
     try {
         auto url = ada::parse<ada::url_aggregator>(pool_key_);
        if (!url) {
@@ -49,7 +54,7 @@ boost::asio::awaitable<bool> HttpSslConnection::ping() {
         //    只要能收到一个合法的 HTTP 响应（即使是 4xx 或 5xx），
         //    都证明了整个网络链路是通畅的。
         if (response.result_int() > 0) {
-            update_last_used_time();
+
             co_return true;
         }
         // 如果收到无效响应，则认为连接有问题
@@ -62,6 +67,7 @@ boost::asio::awaitable<bool> HttpSslConnection::ping() {
 
 boost::asio::awaitable<HttpResponse> HttpSslConnection::execute(HttpRequest request) {
     try {
+        ++active_streams_;
         update_last_used_time();
         // 发送请求
         co_await http::async_write(stream_, request, boost::asio::use_awaitable);
@@ -80,10 +86,12 @@ boost::asio::awaitable<HttpResponse> HttpSslConnection::execute(HttpRequest requ
         }
         SPDLOG_DEBUG("HttpsConnection [{}] response received with status {}.keep_alive_ = {}", id_, response.result_int(), keep_alive_);
         // 返回响应
+        --active_streams_;
         co_return response;
     } catch (const boost::system::system_error& e) {
         SPDLOG_ERROR("HttpsConnection [{}] error: {}", id_, e.what());
         keep_alive_ = false;
+        --active_streams_;
         // 将异常重新抛出，让调用者知道操作失败了
         throw;
     }
@@ -102,7 +110,7 @@ boost::asio::awaitable<void> HttpSslConnection::close() {
 }
 
 void HttpSslConnection::update_last_used_time() {
-    last_used_timestamp_ms_ = steady_clock_ms_since_epoch();
+    last_used_timestamp_seconds_ = steady_clock_seconds_since_epoch();
 }
 
 const std::string& HttpSslConnection::id() const { return id_; }
