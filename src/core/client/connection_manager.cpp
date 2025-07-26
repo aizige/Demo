@@ -26,6 +26,7 @@ ConnectionManager::ConnectionManager(boost::asio::io_context &ioc, bool enable_m
         boost::asio::ssl::context::no_tlsv1_1 |
         boost::asio::ssl::context::single_dh_use
     );
+    // 显式设置验证回调 (set_verify_callback) 并不是严格必须的
     ssl_ctx_.set_default_verify_paths();
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
 
@@ -234,7 +235,12 @@ boost::asio::awaitable<std::shared_ptr<IConnection> > ConnectionManager::create_
             co_await async_connect(socket, endpoints, boost::asio::use_awaitable);
             co_return std::make_shared<Http1Connection>(std::move(socket), key);
         } else if (scheme == "https:") {
+            // 2. 创建 stream
             auto stream = std::make_shared<boost::beast::ssl_stream<boost::beast::tcp_stream> >(ioc_, ssl_ctx_);
+            //auto stream = std::make_shared<boost::beast::ssl_stream<tcp::socket>>(ioc_, ssl_ctx_);
+
+            // 3. 建立 TCP 连接
+            //co_await boost::asio::async_connect(get_lowest_layer(*stream), endpoints, boost::asio::use_awaitable);
             co_await async_connect(stream->next_layer().socket(), endpoints, boost::asio::use_awaitable);
 
             if (!SSL_set_tlsext_host_name(stream->native_handle(), host.data())) {

@@ -14,7 +14,6 @@
 #include <boost/asio/experimental/parallel_group.hpp> // <-- 引入 parallel_group
 #include "http/request_context.hpp"
 #include <nghttp2/nghttp2.h>
-#include <nghttp2/n>
 
 #include <boost/system/system_error.hpp>
 
@@ -48,6 +47,7 @@ Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
 }
 
 Http2Connection::~Http2Connection() {
+
     if (session_) {
         nghttp2_session_del(session_);
         session_ = nullptr; // 关键: 置为 nullptr
