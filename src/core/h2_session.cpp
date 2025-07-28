@@ -5,6 +5,7 @@
 #include <chrono>                   // C++ 时间库
 #include <boost/asio/experimental/parallel_group.hpp> // <-- 引入 parallel_group
 #include "http/request_context.hpp"
+#include "utils/finally.hpp"
 
 // 将 C++14 的时间字面量（如 30s）引入当前作用域
 using namespace std::literals::chrono_literals;
@@ -12,16 +13,18 @@ using namespace std::literals::chrono_literals;
 /**
  * @brief Http2Session 构造函数
  */
-Http2Session::Http2Session(StreamPtr stream, Router& router)
+Http2Session::Http2Session(StreamPtr stream, Router &router)
     : stream_(std::move(stream)), // 移动语义，接管 SSL 流的所有权
       router_(router), // 保存对路由器的引用
       strand_(stream_->get_executor()), // 从流中获取执行器并构造一个 strand，保证线程安全
       session_(nullptr), // 初始化 nghttp2 会话指针为空
-      idle_timer_(strand_), // 在同一个 strand 上构造空闲计时器
-      dispatch_channel_(strand_)
-{
+      idle_timer_(strand_),
+      write_trigger_(strand_),
+      // 在同一个 strand 上构造空闲计时器
+      dispatch_channel_(strand_) {
     // 初始时，将计时器设置为永不超时
     idle_timer_.expires_at(std::chrono::steady_clock::time_point::max());
+    write_trigger_.expires_at(std::chrono::steady_clock::time_point::max());
 }
 
 /**
@@ -31,14 +34,13 @@ Http2Session::Http2Session(StreamPtr stream, Router& router)
 Http2Session::~Http2Session() {
     if (session_)
         nghttp2_session_del(session_);
-    // **在析构时调用回调**
 }
 
 /**
  * @brief 初始化 nghttp2 会话，设置所有必需的回调函数
  */
 void Http2Session::init_session() {
-    nghttp2_session_callbacks* callbacks;
+    nghttp2_session_callbacks *callbacks;
     nghttp2_session_callbacks_new(&callbacks);
     // 绑定各种事件的回调函数，这是 nghttp2 与我们 C++ 代码交互的桥梁
     nghttp2_session_callbacks_set_on_header_callback(callbacks, on_header_callback);
@@ -56,9 +58,9 @@ void Http2Session::init_session() {
 boost::asio::awaitable<void> Http2Session::start() {
     using namespace boost::asio::experimental::awaitable_operators;
     try {
-        // 并行运行 I/O 循环和请求处理循环
-        co_await (session_loop() && dispatcher_loop());
-    } catch (const std::exception& e) {
+        // 并行运行所有三个核心循环
+        co_await (session_loop() && dispatcher_loop() && writer_loop());
+    } catch (const std::exception &e) {
         SPDLOG_DEBUG("H2 session ended: {}", e.what());
     }
 }
@@ -71,7 +73,7 @@ boost::asio::awaitable<void> Http2Session::do_write() {
     try {
         // 只要 nghttp2 告诉我们它有数据想发送，就一直循环
         while (nghttp2_session_want_write(session_)) {
-            const uint8_t* data_ptr = nullptr;
+            const uint8_t *data_ptr = nullptr;
             // 从 nghttp2 获取待发送数据块的指针和长度
             ssize_t len = nghttp2_session_mem_send(session_, &data_ptr);
             if (len <= 0)
@@ -82,9 +84,50 @@ boost::asio::awaitable<void> Http2Session::do_write() {
             // 不会去拉取下一个数据块，从而完美地避免了撑爆 OpenSSL 缓冲区的问题。
             co_await boost::asio::async_write(*stream_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception &) {
         // 如果写入时发生任何错误（如连接被对方重置），关闭套接字以终止整个会话。
         stream_->next_layer().close();
+    }
+}
+
+void Http2Session::schedule_write() {
+    // 这个函数必须在 strand 上下文中被调用
+    if (write_in_progress_ || !session_ || !stream_->next_layer().is_open()) {
+        return;
+    }
+    if (nghttp2_session_want_write(session_)) {
+        // 立即触发 writer_loop
+        write_trigger_.cancel_one();
+    }
+}
+
+boost::asio::awaitable<void> Http2Session::writer_loop() {
+    try {
+        while (stream_->next_layer().is_open()) {
+            boost::system::error_code ec;
+            // 1. 使用 redirect_error 将错误码存入 ec，而不是抛出异常
+            co_await write_trigger_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+
+            // 如果 ec 是 operation_aborted，这是正常的唤醒，我们继续执行。
+            // 如果是其他错误，或者连接关闭了，我们就退出。
+            if (ec && ec != boost::asio::error::operation_aborted) {
+                // 真正的定时器错误，或者 session 正在关闭
+                break;
+            }
+            if (!stream_->next_layer().is_open()) {
+                break;
+            }
+
+            write_in_progress_ = true;
+            auto guard = Finally([this] { write_in_progress_ = false; });
+            co_await do_write();
+        }
+    } catch (const std::exception &e) {
+        SPDLOG_WARN("H2 writer_loop ended with exception: {}", e.what());
+        if (stream_->next_layer().is_open()) {
+            boost::system::error_code ignored_ec;
+            stream_->next_layer().close(ignored_ec);
+        }
     }
 }
 
@@ -96,18 +139,17 @@ boost::asio::awaitable<void> Http2Session::do_write() {
 boost::asio::awaitable<void> Http2Session::session_loop() {
     co_await boost::asio::dispatch(strand_, boost::asio::use_awaitable);
     init_session();
-    constexpr auto timeout = 30s;
+    constexpr auto timeout = 60s;
 
     idle_timer_.expires_after(timeout);
     nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
     nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 1);
-    co_await do_write();
+    schedule_write();
 
     std::array<char, 8192> buf{};
 
     using namespace boost::asio::experimental::awaitable_operators;
     while (stream_->next_layer().is_open()) {
-
         // **为了清晰，我们明确指定 as_tuple**
         auto read_op = stream_->async_read_some(
             boost::asio::buffer(buf),
@@ -119,12 +161,17 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
 
         auto result = co_await(std::move(read_op) || std::move(timer_op));
 
-        if (result.index() == 1) { // --- 超时发生 ---
+        if (result.index() == 1) {
+            // --- 超时发生 ---
             // timer_op 完成
             // as_tuple(use_awaitable) 会让 timer_op 返回 std::tuple<error_code>
             auto [ec_timer] = std::get<1>(result);
             if (!ec_timer) {
-                SPDLOG_INFO("H2 connection idle timeout.");
+                SPDLOG_INFO("H2 connection idle timeout. Sending GOAWAY.");
+                // --- 关键修改 ---
+                // 调用我们新的优雅关闭协程
+                // NGHTTP2_NO_ERROR 表示这是一个计划内的关闭，而不是协议错误
+                co_await graceful_shutdown(NGHTTP2_NO_ERROR);
             } else if (ec_timer != boost::asio::error::operation_aborted) {
                 SPDLOG_WARN("H2 timer error: {}", ec_timer.message());
             }
@@ -149,7 +196,7 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
         idle_timer_.expires_after(timeout);
 
         // 4. 将数据喂给 nghttp2
-        ssize_t rv = nghttp2_session_mem_recv(session_, (const uint8_t*)buf.data(), n);
+        ssize_t rv = nghttp2_session_mem_recv(session_, (const uint8_t *) buf.data(), n);
         if (rv < 0) {
             SPDLOG_ERROR("nghttp2_session_mem_recv() failed: {}", nghttp2_strerror(rv));
             dispatch_channel_.close();
@@ -157,9 +204,10 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
         }
 
         // 5. 触发写操作
-        co_await do_write();
+        schedule_write();
     }
 }
+
 // --- **[新增]** 请求处理循环 ---
 boost::asio::awaitable<void> Http2Session::dispatcher_loop() {
     for (;;) {
@@ -187,9 +235,9 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
 
     HttpRequest req;
     req.version(20);
-    for (const auto& pair : stream_ctx.headers) {
-        const std::string& key = pair.first;
-        const std::string& val = pair.second;
+    for (const auto &pair: stream_ctx.headers) {
+        const std::string &key = pair.first;
+        const std::string &val = pair.second;
         if (key.empty()) continue;
         if (key[0] == ':') {
             if (key == ":method") req.method(http::string_to_verb(val));
@@ -207,19 +255,19 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
 
     try {
         co_await match.handler(ctx);
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         SPDLOG_ERROR("Exception in H2 handler for [{}]: {}", ctx.request().target(), e.what());
         ctx.json(http::status::internal_server_error, "error Internal Server Error");
     }
 
-    auto& resp = ctx.response();
+    auto &resp = ctx.response();
 
     std::vector<nghttp2_nv> headers;
     std::string status_code = std::to_string(resp.result_int());
-    headers.push_back({(uint8_t*)":status", (uint8_t*)status_code.c_str(), 7, status_code.size(), NGHTTP2_NV_FLAG_NONE});
-    for (const auto& field : resp) {
+    headers.push_back({(uint8_t *) ":status", (uint8_t *) status_code.c_str(), 7, status_code.size(), NGHTTP2_NV_FLAG_NONE});
+    for (const auto &field: resp) {
         if (field.name() == http::field::connection) continue;
-        headers.push_back({(uint8_t*)field.name_string().data(), (uint8_t*)field.value().data(), field.name_string().length(), field.value().length(), NGHTTP2_NV_FLAG_NONE});
+        headers.push_back({(uint8_t *) field.name_string().data(), (uint8_t *) field.value().data(), field.name_string().length(), field.value().length(), NGHTTP2_NV_FLAG_NONE});
     }
 
     auto content = std::make_shared<std::string>(std::move(resp.body()));
@@ -230,8 +278,8 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
         pack->content = content;
         provider.source.ptr = pack.get();
         // ... read_callback ...
-        provider.read_callback = [](nghttp2_session*, int32_t, uint8_t* buf, size_t len, uint32_t* flags, nghttp2_data_source* src, void*) -> ssize_t {
-            auto* p = static_cast<ProviderPack*>(src->ptr);
+        provider.read_callback = [](nghttp2_session *, int32_t, uint8_t *buf, size_t len, uint32_t *flags, nghttp2_data_source *src, void *) -> ssize_t {
+            auto *p = static_cast<ProviderPack *>(src->ptr);
             if (!p || !p->content) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             size_t remaining = p->content->size() - p->offset;
             size_t n = std::min(len, remaining);
@@ -248,14 +296,14 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
     nghttp2_submit_response(session_, stream_id, headers.data(), headers.size(), (pack ? &provider : nullptr));
 
     // 在 dispatch 协程的最后，触发一次写操作
-    co_await do_write();
+    schedule_write();
 }
 
 /**
  * @brief nghttp2 回调：当一个完整的帧被接收时调用
  */
-int Http2Session::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
-    auto* self = static_cast<Http2Session*>(user_data);
+int Http2Session::on_frame_recv_callback(nghttp2_session *, const nghttp2_frame *frame, void *user_data) {
+    auto *self = static_cast<Http2Session *>(user_data);
     int32_t sid = frame->hd.stream_id;
     // 我们只关心带有 END_STREAM 标志的帧，因为它代表一个请求的结束
     if (sid != 0 && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
@@ -273,24 +321,23 @@ int Http2Session::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* 
  */
 // in H2Session.cpp and H2cSession.cpp
 
-int Http2Session::on_header_callback(nghttp2_session*, const nghttp2_frame* frame,
-                                     const uint8_t* name, size_t namelen,
-                                     const uint8_t* value, size_t valuelen,
-                                     uint8_t, void* user_data)
-{
-    auto* self = static_cast<Http2Session*>(user_data); // or H2cSession*
+int Http2Session::on_header_callback(nghttp2_session *, const nghttp2_frame *frame,
+                                     const uint8_t *name, size_t namelen,
+                                     const uint8_t *value, size_t valuelen,
+                                     uint8_t, void *user_data) {
+    auto *self = static_cast<Http2Session *>(user_data); // or H2cSession*
     int32_t sid = frame->hd.stream_id;
     if (sid == 0) return 0;
 
     if (self->streams_.find(sid) == self->streams_.end()) {
         self->streams_[sid] = {};
     }
-    auto& stream_ctx = self->streams_.at(sid);
+    auto &stream_ctx = self->streams_.at(sid);
 
     // **直接存储原始数据，不做任何解析**
     stream_ctx.headers.emplace_back(
-        std::string((const char*)name, namelen),
-        std::string((const char*)value, valuelen)
+        std::string((const char *) name, namelen),
+        std::string((const char *) value, valuelen)
     );
 
     return 0;
@@ -299,12 +346,12 @@ int Http2Session::on_header_callback(nghttp2_session*, const nghttp2_frame* fram
 /**
  * @brief nghttp2 回调：当一小块请求体数据被接收时调用
  */
-int Http2Session::on_data_chunk_recv_callback(nghttp2_session*, uint8_t, int32_t stream_id, const uint8_t* data, size_t len, void* user_data) {
-    auto* self = static_cast<Http2Session*>(user_data);
+int Http2Session::on_data_chunk_recv_callback(nghttp2_session *, uint8_t, int32_t stream_id, const uint8_t *data, size_t len, void *user_data) {
+    auto *self = static_cast<Http2Session *>(user_data);
     auto it = self->streams_.find(stream_id);
     if (it != self->streams_.end()) {
         // 将数据块追加到对应流的 body 字符串中
-        it->second.body.append((char*)data, len);
+        it->second.body.append((char *) data, len);
     }
     return 0;
 }
@@ -312,8 +359,8 @@ int Http2Session::on_data_chunk_recv_callback(nghttp2_session*, uint8_t, int32_t
 /**
  * @brief nghttp2 回调：当一个流被关闭时调用
  */
-int Http2Session::on_stream_close_callback(nghttp2_session*, int32_t stream_id, uint32_t, void* user_data) {
-    auto* self = static_cast<Http2Session*>(user_data);
+int Http2Session::on_stream_close_callback(nghttp2_session *, int32_t stream_id, uint32_t, void *user_data) {
+    auto *self = static_cast<Http2Session *>(user_data);
     // 使用 post 将清理工作调度到 strand 上，以确保线程安全
     boost::asio::post(self->strand_,
                       [self, stream_id]() {
@@ -324,38 +371,76 @@ int Http2Session::on_stream_close_callback(nghttp2_session*, int32_t stream_id, 
 }
 
 
+boost::asio::awaitable<void> Http2Session::graceful_shutdown(uint32_t error_code) {
+    // 确保我们总是在 strand 上下文中执行此操作。
+    // 如果调用者已经在 strand 上，dispatch 是一个 no-op。
+    // 如果不在，它会将协程的剩余部分 post 到 strand 上。
+    co_await boost::asio::dispatch(strand_, boost::asio::use_awaitable);
 
-void Http2Session::graceful_shutdown() {
-    // 使用 post 确保操作在 session 的 strand 上执行，保证线程安全
-    boost::asio::post(strand_,
-                      [self = shared_from_this()]() {
-                          if (!self->session_ || !self->stream_->next_layer().is_open()) {
-                              return; // 如果会话已经关闭，则什么也不做
-                          }
+    // 检查是否已经关闭或正在关闭
+    if (!session_ || !stream_->next_layer().is_open()) {
+        co_return;
+    }
 
-                          SPDLOG_INFO("Initiating graceful shutdown for Http2Session...");
+    SPDLOG_INFO("Initiating graceful shutdown for Http2Session with error_code={}", error_code);
 
-                          // 获取最后一个处理的流 ID。nghttp2 会确保ID小于等于此值的流被处理完。
-                          int32_t last_stream_id = nghttp2_session_get_last_proc_stream_id(self->session_);
+    int32_t last_stream_id = nghttp2_session_get_last_proc_stream_id(session_);
 
-                          // 准备 GOAWAY 帧
-                          boost::system::error_code ec;
-                          int rv = nghttp2_submit_goaway(
-                              self->session_,
-                              NGHTTP2_FLAG_NONE,
-                              last_stream_id,
-                              NGHTTP2_NO_ERROR,
-                              // 这是一个正常的关闭，没有错误
-                              nullptr,
-                              0
-                          );
+    int rv = nghttp2_submit_goaway(
+        session_,
+        NGHTTP2_FLAG_NONE,
+        last_stream_id,
+        error_code,
+        nullptr,
+        0
+    );
 
-                          if (rv != 0) {
-                              SPDLOG_ERROR("nghttp2_submit_goaway() failed: {}", nghttp2_strerror(rv));
-                              return;
-                          }
+    if (rv != 0) {
+        SPDLOG_ERROR("nghttp2_submit_goaway() failed: {}", nghttp2_strerror(rv));
+        // 即使提交失败，我们也要继续尝试关闭
+    }
 
-                          // 提交 GOAWAY 帧后，需要触发一次写操作来把它发送出去
-                          boost::asio::co_spawn(self->strand_, self->do_write(), boost::asio::detached);
-                      });
+    // 触发 writer_loop 来发送 GOAWAY 帧。
+    // 因为我们已经在 strand 上，所以可以直接调用。
+    schedule_write();
+
+    // 注意：我们在这里不 co_await do_write()，因为那是 writer_loop 的职责。
+    // schedule_write() 已经足够唤醒它了。
+    // 同样，我们也不需要在这里等待一小段时间，因为调用 graceful_shutdown 之后，
+    // 通常会有关闭 socket 的操作，这会给 writer_loop 足够的时间去发送数据。
+}
+
+boost::asio::awaitable<void> Http2Session::do_graceful_shutdown(uint32_t error_code) {
+    // 确保在 strand 上下文中执行
+    co_await boost::asio::dispatch(strand_, boost::asio::use_awaitable);
+
+    if (!session_ || !stream_->next_layer().is_open()) {
+        co_return; // 已经关闭了
+    }
+
+    SPDLOG_INFO("Initiating graceful shutdown for Http2Session with error_code={}", error_code);
+
+    int32_t last_stream_id = nghttp2_session_get_last_proc_stream_id(session_);
+
+    int rv = nghttp2_submit_goaway(
+        session_,
+        NGHTTP2_FLAG_NONE,
+        last_stream_id,
+        error_code, // 使用传入的错误码 (例如 NGHTTP2_NO_ERROR 或其他)
+        nullptr,
+        0
+    );
+
+    if (rv != 0) {
+        SPDLOG_ERROR("nghttp2_submit_goaway() failed: {}", nghttp2_strerror(rv));
+        // 即使提交失败，我们也要继续关闭流程
+    }
+
+    // 触发 writer_loop 来发送 GOAWAY 帧
+    schedule_write();
+
+    // **可选但推荐**: 等待一小段时间，给 GOAWAY 帧发送出去的机会
+    // 这不是必须的，因为 writer_loop 会尽力发送，但可以增加成功率
+    boost::asio::steady_timer t(co_await boost::asio::this_coro::executor, 50ms);
+    co_await t.async_wait(boost::asio::use_awaitable);
 }

@@ -4,14 +4,15 @@
 
 #ifndef UNTITLED1_CONNECTION_MANAGER_HPP
 #define UNTITLED1_CONNECTION_MANAGER_HPP
-#include <map>
+
 #include <queue>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/experimental/promise.hpp>
-#include <boost/asio/ssl/context.hpp>
 
+#include <boost/asio/ssl/context.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/channel.hpp>
 // 向前声明
 class IConnection;
 
@@ -97,6 +98,17 @@ private:
     // --- 后台维护任务相关 ---
     boost::asio::steady_timer maintenance_timer_;
     bool stopped_ = false;
+
+    // **使用 channel 作为异步锁/信号**
+    // 它可以携带成功的结果 (shared_ptr) 或失败的结果 (exception_ptr)
+    using ConnectionResult = std::variant<
+        std::shared_ptr<IConnection>,
+        std::exception_ptr
+    >;
+    using CreationChannel = boost::asio::experimental::channel<void(boost::system::error_code, ConnectionResult)>;
+
+    // 用于存储每个 key 正在创建连接的 channel
+    std::unordered_map<std::string, std::shared_ptr<CreationChannel>> creation_channels_;
 };
 
 

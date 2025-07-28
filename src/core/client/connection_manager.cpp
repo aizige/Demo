@@ -9,6 +9,7 @@
 #include "http_ssl_connection.hpp"
 #include "h2_connection.hpp"
 #include "utils/utils.hpp"
+#include "utils/finally.hpp" // 假设你有一个 RAII guard
 
 
 ConnectionManager::ConnectionManager(boost::asio::io_context &ioc, bool enable_maintenance)
@@ -165,25 +166,83 @@ boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::
         while (!h1_queue.empty()) {
             auto conn = std::move(h1_queue.front());
             h1_queue.pop_front();
-            if (conn->is_usable() && conn->get_active_streams() < 0) {
-                SPDLOG_DEBUG("Reusing H1 connection {} from pool", conn->id());
+            if (conn->is_usable() && conn->get_active_streams() <= 0) {
+                SPDLOG_DEBUG("复用池中的 H1 连接 {}", conn->id());
                 co_return PooledConnection{conn, true};
             }
             SPDLOG_DEBUG("从连接池中删除为 {} 的陈旧连接 {}", conn->id(), key);
         }
     }
 
-    // 池中无可用连接，创建新的
-    SPDLOG_DEBUG("连接池中没有可用于主机: {} 的连接，正在创建新的连接。", key);
-    std::shared_ptr<IConnection> new_connection = co_await create_new_connection(key, scheme, host, port);
+    // --- 池子为空，进入受保护的创建流程 ---
 
-    // **根据新连接类型决定如何处理**
-    if (new_connection->supports_multiplexing()) {
-        // 新的 H2 连接，放入 H2 连接列表以供共享, H1 连接直接返回给调用者使用，用完后会被 release_connection 放回 H1 池
-        h2_pool_[key].push_back(new_connection);
+    // 3. 检查是否已有协程正在为这个 key 创建连接
+    if (auto it = creation_channels_.find(key); it != creation_channels_.end()) {
+        auto channel = it->second;
+        SPDLOG_DEBUG("Connection for '{}' is being created by another task, waiting...", key);
+
+        // **离开 strand 去等待结果**，避免死锁
+        co_await boost::asio::post(ioc_, boost::asio::use_awaitable);
+
+        auto [ec, result] = co_await channel->async_receive(boost::asio::as_tuple(boost::asio::use_awaitable));
+
+        if (ec) {
+            throw boost::system::system_error(ec, "Failed while waiting for connection creation");
+        }
+
+        // 检查创建结果
+        if (auto e_ptr_ptr = std::get_if<std::exception_ptr>(&result)) {
+            std::rethrow_exception(*e_ptr_ptr); // 第一个创建者失败了，我们也跟着失败
+        }
+
+        // 第一个创建者成功了，它已经把连接放入了池中。
+        // 我们需要重新调用 get_connection 来公平地从池中获取它。
+        // 再次调用会重新进入 strand，是安全的。
+        co_return co_await get_connection(scheme, host, port);
     }
 
-    co_return PooledConnection{new_connection, true};
+    // 4. 我是第一个创建者，上锁！
+    auto ex = co_await boost::asio::this_coro::executor;
+    auto channel = std::make_shared<CreationChannel>(ex, 1); // 容量为 1 即可
+    creation_channels_[key] = channel;
+
+    // 使用 RAII guard 确保 channel 一定会被从 map 中移除
+    auto guard = Finally([this, key] {
+        boost::asio::post(strand_, [this, key] {
+            post(strand_, [this, key] { creation_channels_.erase(key); }); // 确保 channel 会被清理
+            SPDLOG_DEBUG("Creation channel for '{}' removed.", key);
+        });
+    });
+
+    // 4. 离开 strand 去执行耗时的 I/O
+    co_await boost::asio::post(ioc_, boost::asio::use_awaitable);
+
+
+    SPDLOG_DEBUG("连接池中没有可用于主机: {} 的连接，正在创建新的连接。", key);
+    auto new_conn = co_await create_new_connection(key, scheme, host, port);
+    try {
+        new_conn = co_await create_new_connection(key, scheme, host, port);
+    } catch (...) {
+        // **创建失败**: 通过 channel 广播异常
+        auto e_ptr = std::current_exception();
+        post(strand_, [channel, e_ptr] {
+            channel->try_send(boost::system::error_code{}, ConnectionResult(e_ptr));
+        });
+        std::rethrow_exception(e_ptr); // 重新抛出，让当前协程失败
+    }
+    // **成功**: 回到 strand 上，把新连接放入池中，并通过 channel 通知所有等待者
+    post(strand_, [this, new_conn, channel, key] {
+        // 在 strand 上安全地更新共享状态
+        if (new_conn->supports_multiplexing()) {
+            h2_pool_[key].push_back(new_conn);
+        } else {
+           // h1_pool_[key].push_back(new_conn);
+        }
+        // 广播成功结果
+        channel->try_send(boost::system::error_code{}, ConnectionResult(new_conn));
+    });
+    // 返回给我们自己的这个协程
+    co_return PooledConnection{new_conn, true};
 }
 
 void ConnectionManager::release_connection(const std::shared_ptr<IConnection> &conn) {
@@ -236,16 +295,15 @@ boost::asio::awaitable<std::shared_ptr<IConnection> > ConnectionManager::create_
             co_return std::make_shared<Http1Connection>(std::move(socket), key);
         } else if (scheme == "https:") {
             // 2. 创建 stream
-            auto stream = std::make_shared<boost::beast::ssl_stream<boost::beast::tcp_stream> >(ioc_, ssl_ctx_);
-            //auto stream = std::make_shared<boost::beast::ssl_stream<tcp::socket>>(ioc_, ssl_ctx_);
+            auto stream = std::make_shared<boost::beast::ssl_stream<tcp::socket> >(ioc_, ssl_ctx_);
 
             // 3. 建立 TCP 连接
-            //co_await boost::asio::async_connect(get_lowest_layer(*stream), endpoints, boost::asio::use_awaitable);
-            co_await async_connect(stream->next_layer().socket(), endpoints, boost::asio::use_awaitable);
+            co_await async_connect(get_lowest_layer(*stream), endpoints, boost::asio::use_awaitable);
 
             if (!SSL_set_tlsext_host_name(stream->native_handle(), host.data())) {
                 throw boost::system::system_error(static_cast<int>(::ERR_get_error()), boost::asio::error::get_ssl_category());
             }
+
             co_await stream->async_handshake(boost::asio::ssl::stream_base::client, boost::asio::use_awaitable);
 
             const unsigned char *proto = nullptr;
@@ -253,12 +311,20 @@ boost::asio::awaitable<std::shared_ptr<IConnection> > ConnectionManager::create_
             SSL_get0_alpn_selected(stream->native_handle(), &proto, &len);
             if (proto && std::string_view((const char *) proto, len) == "h2") {
                 SPDLOG_INFO("ALPN selected h2 for {}. Creating Http2Connection.", host);
+                // a. 创建 Actor 对象
                 auto conn = Http2Connection::create(stream, key);
-                co_await conn->start();
+
+                // b. 调用同步的 run() 方法来启动后台 actor_loop
+                conn->run();
+
+                // c. **立即返回**。我们不再等待 H2 握手完成。
+                //    H2 握手现在是 actor_loop 内部的第一阶段。
+                //    第一个 `execute` 请求会被 channel 自动“缓冲”，
+                //    直到 actor_loop 完成握手并开始处理请求消息。
                 co_return conn;
             } else {
                 SPDLOG_INFO("ALPN selected http/1.1 for {}. Creating HttpSslConnection.", host);
-                co_return std::make_shared<HttpSslConnection>(std::move(*stream), key);
+                co_return std::make_shared<HttpSslConnection>(stream, key);
             }
         }
         throw std::runtime_error("Unsupported scheme: " + std::string(scheme));
