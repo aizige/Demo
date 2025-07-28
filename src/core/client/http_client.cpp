@@ -186,6 +186,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
         auto it = res.find(http::field::content_encoding);
         if (it != res.end()) {
+            SPDLOG_DEBUG("正在解压Body");
             std::string decompressed_body;
             if (boost::beast::iequals(it->value(), "gzip")) {
                 // **直接调用线程安全的静态方法**
@@ -204,6 +205,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
                 res.erase(http::field::content_encoding);
                 res.prepare_payload();
             }
+            SPDLOG_DEBUG("正在解压Body 完毕");
         }
         co_return res;
     }

@@ -33,6 +33,7 @@ add_executable(untitled1
         src/http/router.cpp
         src/utils/decompressor.cpp
         src/utils/decompression_manager.cpp
+        src/utils/compressor.cpp
         src/core/client/http_ssl_connection.cpp
         src/core/client/h2_connection.cpp
         src/core/client/h2c_connection.cpp

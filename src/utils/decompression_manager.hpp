@@ -11,6 +11,8 @@
 #include <string_view>
 #include <memory>
 
+#include "compressor.hpp"
+
 namespace utils::compression {
 
     /**
@@ -35,10 +37,16 @@ namespace utils::compression {
          */
         static std::string deflate_decompress(std::string_view compressed_data);
 
+        static std::string gzip_compress(std::string_view data);
+        static std::string deflate_compress(std::string_view data);
+
     private:
         // 私有辅助函数，用于获取当前线程的解压器实例
         static Decompressor& get_thread_local_gzip_decompressor();
         static Decompressor& get_thread_local_deflate_decompressor();
+
+        static Compressor &get_thread_local_gzip_Compressor();
+        static Compressor &get_thread_local_deflate_Compressor();
     };
 
 }

@@ -71,22 +71,26 @@ boost::asio::awaitable<void> Http2Session::start() {
  */
 boost::asio::awaitable<void> Http2Session::do_write() {
     try {
-        // 只要 nghttp2 告诉我们它有数据想发送，就一直循环
-        while (nghttp2_session_want_write(session_)) {
+        if (session_ && nghttp2_session_want_write(session_)) {
             const uint8_t *data_ptr = nullptr;
-            // 从 nghttp2 获取待发送数据块的指针和长度
             ssize_t len = nghttp2_session_mem_send(session_, &data_ptr);
-            if (len <= 0)
-                break; // 如果没有数据或出错，则退出循环
 
-            // 异步写入数据。co_await 在这里提供了最关键的、天然的背压控制。
-            // 在数据被完全写入（或进入内核缓冲区）之前，协程会在此挂起，
-            // 不会去拉取下一个数据块，从而完美地避免了撑爆 OpenSSL 缓冲区的问题。
-            co_await boost::asio::async_write(*stream_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
+            if (len < 0) {
+                SPDLOG_ERROR("H2 Server: nghttp2_session_mem_send() failed: {}", nghttp2_strerror(len));
+                if (stream_->next_layer().is_open()) stream_->next_layer().close();
+                co_return;
+            }
+
+            if (len > 0) {
+                co_await boost::asio::async_write(*stream_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
+            }
         }
-    } catch (const std::exception &) {
-        // 如果写入时发生任何错误（如连接被对方重置），关闭套接字以终止整个会话。
-        stream_->next_layer().close();
+    } catch (const std::exception &e) {
+        SPDLOG_WARN("H2 Server do_write failed, closing socket: {}", e.what());
+        if (stream_->next_layer().is_open()) {
+            boost::system::error_code ignored_ec;
+            stream_->next_layer().close(ignored_ec);
+        }
     }
 }
 
@@ -105,22 +109,27 @@ boost::asio::awaitable<void> Http2Session::writer_loop() {
     try {
         while (stream_->next_layer().is_open()) {
             boost::system::error_code ec;
-            // 1. 使用 redirect_error 将错误码存入 ec，而不是抛出异常
             co_await write_trigger_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
 
-            // 如果 ec 是 operation_aborted，这是正常的唤醒，我们继续执行。
-            // 如果是其他错误，或者连接关闭了，我们就退出。
             if (ec && ec != boost::asio::error::operation_aborted) {
-                // 真正的定时器错误，或者 session 正在关闭
                 break;
             }
             if (!stream_->next_layer().is_open()) {
                 break;
             }
 
+            if (write_in_progress_) continue;
             write_in_progress_ = true;
             auto guard = Finally([this] { write_in_progress_ = false; });
-            co_await do_write();
+
+            // **关键的 "清空队列" 循环**
+            while (session_ && nghttp2_session_want_write(session_)) {
+                co_await do_write();
+                // 检查 do_write 是否因为错误关闭了套接字
+                if (!stream_->next_layer().is_open()) {
+                    co_return;
+                }
+            }
         }
     } catch (const std::exception &e) {
         SPDLOG_WARN("H2 writer_loop ended with exception: {}", e.what());
@@ -186,7 +195,8 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
         // 2. 检查读取操作的 error_code
         if (ec) {
             if (ec != boost::asio::error::eof) {
-                SPDLOG_WARN("H2 session_loop read error: {}", ec.message());
+                SPDLOG_WARN("H2 session_loop read error: {} (value: {}, category: {})",
+                   ec.message(), ec.value(), ec.category().name());
             }
             dispatch_channel_.close();
             break;

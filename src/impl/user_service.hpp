@@ -59,41 +59,37 @@ public:
         // 2. 从上下文中获取名为 "kw" 和 "page" 的查询参数
         auto url = ctx.query_param("url");
         std::string_view value = url.value();
-
-        //ctx.string(http::status::ok, "TLS_ST_CR_SRVR_HELLO");
-        //co_return ;
         try {
             // 直接使用注入的 http_client_ 实例
             SPDLOG_DEBUG("准备对：{} 发起请求",value);
             HttpResponse response = co_await http_client_->get(value, {});
 
             if (response.result() == http::status::ok) {
-                SPDLOG_DEBUG("请求成功");
+                SPDLOG_DEBUG("请求成功 body size = {}",response.body().size());
                 std::string_view content_type;
                 auto it = response.find(http::field::content_type);
                 if (it != response.end()) {
                     content_type = it->value();
                 }
-
                 ctx.string(http::status::ok, response.body(), content_type);
                 co_return ;
             }
 
-            ctx.string(http::status::ok, http::obsolete_reason(response.result()));
+            ctx.string(response.result(), http::obsolete_reason(response.result()));
             co_return;
         } catch (const std::exception& e) {
             // 处理异常
             SPDLOG_ERROR("Failed to get user from external API: {}", e.what());
             ctx.json(http::status::bad_gateway,
                      {
-                         {"error", "Failed to fetch from upstream server"},
+                         {"error", "Failed to fetch from upstream server."},
                          {"reason", e.what()}
                      });
         }
     }
 
 private:
-    std::remove_reference<std::shared_ptr<IHttpClient>&>::type http_client_;
+    std::remove_reference_t<std::shared_ptr<IHttpClient>&> http_client_;
 };
 
 #endif // USERSERVICE_HPP

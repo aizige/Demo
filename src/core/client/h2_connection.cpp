@@ -175,31 +175,36 @@ asio::awaitable<void> Http2Connection::writer_loop() {
             boost::system::error_code ec;
             co_await write_trigger_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
-            // 1. 我们只关心真正的错误。operation_aborted 是正常唤醒或取消。
             if (ec && ec != asio::error::operation_aborted) {
-                // 抛出真正的错误，让 run_internal() 捕获
                 throw boost::system::system_error(ec, "writer_loop wait failed");
             }
+            if (is_closing_) co_return; // 如果在等待时被关闭，则退出
 
-            // 如果 ec 是 operation_aborted (来自 cancel_one) 或没有错误 (超时唤醒，虽然不太可能)，
-            // 并且我们没有被外部取消，就继续执行。
-
-            // 3. 执行写操作
+            if (write_in_progress_) continue;
             write_in_progress_ = true;
             auto guard = Finally([this] { write_in_progress_ = false; });
-            co_await do_write();
+
+
+            // 在一次 writer_loop 的唤醒中，循环调用 do_write，直到 nghttp2 的缓冲区被清空
+            while (session_ && nghttp2_session_want_write(session_)) {
+                co_await do_write();
+
+                // 检查 do_write 是否因为错误而将连接标记为关闭
+                if (is_closing_) {
+                    co_return;
+                }
+            }
         }
     } catch (const boost::system::system_error& e) {
         if (e.code() == asio::error::operation_aborted) {
-            // 这是由 parallel_group 取消导致的，是正常的退出路径。
             SPDLOG_DEBUG("Http2Connection [{}] writer_loop was canceled.", id_);
-            co_return; // 静默退出
+            co_return;
         }
         SPDLOG_WARN("Http2Connection [{}] writer_loop unhandled system_error: {}", id_, e.what());
-        throw; // 重新抛出其他系统错误
+        throw;
     } catch (const std::exception &e) {
         SPDLOG_WARN("H2 Connection [{}] writer_loop unhandled exception: {}", id_, e.what());
-        throw; // 重新抛出，让 run_internal 捕获
+        throw;
     }
 }
 
@@ -361,15 +366,29 @@ boost::asio::awaitable<void> Http2Connection::do_read() {
 }
 
 boost::asio::awaitable<void> Http2Connection::do_write() {
-    while (session_ && nghttp2_session_want_write(session_)) {
-        const uint8_t *data = nullptr;
-        ssize_t len = nghttp2_session_mem_send(session_, &data);
-        if (len <= 0) break;
-        auto [ec, _] = co_await asio::async_write(*stream_, asio::buffer(data, len), asio::as_tuple(asio::use_awaitable));
-        if (ec) {
-            is_closing_ = true;
-            break;
+    try {
+        if (session_ && nghttp2_session_want_write(session_)) {
+            const uint8_t *data = nullptr;
+            ssize_t len = nghttp2_session_mem_send(session_, &data);
+
+            if (len < 0) {
+                SPDLOG_ERROR("H2 Client [{}]: nghttp2_session_mem_send() failed: {}", id_, nghttp2_strerror(len));
+                is_closing_ = true;
+                co_return;
+            }
+
+            if (len > 0) {
+                // co_await 发送这一小块数据。
+                // 这提供了真正的背压。
+                auto [ec, _] = co_await asio::async_write(*stream_, asio::buffer(data, len), asio::as_tuple(asio::use_awaitable));
+                if (ec) {
+                    is_closing_ = true;
+                }
+            }
         }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("H2 Client [{}] do_write exception: {}", id_, e.what());
+        is_closing_ = true;
     }
 }
 

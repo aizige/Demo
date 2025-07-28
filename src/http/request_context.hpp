@@ -80,6 +80,8 @@ private:
      */
     void parse_query_if_needed() const;
 
+    void compress_if_acceptable();
+
     // --- 成员变量 ---
 
     HttpRequest request_;   // 持有请求对象的值

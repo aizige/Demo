@@ -34,12 +34,12 @@ public:
     Decompressor& operator=(Decompressor&& other) noexcept;
 
     // 主解压函数
-    std::string GzipDecompress(std::string_view compressed_data);
-    std::string DeflateDecompress(std::string_view compressed_data);
+    std::string decompress(std::string_view compressed_data);
+
     void reset(Format new_format);
 
 private:
-    std::string decompress(std::string_view compressed_data,Format format);
+
 
     void initialize(Format format);
     void cleanup();

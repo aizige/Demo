@@ -91,16 +91,10 @@ void Decompressor::reset(Format new_format) {
     }
 }
 
-std::string Decompressor::GzipDecompress(std::string_view compressed_data) {
-    return decompress(compressed_data, Format::GZIP);
-}
 
-std::string Decompressor::DeflateDecompress(std::string_view compressed_data) {
-    return decompress(compressed_data, Format::DEFLATE);
-}
 
-std::string Decompressor::decompress(std::string_view compressed_data, Format format) {
-    reset(format); // 确保每次解压都是从一个干净的状态开始
+std::string Decompressor::decompress(std::string_view compressed_data) {
+    reset(m_format); // 确保每次解压都是从一个干净的状态开始
 
     std::string decompressed_output;
 
@@ -123,6 +117,8 @@ std::string Decompressor::decompress(std::string_view compressed_data, Format fo
             (void)inflateEnd(&m_stream); // Clean up
             m_initialized = false;
             throw std::runtime_error("GzipDecompressor: inflate failed with critical error.");
+        default:
+                ;
         }
 
         // 计算这次解压了多少数据

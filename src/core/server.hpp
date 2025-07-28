@@ -8,7 +8,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>     // Asio 的 SSL/TLS 功能
 #include <boost/beast/http.hpp>   // Beast 的 HTTP/1.1 功能
-
+#include <boost/asio/experimental/parallel_group.hpp> // 引入 parallel_group
 #include "h2c_session.hpp"
 #include "http/router.hpp"
 #include "ssl_context_manager.hpp"
@@ -95,72 +95,65 @@ public:
         boost::asio::co_spawn(io_context_, listener(), boost::asio::detached);
     }
 
-    /**
-     * @brief 启动优雅关闭服务器的流程。
-     */
-    // 在 Server 类的实现中
-    void stop() {
-        // 1. 停止接受新连接 (同步操作，立即执行)
+    // 在 Server.hpp 或 Server.cpp 的 Server 类中
+
+// 在 Server.hpp 或 Server.cpp 的 Server 类中
+// **注意：返回类型是 void，不再是 awaitable<void>**
+void stop() {
+    // 1. 立即停止接受新连接
+    if (acceptor_.is_open()) {
         acceptor_.close();
         SPDLOG_INFO("Server stopped accepting new connections.");
-
-        // 2. 使用 co_spawn 启动一个协程来处理所有异步的关闭逻辑
-        //    asio::use_future 会让 co_spawn 返回一个 std::future<void>
-        std::future<void> shutdown_future = boost::asio::co_spawn(
-            io_context_,
-            // 这个 lambda 就是我们的“关闭”协程
-            [this]() -> boost::asio::awaitable<void> {
-                // 确保在锁的作用域内复制 shared_ptr 列表
-                std::vector<std::shared_ptr<Http2Session> > h2_sessions_to_close;
-                std::vector<std::shared_ptr<H2cSession> > h2c_sessions_to_close; {
-                    std::lock_guard<std::mutex> lock(session_mutex_);
-                    SPDLOG_INFO("Initiating graceful shutdown for {} H2 sessions...", h2_sessions_.size());
-                    for (auto const &weak_session: h2_sessions_) {
-                        if (auto session = weak_session.lock()) {
-                            h2_sessions_to_close.push_back(session);
-                        }
-                    }
-                    h2_sessions_.clear();
-
-                    SPDLOG_INFO("Initiating graceful shutdown for {} H2C sessions...", h2c_sessions_.size());
-                    for (auto const &weak_session: h2c_sessions_) {
-                        if (auto session = weak_session.lock()) {
-                            h2c_sessions_to_close.push_back(session);
-                        }
-                    }
-                    h2c_sessions_.clear();
-                }
-
-                // 现在我们可以在没有锁的情况下，安全地关闭这些 session
-                for (auto &session: h2_sessions_to_close) {
-                    try {
-                        // **现在我们可以 co_await 了！**
-                        co_await session->graceful_shutdown();
-                    } catch (const std::exception &e) {
-                        SPDLOG_WARN("Exception during H2 session graceful shutdown: {}", e.what());
-                    }
-                }
-
-                for (auto &session: h2c_sessions_to_close) {
-                    try {
-                        co_await session->graceful_shutdown();
-                    } catch (const std::exception &e) {
-                        SPDLOG_WARN("Exception during H2C session graceful shutdown: {}", e.what());
-                    }
-                }
-            },
-            boost::asio::use_future // 告诉 co_spawn 返回一个 future
-        );
-
-        // 3. **阻塞等待**异步关闭操作完成
-        try {
-            SPDLOG_INFO("Waiting for all sessions to gracefully shutdown...");
-            shutdown_future.get(); // 这会阻塞当前线程，直到协程完成或抛出异常
-            SPDLOG_INFO("All sessions have been shut down.");
-        } catch (const std::exception &e) {
-            SPDLOG_ERROR("Error during server shutdown: {}", e.what());
-        }
     }
+
+    // 2. 在锁的作用域内，为每个会话启动一个独立的关闭协程
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+
+        SPDLOG_INFO("Spawning shutdown tasks for {} H2 sessions...", h2_sessions_.size());
+        // --- 处理 Http2Session ---
+        for (const auto& weak_session : h2_sessions_) {
+            if (auto session = weak_session.lock()) {
+                // 为每个 session 启动一个独立的、被分离的协程来执行关闭
+                // 它会在后台运行，我们不等待它
+                boost::asio::co_spawn(
+                    io_context_, // 在 server 的 io_context 上运行
+                    [session]() -> boost::asio::awaitable<void> {
+                        try {
+                            co_await session->graceful_shutdown();
+                        } catch (const std::exception& e) {
+                            SPDLOG_WARN("Exception in H2 graceful_shutdown task: {}", e.what());
+                        }
+                    },
+                    boost::asio::detached // 分离协程，我们不关心它的结果
+                );
+            }
+        }
+        h2_sessions_.clear(); // 清空列表
+
+        SPDLOG_INFO("Spawning shutdown tasks for {} H2C sessions...", h2c_sessions_.size());
+        // --- 处理 H2cSession ---
+        for (const auto& weak_session : h2c_sessions_) {
+            if (auto session = weak_session.lock()) {
+                boost::asio::co_spawn(
+                    io_context_,
+                    [session]() -> boost::asio::awaitable<void> {
+                        try {
+                            co_await session->graceful_shutdown();
+                        } catch (const std::exception& e) {
+                            SPDLOG_WARN("Exception in H2C graceful_shutdown task: {}", e.what());
+                        }
+                    },
+                    boost::asio::detached
+                );
+            }
+        }
+        h2c_sessions_.clear(); // 清空列表
+    }
+
+    SPDLOG_INFO("All shutdown tasks have been spawned.");
+    // 函数在这里立即返回，不阻塞，不 co_await
+}
 
 private:
     /**
@@ -342,7 +335,7 @@ private:
                     std::lock_guard<std::mutex> lock(session_mutex_);
                     h2c_sessions_.insert(session);
                 }
-                session->start();
+                co_await session->start(std::move(req), buf);
                 co_return; // 协议已切换，此协程任务完成
             }
 
