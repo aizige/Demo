@@ -11,7 +11,7 @@ int main() {
     try {
         // --- 1. 初始设置 ---
         spdlog_config::initLoggers();
-        spdlog::set_level(spdlog::level::debug); // 生产环境建议 info 级别
+        spdlog::set_level(spdlog::level::trace); // 生产环境建议 info 级别
 
         const nghttp2_info *lib_info = nghttp2_version(0);
         std::cout << "📦 libnghttp2 version: " << lib_info->version_str << std::endl;

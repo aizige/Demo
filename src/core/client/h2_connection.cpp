@@ -241,6 +241,10 @@ asio::awaitable<void> Http2Connection::actor_loop() {
         // 1.2. 发送客户端的 SETTINGS 帧
         nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}, {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, (1 << 24)}};
         nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, std::size(iv));
+
+        SPDLOG_TRACE("H2 [{}]: After submit_settings, want_write={}", id_, nghttp2_session_want_write(session_));
+
+        // 1.3. 触发 writer_loop 第一次发送数据（连接前言 + SETTINGS）
         schedule_write(); // 触发 writer_loop 发送数据
 
         // 1.3. 循环读，直到收到服务器的 SETTINGS 帧
@@ -258,25 +262,52 @@ asio::awaitable<void> Http2Connection::actor_loop() {
 
             if (result.index() == 1) {
                 // 超时
+                auto [ec_timer] = std::get<1>(result);
+                if (ec_timer == asio::error::operation_aborted) {
+                    SPDLOG_TRACE("H2 [{}]: Handshake timer cancelled, continuing.", id_);
+                    continue; // 定时器被取消是正常的
+                }
+                SPDLOG_ERROR("H2 [{}]: Handshake timer expired after 10s.", id_);
                 throw std::runtime_error("HTTP/2 handshake timed out.");
             }
 
+            // --- 收到了网络数据 ---
             auto [ec, n] = std::get<0>(result);
             if (ec) {
+                SPDLOG_ERROR("H2 [{}]: Handshake read failed: {}", id_, ec.message());
                 throw boost::system::system_error(ec, "Handshake read failed");
             }
 
+            SPDLOG_TRACE("H2 [{}]: Read {} bytes from network during handshake.", id_, n);
+
             // 直接处理这次读到的 n 字节数据喂给 nghttp2
-            if (nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t *>(read_buffer_.data()), n) < 0) {
+            ssize_t rv = nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t *>(read_buffer_.data()), n);
+            if (rv < 0) {
+                SPDLOG_ERROR("H2 [{}]: nghttp2_session_mem_recv failed: {}", id_, nghttp2_strerror(rv));
                 throw std::runtime_error("Failed to process received handshake data.");
             }
 
+            SPDLOG_TRACE("H2 [{}]: Fed {} bytes to nghttp2.", id_, n);
 
-            // on_frame_recv_callback 会在收到 SETTINGS 时更新 max_concurrent_streams
-            // 我们可以用它作为一个握手成功的信号。
-            int32_t  remote_val  = nghttp2_session_get_remote_settings(session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
-            if (remote_val >= 0) {
+            // --- [日志] 检查 nghttp2 在收到数据后的状态 ---
+            // 它可能会想发送 SETTINGS ACK
+            SPDLOG_TRACE("H2 [{}]: After mem_recv, want_read={}, want_write={}",
+                         id_,
+                         nghttp2_session_want_read(session_),
+                         nghttp2_session_want_write(session_));
+
+
+            // 1.7. 检查握手是否完成
+            // 握手成功的标志是：我们收到了服务器的 SETTINGS 帧。
+            // 我们可以通过检查远程设置是否被应用来判断。
+            // nghttp2_session_get_remote_settings 在收到 SETTINGS 帧之前会返回-1。
+            int32_t remote_max_streams = nghttp2_session_get_remote_settings(session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
+            if (remote_max_streams >= 0) {
+                SPDLOG_INFO("H2 [{}]: Received server SETTINGS frame. Max concurrent streams: {}", id_, remote_max_streams);
                 handshake_ok = true;
+                handshake_timer.cancel(); // 握手成功，取消超时
+            } else {
+                SPDLOG_TRACE("H2 [{}]: Server SETTINGS frame not yet received (remote_max_streams={}).", id_, remote_max_streams);
             }
 
             // 确保发送队列中的任何数据（比如 SETTINGS 的 ACK）被发送出去

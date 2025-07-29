@@ -15,18 +15,32 @@
 ConnectionManager::ConnectionManager(boost::asio::io_context &ioc, bool enable_maintenance)
     : ioc_(ioc),
       strand_(ioc.get_executor()),
-      ssl_ctx_(boost::asio::ssl::context::sslv23_client),
+      ssl_ctx_(boost::asio::ssl::context::tlsv13_client),
       resolver_(ioc),
       maintenance_timer_(ioc) {
+
     // 配置 SSL 上下文
     ssl_ctx_.set_options(
         boost::asio::ssl::context::default_workarounds |
         boost::asio::ssl::context::no_sslv2 |
         boost::asio::ssl::context::no_sslv3 |
         boost::asio::ssl::context::no_tlsv1 |
-        boost::asio::ssl::context::no_tlsv1_1 |
-        boost::asio::ssl::context::single_dh_use
+        boost::asio::ssl::context::no_tlsv1_1
     );
+
+    // [可选，但推荐] 设置一个现代化的加密套件列表。
+    // 这个列表是从 Mozilla Intermediate compatibility 推荐中提取的，兼容性很好。
+    const char* modern_ciphers =
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+        "DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+
+    if (SSL_CTX_set_cipher_list(ssl_ctx_.native_handle(), modern_ciphers) != 1) {
+        // 如果设置失败，可以记录一个错误，但不一定要中断程序
+        SPDLOG_ERROR("Could not set SSL cipher list.");
+    }
+
     // 显式设置验证回调 (set_verify_callback) 并不是严格必须的
     ssl_ctx_.set_default_verify_paths();
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
@@ -219,7 +233,7 @@ boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::
 
 
     SPDLOG_DEBUG("连接池中没有可用于主机: {} 的连接，正在创建新的连接。", key);
-    auto new_conn = co_await create_new_connection(key, scheme, host, port);
+    std::shared_ptr<IConnection> new_conn ;
     try {
         new_conn = co_await create_new_connection(key, scheme, host, port);
     } catch (...) {
@@ -236,13 +250,13 @@ boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::
         if (new_conn->supports_multiplexing()) {
             h2_pool_[key].push_back(new_conn);
         } else {
-           // h1_pool_[key].push_back(new_conn);
+           // pool_[key].push_back(new_conn);
         }
         // 广播成功结果
         channel->try_send(boost::system::error_code{}, ConnectionResult(new_conn));
     });
     // 返回给我们自己的这个协程
-    co_return PooledConnection{new_conn, true};
+    co_return PooledConnection{new_conn, false};
 }
 
 void ConnectionManager::release_connection(const std::shared_ptr<IConnection> &conn) {
@@ -287,7 +301,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection> > ConnectionManager::create_
 
     try {
         // 1. DNS 解析
-        auto endpoints = co_await resolver_.async_resolve(host, std::to_string(port), boost::asio::use_awaitable);
+        auto endpoints = co_await resolver_.async_resolve(tcp::v4(),host, std::to_string(port), boost::asio::use_awaitable);
 
         if (scheme == "http:") {
             tcp::socket socket(ioc_);
@@ -310,7 +324,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection> > ConnectionManager::create_
             unsigned int len = 0;
             SSL_get0_alpn_selected(stream->native_handle(), &proto, &len);
             if (proto && std::string_view((const char *) proto, len) == "h2") {
-                SPDLOG_INFO("ALPN selected h2 for {}. Creating Http2Connection.", host);
+                SPDLOG_INFO("ALPN selected h2 for {} Creating Http2Connection.", host);
                 // a. 创建 Actor 对象
                 auto conn = Http2Connection::create(stream, key);
 
