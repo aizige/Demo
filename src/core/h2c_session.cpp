@@ -90,14 +90,22 @@ boost::asio::awaitable<void> H2cSession::start(
 
 boost::asio::awaitable<void> H2cSession::do_write() {
     try {
-        while (nghttp2_session_want_write(session_)) {
+        if (session_ && nghttp2_session_want_write(session_)) {
             const uint8_t *data_ptr = nullptr;
             ssize_t len = nghttp2_session_mem_send(session_, &data_ptr);
-            if (len <= 0) break;
-            co_await boost::asio::async_write(*socket_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
+
+            if (len < 0) {
+                SPDLOG_ERROR("H2C Server: nghttp2_session_mem_send() failed: {}", nghttp2_strerror(len));
+                if (socket_->is_open()) socket_->close();
+                co_return;
+            }
+
+            if (len > 0) {
+                co_await boost::asio::async_write(*socket_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
+            }
         }
     } catch (const std::exception &e) {
-        SPDLOG_WARN("H2C do_write failed: {}", e.what());
+        SPDLOG_WARN("H2C Server do_write failed, closing socket: {}", e.what());
         if (socket_->is_open()) {
             boost::system::error_code ignored_ec;
             socket_->close(ignored_ec);
@@ -119,12 +127,26 @@ boost::asio::awaitable<void> H2cSession::writer_loop() {
         while (socket_->is_open()) {
             boost::system::error_code ec;
             co_await write_trigger_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-            if (ec && ec != boost::asio::error::operation_aborted) break;
-            if (!socket_->is_open()) break;
 
+            if (ec && ec != boost::asio::error::operation_aborted) {
+                break;
+            }
+            if (!socket_->is_open()) {
+                break;
+            }
+
+            if (write_in_progress_) continue;
             write_in_progress_ = true;
             auto guard = Finally([this] { write_in_progress_ = false; });
-            co_await do_write();
+
+            // **关键的 "清空队列" 循环**
+            while (session_ && nghttp2_session_want_write(session_)) {
+                co_await do_write();
+                // 检查 do_write 是否因为错误关闭了套接字
+                if (!socket_->is_open()) {
+                    co_return;
+                }
+            }
         }
     } catch (const std::exception &e) {
         SPDLOG_WARN("H2C writer_loop ended with exception: {}", e.what());

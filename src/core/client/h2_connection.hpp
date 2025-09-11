@@ -18,44 +18,63 @@
 
 #include "core/server.hpp"
 #include "http/http_common_types.hpp"
+// 单协程融合模型
 
-// Actor 的“消息”类型，用于从 execute() 发送请求到 actor_loop()
+// 定义 Actor 的“消息”类型，用于从 execute() 方法向 actor_loop() 协程发送请求。
 struct H2RequestMessage {
     HttpRequest request;
-    // 使用一个 channel 来将最终的 HttpResponse 返回给调用者
-    std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)> > response_channel;
+    // 使用一个 channel，将最终的 HttpResponse 从 actor_loop() 返回给调用者。
+    std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>> response_channel;
 };
 
-// Actor 的“邮箱”类型
+// 定义 Actor 的“邮箱”类型，用于接收请求消息。
 using RequestChannel = boost::asio::experimental::channel<void(boost::system::error_code, H2RequestMessage)>;
 
+
+
+/**
+ * @class Http2Connection
+ * @brief 管理一个到远程服务器的 HTTP/2 客户端连接。
+ *
+ * 这个类实现为一个 Actor 模型，其中一个名为 actor_loop() 的单一协程
+ * 负责管理此连接的所有状态和 I/O 操作，确保线程安全和无死锁。
+ * 它支持多路复用，可以在一个 TCP 连接上并行处理多个请求。
+ */
 class Http2Connection : public IConnection, public std::enable_shared_from_this<Http2Connection> {
 public:
+    // 存储单个 HTTP/2 流（即一个请求）的上下文信息。
+    struct StreamContext {
+        std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>> response_channel;
+        HttpResponse response_in_progress;
+        std::string request_body;
+        size_t request_body_offset = 0;
+        std::vector<std::string> header_storage; // 用于稳定存储 header 的 key-value 字符串
+    };
+
     using StreamType = boost::beast::ssl_stream<tcp::socket>;
     using StreamPtr = std::shared_ptr<StreamType>;
 
     Http2Connection(StreamPtr stream, std::string pool_key);
-
     ~Http2Connection() override;
 
-    Http2Connection(const Http2Connection &) = delete;
-
-    Http2Connection &operator=(const Http2Connection &) = delete;
+    Http2Connection(const Http2Connection&) = delete;
+    Http2Connection& operator=(const Http2Connection&) = delete;
 
     static std::shared_ptr<Http2Connection> create(StreamPtr stream, std::string key) {
         return std::make_shared<Http2Connection>(std::move(stream), std::move(key));
     }
 
-    // 启动 Actor 的同步方法
+    // 同步方法，用于启动后台运行的 Actor。
     void run();
+
 
     // --- IConnection 接口实现 ---
     boost::asio::awaitable<HttpResponse> execute(HttpRequest request) override;
     bool is_usable() const override;
     boost::asio::awaitable<void> close() override;
-    const std::string &id() const override { return id_; }
-    const std::string &get_pool_key() const override { return pool_key_; }
-    tcp::socket &lowest_layer_socket();
+    const std::string& id() const override { return id_; }
+    const std::string& get_pool_key() const override { return pool_key_; }
+    tcp::socket& lowest_layer_socket();
 
 
 
@@ -67,32 +86,18 @@ public:
     size_t get_active_streams() const override;
     size_t get_max_concurrent_streams() const override { return max_concurrent_streams_.load(); }
 
+
 private:
-    struct StreamContext {
-        std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)> > response_channel;
-        HttpResponse response_in_progress;
-        std::string request_body;
-        size_t request_body_offset = 0;
-        std::vector<std::string> header_storage;
-    };
 
-    boost::asio::awaitable<void> run_internal();
-
-    // 唯一的后台 Actor 协程，管理所有状态和 I/O
+    // 唯一的、统一的 Actor 协程，管理所有状态和 I/O。
     boost::asio::awaitable<void> actor_loop();
 
-    boost::asio::awaitable<void> writer_loop();
-
-    void schedule_write();
-
-    // 仅由 actor_loop 调用的辅助函数
-    boost::asio::awaitable<void> do_read();
+    // 由 actor_loop 调用的写操作辅助函数。
     boost::asio::awaitable<void> do_write();
+
+
     void prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req, StreamContext& stream_ctx);
     void handle_stream_close(int32_t stream_id, uint32_t error_code);
-
-
-
 
 
     // --- nghttp2 C-style 静态回调函数 ---
@@ -108,28 +113,24 @@ private:
     StreamPtr stream_;
     std::string pool_key_;
     std::string id_;
-    boost::asio::strand<boost::asio::any_io_executor> strand_;
 
-    RequestChannel request_channel_; // Actor's Mailbox
+    RequestChannel request_channel_; // Actor 的“邮箱”
     std::array<char, 8192> read_buffer_{};
 
-    nghttp2_session *session_ = nullptr;
-    std::unordered_map<int32_t, std::unique_ptr<StreamContext> > streams_;
+    nghttp2_session* session_ = nullptr;
+    std::unordered_map<int32_t, std::unique_ptr<StreamContext>> streams_;
 
     std::atomic<bool> is_closing_{false};
     std::atomic<bool> close_called_{false};
     std::atomic<bool> handshake_completed_{false};
 
     std::atomic<size_t> max_concurrent_streams_{100};
-    std::atomic<int64_t> last_used_timestamp_seconds_; // 用于记录最后一次活动时间
+    std::atomic<int64_t> last_used_timestamp_seconds_;
+    std::atomic<size_t> active_streams_{0}; // 0 表示空闲, > 0 表示繁忙
 
 
     static std::string generate_simple_uuid();
 
-    std::atomic<size_t> active_streams_{0}; // 0 表示空闲, 1 表示繁忙
-
-    boost::asio::steady_timer write_trigger_;
-    bool write_in_progress_ = false;
 
 };
 

@@ -14,7 +14,7 @@
 
 class HttpClient : public IHttpClient {
 public:
-    explicit HttpClient(boost::asio::io_context& ioc);
+    explicit HttpClient(std::shared_ptr<ConnectionManager> manger);
 
     boost::asio::awaitable<HttpResponse> get(std::string_view url,
                                              const Headers& headers = {}) override;
@@ -42,9 +42,11 @@ private:
     ParsedUrl parse_url(std::string_view url);
     std::string resolve_url(const std::string& base_url, const std::string& location);
     // 统一的内部执行函数
-    boost::asio::awaitable<InternalResponse> execute_internal(HttpRequest& request,const ParsedUrl& target);
+    boost::asio::awaitable<InternalResponse> execute_internal(HttpRequest& request,const ParsedUrl& target) ;
 
-    boost::asio::io_context& ioc_;
+
+
+
     // HttpClient 持有一个 ConnectionManager 的共享指针
     // 使用 shared_ptr 是因为它可能被多个并发的请求共享
     std::shared_ptr<ConnectionManager> manager_;

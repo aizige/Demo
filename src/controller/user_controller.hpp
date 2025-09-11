@@ -34,6 +34,9 @@ public:
         router.GET("/request", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
             co_await user_service_->test_http_client(ctx);
         });
+        router.GET("/ws", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
+            co_await user_service_->connect_to_status_stream(ctx);
+        });
     }
 
 private:

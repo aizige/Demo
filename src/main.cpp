@@ -23,12 +23,13 @@ int main() {
 
         server.set_tls("dev-cert/server.crt", "dev-cert/server.key");
 
-
+        auto connection_manager = std::make_shared<ConnectionManager>(io);
         // 1. 创建底层服务
-        auto http_client = std::make_shared<HttpClient>(io);
+        auto http_client = std::make_shared<HttpClient>(connection_manager);
+        auto ws_client = std::make_shared<WebSocketClient>(io);
 
         // 2. 创建业务服务，注入依赖
-        auto user_service = std::make_shared<UserService>(http_client);
+        auto user_service = std::make_shared<UserService>(http_client,ws_client);
 
         // 3. 创建控制器，注入业务服务
         auto user_controller = std::make_shared<UserController>(user_service);
@@ -37,19 +38,36 @@ int main() {
 
         // --- 3. 设置信号处理和优雅关闭逻辑 ---
         boost::asio::signal_set signals(io, SIGINT, SIGTERM);
-        signals.async_wait([&server, &io, &signals](const boost::system::error_code &error, int signal_number) {
+        signals.async_wait([&server, &io, &connection_manager,&signals](const boost::system::error_code &error, int signal_number) {
             if (!error) {
                 SPDLOG_WARN("Received signal {}, starting graceful shutdown...", signal_number);
-                SPDLOG_WARN("Received signal {}, starting graceful shutdown...", signal_number);
 
-                // 1. 调用 server.stop()。这个函数现在是同步的，
-                //    它会立即返回，但它已经把所有关闭任务都提交给了 io_context。
-                server.stop();
+                // 立即取消未来的信号等待，防止重复触发
+                    signals.cancel();
 
-                // 2. 告诉 io_context 在处理完当前所有任务后就退出。
-                //    io_context::run() 将会继续执行我们刚刚 spawn 的所有关闭协程，
-                //    直到它们全部完成，然后 run() 才会返回。
-                io.stop();
+                // 启动一个“顶级关闭协程”，它将负责所有清理工作
+                boost::asio::co_spawn(
+                    io,
+                    // 这个 lambda 就是我们的完整关闭流程
+                    [&]() -> boost::asio::awaitable<void> {
+
+                        // a. 关闭服务端，停止接受新连接并关闭现有会话
+                        SPDLOG_INFO("Shutting down server sessions...");
+                        server.stop();
+
+                        // b. 关闭客户端连接管理器，这将关闭所有池中的连接
+                        SPDLOG_INFO("Shutting down client connections...");
+                        co_await connection_manager->stop();
+
+                        // c. [可选] 关闭其他需要清理的服务
+                        // co_await some_other_service->stop();
+
+                        // d. 在所有异步清理工作都完成后，才停止 io_context
+                        SPDLOG_INFO("All services stopped. Stopping io_context...");
+                        io.stop();
+                    },
+                    boost::asio::detached // 我们不关心这个协程的结果，让它独立运行
+                );
             }
         });
 

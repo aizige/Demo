@@ -174,7 +174,7 @@ private:
                     );
 
             if (ec) {
-                SPDLOG_ERROR("Accept failed: {}", ec.message());
+                //SPDLOG_ERROR("Accept failed: {}", ec.message());
                 continue; // 接受失败，记录日志并继续等待下一个连接
             }
 

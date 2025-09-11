@@ -6,6 +6,7 @@
 #define UNTITLED1_CONNECTION_MANAGER_HPP
 
 #include <queue>
+#include <unordered_set>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -13,6 +14,8 @@
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/channel.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
+#include <boost/beast/ssl/ssl_stream.hpp>
 // 向前声明
 class IConnection;
 
@@ -20,6 +23,8 @@ struct PooledConnection {
     std::shared_ptr<IConnection> connection;
     bool is_reused = false; // true 表示是从池中复用的
 };
+
+
 /**
  * @brief 一个现代化的、基于 strand 和协程的 HTTP/1.1 & HTTP/2 连接池管理器。
  *
@@ -57,6 +62,10 @@ public:
      * @param conn 要释放的连接。
      */
     void release_connection(const std::shared_ptr<IConnection>& conn);
+
+
+    // 负责关闭所有连接
+    boost::asio::awaitable<void> stop();
 private:
 
 
@@ -71,7 +80,7 @@ private:
     boost::asio::awaitable<void> run_maintenance();
 
     // 停止后台任务（在析构时调用）
-    void stop();
+    void stop_internal();
 
     // --- 核心数据成员 ---
 
@@ -99,16 +108,7 @@ private:
     boost::asio::steady_timer maintenance_timer_;
     bool stopped_ = false;
 
-    // **使用 channel 作为异步锁/信号**
-    // 它可以携带成功的结果 (shared_ptr) 或失败的结果 (exception_ptr)
-    using ConnectionResult = std::variant<
-        std::shared_ptr<IConnection>,
-        std::exception_ptr
-    >;
-    using CreationChannel = boost::asio::experimental::channel<void(boost::system::error_code, ConnectionResult)>;
-
-    // 用于存储每个 key 正在创建连接的 channel
-    std::unordered_map<std::string, std::shared_ptr<CreationChannel>> creation_channels_;
+    std::unordered_set<std::string> creation_in_progress_;
 };
 
 

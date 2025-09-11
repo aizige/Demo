@@ -16,12 +16,20 @@
 #include <spdlog/spdlog.h>
 #include <iostream>
 #include <boost/asio/experimental/channel.hpp>
+#include "h2_connection.hpp" // 复用 H2RequestMessage 和 RequestChannel 的定义
 
+/**
+ * @class Http2cConnection
+ * @brief 管理一个到远程服务器的明文 HTTP/2 (H2C) 客户端连接。
+ *
+ * 这个类实现为一个 Actor 模型，其中一个名为 actor_loop() 的单一协程
+ * 负责管理此连接的所有状态和 I/O 操作，确保线程安全和无死锁。
+ * 它支持多路复用，可以在一个 TCP 连接上并行处理多个请求。
+ */
 class Http2cConnection : public IConnection, public std::enable_shared_from_this<Http2cConnection> {
 public:
     using StreamType = boost::beast::tcp_stream;
     using StreamPtr = std::shared_ptr<StreamType>;
-    using ResponseChannel = boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>;
 
     Http2cConnection(StreamPtr stream, std::string pool_key);
     ~Http2cConnection() override;
@@ -33,49 +41,40 @@ public:
         return std::make_shared<Http2cConnection>(std::move(stream), std::move(key));
     }
 
+    // 同步方法，用于启动后台运行的 Actor。
+    void run();
+
     // --- IConnection 接口实现 ---
     boost::asio::awaitable<HttpResponse> execute(HttpRequest request) override;
     bool is_usable() const override;
     boost::asio::awaitable<void> close() override;
     const std::string& id() const override { return id_; }
     const std::string& get_pool_key() const override { return pool_key_; }
-    size_t get_active_streams() const override { return active_streams_.load(); }
+    tcp::socket& lowest_layer_socket();
 
-    boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> release_socket() override {co_return std::nullopt;}  // 明确地 override，并返回 nullopt
-
-    // --- H2 客户端特定方法 ---
-    void start(); // 启动器，非协程
-
-    boost::asio::awaitable<bool> ping() override;
-    int64_t get_last_used_timestamp_seconds() const override{ return last_used_timestamp_seconds_; }
-
-    size_t get_max_concurrent_streams() const override{return max_concurrent_streams_.load();};
-
+    // --- 连接池支持 ---
     void update_last_used_time() override;
+    int64_t get_last_used_timestamp_seconds() const override { return last_used_timestamp_seconds_.load(); }
+    boost::asio::awaitable<bool> ping() override;
     bool supports_multiplexing() const override { return true; }
+    size_t get_active_streams() const override;
+    size_t get_max_concurrent_streams() const override { return max_concurrent_streams_.load(); }
+
+    // H2C 不涉及 TLS，所以不能“窃取”套接字
+    boost::asio::awaitable<std::optional<tcp::socket>> release_socket() override { co_return std::nullopt; }
 
 private:
-    int64_t last_used_timestamp_seconds_;
+    // H2 和 H2C 的 StreamContext 是完全一样的
+    using StreamContext = Http2Connection::StreamContext;
 
-    // 上下文，用于存储一个客户端发起的流（请求-响应对）的状态
-    struct StreamContext {
-        // 构造函数现在接收 executor 来初始化 channel
-        explicit StreamContext(const boost::asio::any_io_executor& ex)
-            : response_channel(ex, 1) // 容量为 1 的 channel
-        {}
+    // 唯一的、统一的 Actor 协程
+    boost::asio::awaitable<void> actor_loop();
 
-        ResponseChannel response_channel;
-        HttpResponse response_in_progress; // 正在组装的响应
-        std::string request_body; // 请求体的拷贝，用于数据提供者回调
-        size_t request_body_offset = 0; // 请求体发送偏移量
-
-
-    };
-
-    void init_nghttp2_session();
-    boost::asio::awaitable<void> session_loop(); // 负责网络 I/O 的主协程
+    // 写操作辅助函数
     boost::asio::awaitable<void> do_write();
-    void prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req);
+
+    void prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req, StreamContext& stream_ctx);
+    void handle_stream_close(int32_t stream_id, uint32_t error_code);
 
     // --- nghttp2 C-style 静态回调函数 ---
     static int on_begin_headers_callback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data);
@@ -85,19 +84,26 @@ private:
     static int on_frame_recv_callback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data);
     static ssize_t read_request_body_callback(nghttp2_session* session, int32_t stream_id, uint8_t* buf, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void* user_data);
 
-
     // --- 成员变量 ---
     StreamPtr stream_;
     std::string pool_key_;
     std::string id_;
-    boost::asio::strand<boost::asio::any_io_executor> strand_;
+
+    RequestChannel request_channel_;
+    std::array<char, 8192> read_buffer_{};
+
     nghttp2_session* session_ = nullptr;
     std::unordered_map<int32_t, std::unique_ptr<StreamContext>> streams_;
-    std::atomic<bool> is_closing_ = false;
+
+    std::atomic<bool> is_closing_{false};
+    std::atomic<bool> close_called_{false};
+    std::atomic<bool> handshake_completed_{false};
+
+    std::atomic<size_t> max_concurrent_streams_{100};
+    std::atomic<int64_t> last_used_timestamp_seconds_;
+    std::atomic<size_t> active_streams_{0};
 
     static std::string generate_simple_uuid();
-    std::atomic<size_t> active_streams_{0};
-    std::atomic<size_t> max_concurrent_streams_{100}; // 默认值
 };
 
 

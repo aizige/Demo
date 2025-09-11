@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.31.8)
+cmake_minimum_required(VERSION 4.0)
 project(untitled1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -38,6 +38,14 @@ add_executable(untitled1
         src/core/client/h2_connection.cpp
         src/core/client/h2c_connection.cpp
         src/utils/finally.hpp
+        src/core/client/IWebSocketClientHandler.hpp
+        src/core/client/WebSocketConnection.cpp
+        src/core/client/WebSocketConnection.hpp
+        src/core/client/WebSocketClient.cpp
+        src/core/client/WebSocketClient.hpp
+        src/core/client/UserStatusHandler.hpp
+        src/impl/user_service.cpp
+        src/impl/user_service.hpp
 )
 
 add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)

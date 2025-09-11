@@ -125,6 +125,16 @@ size_t Http1Connection::get_active_streams() const {
 }
 
 boost::asio::awaitable<std::optional<boost::asio::ip::tcp::socket>> Http1Connection::release_socket() {
-    co_await this->close();
-    co_return std::move(socket_.socket());
+    // 确保我们在正确的 strand 或 executor 上
+    //co_await boost::asio::post(socket_.get_executor(), boost::asio::use_awaitable);
+
+    // 检查 socket 是否仍然可用
+    if (socket_.socket().is_open()) {
+        // 将 socket 移动出来，留下一个空的、关闭的 socket 在 stream 中
+        tcp::socket released_socket = std::move(socket_.socket());
+        co_return std::make_optional(std::move(released_socket));
+    }
+
+    // 如果 socket 已经关闭，返回空
+    co_return std::nullopt;
 }
