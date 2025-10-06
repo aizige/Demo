@@ -90,8 +90,7 @@ public:
      * @brief 启动服务器的监听循环。
      */
     void run() {
-        // 启动一个常驻的监听协程，并将其与主 io_context 分离。
-        // 服务器将在此协程中无限期地接受新连接。
+        // 启动一个常驻的监听协程
         boost::asio::co_spawn(io_context_, listener(), boost::asio::detached);
     }
 
@@ -263,7 +262,6 @@ private:
     /**
      * @brief 处理普通（非加密）的 HTTP/1.1 连接的协程。
      */
-
     boost::asio::awaitable<void> handle_plain(tcp::socket sock) {
         // 将 socket 包装在 shared_ptr 中，以便在 H2C 升级时安全地转移所有权
         auto sock_ptr = std::make_shared<tcp::socket>(std::move(sock));
@@ -303,7 +301,7 @@ private:
 
             boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
             constexpr auto initial_timeout = 10s; // 定义超时策略
-            constexpr auto keep_alive_timeout = 60s;
+            constexpr auto keep_alive_timeout = 5s;
             http::request_parser<http::string_body> parser; // 创建一个可复用的解析器
 
             //  1. 设置初始超时并一次性读取整个请求

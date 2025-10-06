@@ -24,6 +24,24 @@ struct PooledConnection {
     bool is_reused = false; // true 表示是从池中复用的
 };
 
+// 代表一个正在进行的连接创建任务。
+struct CreationInProgress {
+    // 使用一个 channel 作为"信号"，通知等待者任务已完成。
+    using SignalChannel = boost::asio::experimental::channel<void(boost::system::error_code)>;
+
+    std::shared_ptr<SignalChannel> signal;
+
+    // 使用 variant 存储最终结果，供所有协程在收到信号后读取。
+    std::variant<
+        std::monostate,                         // 状态：仍在进行中
+        std::shared_ptr<IConnection>,           // 状态：成功
+        std::exception_ptr                      // 状态：失败
+    > result;
+
+    explicit CreationInProgress(const boost::asio::any_io_executor& ex)
+        : signal(std::make_shared<SignalChannel>(ex, 1)) {} // 容量为1即可
+};
+
 
 /**
  * @brief 一个现代化的、基于 strand 和协程的 HTTP/1.1 & HTTP/2 连接池管理器。
@@ -63,11 +81,11 @@ public:
      */
     void release_connection(const std::shared_ptr<IConnection>& conn);
 
-
     // 负责关闭所有连接
     boost::asio::awaitable<void> stop();
-private:
 
+    void add_connection_to_pool(const std::string& key, std::shared_ptr<IConnection> conn);
+private:
 
     // 在 strand 上创建新连接的私有协程
     boost::asio::awaitable<std::shared_ptr<IConnection>> create_new_connection(
@@ -108,7 +126,8 @@ private:
     boost::asio::steady_timer maintenance_timer_;
     bool stopped_ = false;
 
-    std::unordered_set<std::string> creation_in_progress_;
+    //std::unordered_set<std::string> creation_in_progress_;
+    std::unordered_map<std::string, std::shared_ptr<CreationInProgress>> creation_in_progress_;
 };
 
 

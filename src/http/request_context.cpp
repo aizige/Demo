@@ -48,7 +48,7 @@ void RequestContext::string(http::status status, std::string_view body, std::str
     response_.set(http::field::content_type, content_type);
     response_.set(http::field::server, "Aiziboyserver/1.0");
     response_.body() = body;
-    compress_if_acceptable();
+    //compress_if_acceptable();
     response_.prepare_payload();
 }
 
@@ -161,7 +161,6 @@ void RequestContext::compress_if_acceptable() {
 
     // 4. 执行压缩
     // 注意：这里我们直接修改内部的 response_ 对象
-
     std::string compressed_body = client_accepts_gzip == "gzip"?utils::compression::DecompressionManager::gzip_compress(response_.body()) : utils::compression::DecompressionManager::deflate_compress(response_.body());
 
     // 5. 更新响应对象

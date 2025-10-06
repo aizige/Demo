@@ -148,7 +148,7 @@ boost::asio::awaitable<void> Http2Session::writer_loop() {
 boost::asio::awaitable<void> Http2Session::session_loop() {
     co_await boost::asio::dispatch(strand_, boost::asio::use_awaitable);
     init_session();
-    constexpr auto timeout = 60s;
+    constexpr std::chrono::seconds timeout = 60s;
 
     idle_timer_.expires_after(timeout);
     nghttp2_settings_entry iv[1] = {{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};

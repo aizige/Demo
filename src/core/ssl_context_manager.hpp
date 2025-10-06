@@ -34,7 +34,7 @@ public:
             throw std::runtime_error("未找到证书密钥: " + key_file);
 
         // 创建一个用于服务器端的 SSL 上下文对象
-        ctx_ = std::make_unique<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+        ctx_ = std::make_unique<boost::asio::ssl::context>(boost::asio::ssl::context::tls);
 
         // --- 设置安全选项 ---
         // 这是增强服务器安全性的重要步骤
@@ -45,14 +45,38 @@ public:
             boost::asio::ssl::context::no_sslv2 |
             boost::asio::ssl::context::no_sslv3 |
             boost::asio::ssl::context::no_tlsv1 |
-            boost::asio::ssl::context::no_tlsv1_1 | // 强制使用 TLS 1.2 或更高版本
+            boost::asio::ssl::context::no_tlsv1_1 |
             // 确保每次都使用新的 Diffie-Hellman 密钥，增强前向保密性
             boost::asio::ssl::context::single_dh_use
         );
 
+        // 动态设置协议版本范围
+        SSL_CTX* raw_ctx = ctx_->native_handle();
+
+        int min_version = TLS1_3_VERSION;
+        int max_version = TLS1_3_VERSION;
+
+        // 从配置文件中读取支持的 TLS 协议版本列表，例如：TLSv1.2，TLSv1.3
+        //std::vector<std::string> versions = get_tls_versions_from_config();
+        std::vector<std::string> versions = {"TLSv1.3","TLSv1.2"};
+
+        if (std::find(versions.begin(), versions.end(), "TLSv1.2") == versions.end()) {
+            // 如果配置中没有包含 TLSv1.2，就将最小协议版本设置为 TLS 1.3
+            min_version = TLS1_3_VERSION;
+        }
+        if (std::find(versions.begin(), versions.end(), "TLSv1.3") == versions.end()) {
+            // 	如果配置中没有包含 TLSv1.3，就将最大协议版本限制为 TLS 1.2
+            max_version = TLS1_2_VERSION;
+        }
+
+        SSL_CTX_set_min_proto_version(raw_ctx, min_version);
+        SSL_CTX_set_max_proto_version(raw_ctx, max_version);
+
+
         // --- 加载证书和私钥 ---
         ctx_->use_certificate_chain_file(cert_file);
         ctx_->use_private_key_file(key_file, boost::asio::ssl::context::pem);
+
 
         // 🔐 [可选但推荐] 加入额外的 TLS 安全选项
         // 禁止 TLS 会话重协商，这可以防止一种潜在的 DoS 攻击

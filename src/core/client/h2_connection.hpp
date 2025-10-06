@@ -128,6 +128,8 @@ private:
     std::atomic<int64_t> last_used_timestamp_seconds_;
     std::atomic<size_t> active_streams_{0}; // 0 表示空闲, > 0 表示繁忙
 
+    std::atomic<bool> remote_goaway_received_{false};   // 在 on_frame_recv_callback 中收到 GOAWAY 帧时
+
 
     static std::string generate_simple_uuid();
 

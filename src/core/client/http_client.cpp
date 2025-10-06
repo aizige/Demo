@@ -9,6 +9,7 @@
 #include "h2c_connection.hpp"
 #include "h2_connection.hpp"
 #include "iconnection.hpp"
+#include "error/my_error.hpp"
 #include "utils/decompression_manager.hpp"
 #include "utils/finally.hpp"
 
@@ -190,7 +191,6 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
             // 4. 如果不是重定向，则返回最终的响应
             // 解压Body数据
-
             auto it = res.find(http::field::content_encoding);
             if (it != res.end()) {
                 SPDLOG_DEBUG("正在解压Body");
@@ -217,19 +217,21 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
             co_return res;
         }
     } catch (const std::exception &e) {
-        SPDLOG_DEBUG("ffffffffffffffffffffffffffff");
+
         throw;
     }
     // 不可达，但为了编译器满意
     throw std::runtime_error("Too many redirects.");
 }
 
-// 创建一个辅助函数来检查错误码，让代码更干净
+// 一个辅助函数来检查错误码，让代码更干净
 bool is_retryable_network_error(const boost::system::error_code &ec) {
     return ec == boost::beast::http::error::end_of_stream || // 当尝试写入一个对方已关闭接收的连接时
            ec == boost::asio::error::eof || // 当你尝试读取一个对方已关闭发送的连接时
            ec == boost::asio::error::connection_reset || //对一个已关闭的端口发送数据
-           ec == boost::asio::error::broken_pipe; // 当尝试写入一个对方已关闭接收的连接时
+           ec == boost::asio::error::connection_aborted || // 连接已关闭或已收到 GOAWAY的连接
+           ec == boost::asio::error::broken_pipe || // 当尝试写入一个对方已关闭接收的连接时
+           ec    == my_error::h2::receive_timeout; // 等待H2响应超时，网络不好的时候好像会出现这种问题
 }
 
 // 统一的内部执行函数，负责连接管理
@@ -237,64 +239,71 @@ bool is_retryable_network_error(const boost::system::error_code &ec) {
 
 boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_internal(HttpRequest& request, const ParsedUrl& target) {
 
-    // 我们最多尝试两次
-    for (int attempt = 1; attempt <= 2; ++attempt) {
+    // 初始化重试计数器（最多尝试两次）
+    int attempt = 1;
+
+    // 使用 while 循环代替 for，显式递增 attempt，避免编译器警告
+    while (true) {
+        if (attempt > 2) {
+            throw std::runtime_error("HttpClient: All retry attempts failed after stale connection.");
+        }
 
         PooledConnection pooled_conn;
         std::shared_ptr<IConnection> conn;
 
         try {
-            // 1. 获取连接
+            // 🔹 第一步：从连接池获取连接（可能是复用连接）
             pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
             conn = pooled_conn.connection;
+
+            // 🔹 如果连接获取失败，抛出异常
             if (!conn) {
                 throw std::runtime_error("Failed to acquire a connection.");
             }
 
-            // 2. 使用 RAII guard 确保连接一定会被释放
-            //    无论成功、失败还是重试，conn 离开作用域时都会被 release
-            auto guard = Finally([this, conn]{
+            // 🔹 第二步：使用 RAII 机制确保连接一定会被释放
+            //     无论请求成功、失败还是重试，conn 离开作用域时都会被 release
+            auto guard = Finally([this, conn] {
                 manager_->release_connection(conn);
             });
 
-            // 3. 执行请求
+            // 🔹 第三步：执行请求（可能抛出 system_error）
             HttpResponse response = co_await conn->execute(request);
 
-            // **成功路径**：立即返回，循环结束
+            // ✅ 请求成功，立即返回响应和连接
             co_return std::make_pair(std::move(response), conn);
 
         } catch (const boost::system::system_error& e) {
 
-            // --- [关键的、简单的重试决策逻辑] ---
-
-            // a. 检查是否满足所有重试条件
+            // 🔹 判断是否满足重试条件：
+            //   - 还有重试次数
+            //   - 当前连接是复用的（可能是 stale）
+            //   - 错误码属于可重试的网络错误
             bool should_retry = (
-                attempt < 2 &&                          // 还有重试次数
-                pooled_conn.is_reused &&                // 连接是复用的
-                is_retryable_network_error(e.code())    // 错误是可重试的网络错误
+                attempt < 2 &&
+                pooled_conn.is_reused &&
+                is_retryable_network_error(e.code())
             );
 
-            // b. 如果不满足重试条件，直接向上抛出异常
+            // ❌ 不满足重试条件，记录日志并向上抛出异常
             if (!should_retry) {
                 SPDLOG_ERROR("Request failed and is not retryable (attempt {}): {}", attempt, e.what());
                 throw;
             }
 
-            // c. 如果满足重试条件，记录日志，然后什么也不做
+            // ✅ 满足重试条件，记录日志，继续下一轮尝试
             SPDLOG_WARN("Stale connection [{}] detected. Retrying (attempt {}/2)...",
                         conn ? conn->id() : "N/A",
                         attempt + 1);
 
-            // `catch` 块在这里结束。因为我们没有 throw，
-            // 程序会自然地继续执行到 for 循环的下一次迭代。
-            // `guard` 会在这里析构，释放掉坏掉的连接。
+            // RAII guard 会在此处析构，释放掉坏掉的连接
         }
-    }
 
-    // 如果两次尝试都失败并且进入了重试路径，循环会正常结束。
-    // 在这里抛出一个最终的错误。
-    throw std::runtime_error("HttpClient: All retry attempts failed after stale connection.");
+        // 🔹 显式递增重试计数器，进入下一轮尝试
+        ++attempt;
+    }
 }
+
 
 // 简单的 URL(Ada-url) 解析器实现
 HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
@@ -329,7 +338,7 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
         throw std::runtime_error("Invalid URL format: " + std::string{url_string});
     }
 
-    SPDLOG_DEBUG("Parsed URL successfully: {}", url->get_href());
+    SPDLOG_DEBUG("解析URL成功: {}", url->get_href());
 
 
     ParsedUrl result;

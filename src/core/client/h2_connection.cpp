@@ -22,6 +22,8 @@
 #include <boost/asio/co_spawn.hpp>
 #include <ranges>
 #include <boost/algorithm/string/case_conv.hpp>
+
+#include "error/my_error.hpp"
 #include "utils/finally.hpp"
 #include "utils/utils.hpp"
 
@@ -35,7 +37,7 @@ Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
       id_(generate_simple_uuid()),
       request_channel_(stream_->get_executor(), 256), // 邮箱，带有 256 个消息的缓冲区
       last_used_timestamp_seconds_(steady_clock_seconds_since_epoch()) {
-    SPDLOG_DEBUG("Http2Connection (Actor) [{}] 已创建.", id_);
+    SPDLOG_DEBUG("H2连接 [{}] 已创建.", id_);
 }
 
 Http2Connection::~Http2Connection() {
@@ -43,7 +45,7 @@ Http2Connection::~Http2Connection() {
         nghttp2_session_del(session_);
         session_ = nullptr;
     }
-    SPDLOG_DEBUG("Http2Connection (Actor) [{}] 已销毁.", id_);
+    SPDLOG_DEBUG("H2连接 [{}] 已销毁.", id_);
 }
 
 
@@ -76,43 +78,102 @@ void Http2Connection::run() {
     );
 }
 
+// 发起一个 HTTP/2 请求，并等待响应（带超时保护）
 boost::asio::awaitable<HttpResponse> Http2Connection::execute(HttpRequest request) {
+
+    // 更新连接的最后使用时间（用于连接池管理）
     update_last_used_time();
+
+    // 获取当前协程的执行器（通常是 ioc_）
     auto ex = co_await asio::this_coro::executor;
 
-    if (is_closing_) {
-        throw boost::system::system_error(asio::error::connection_aborted, "连接正在关闭中");
+    // 如果连接已关闭或已收到 GOAWAY，拒绝请求
+    if (is_closing_ || remote_goaway_received_) {
+        SPDLOG_WARN("[{}] execute: 连接已关闭或收到 GOAWAY，拒绝请求", id_);
+        throw boost::system::system_error(asio::error::connection_aborted, "连接已关闭或收到 GOAWAY，拒绝请求");
     }
 
-    // 为本次请求创建一个专用的响应 channel
+    // 为本次请求创建一个响应通道（用于异步接收响应）
     auto response_channel = std::make_shared<asio::experimental::channel<void(boost::system::error_code, HttpResponse)>>(ex, 1);
+
+    // 构造请求消息，包含请求内容和响应通道
     H2RequestMessage msg{std::move(request), response_channel};
 
-    // 将请求消息发送到 actor_loop 的邮箱
-    auto [ec_send] = co_await request_channel_.async_send({}, std::move(msg), asio::as_tuple(asio::use_awaitable));
+    // 将当前协程切换到 actor 的执行器（确保 async_send 在 actor 的上下文中执行）
+    co_await asio::dispatch(stream_->get_executor(), asio::use_awaitable);
+
+    // 设置发送请求的超时定时器（300 毫秒）TODO:时间在配置文件中配置
+    asio::steady_timer send_timer(ex);
+    send_timer.expires_after(std::chrono::milliseconds(300ms));
+
+    // 并发等待：请求发送 或 超时
+    auto send_result = co_await (
+        request_channel_.async_send({}, std::move(msg), asio::as_tuple(asio::use_awaitable)) ||
+        send_timer.async_wait(asio::as_tuple(asio::use_awaitable))
+    );
+
+    // 如果是定时器触发（即超时），则抛出异常
+    if (send_result.index() == 1) {
+        SPDLOG_ERROR("[{}] execute: async_send 超时", id_);
+        throw boost::system::system_error(asio::error::connection_reset, "发送请求超时，服务端可能已经关闭或挂起");
+    }
+
+    // 获取 async_send 的结果
+    auto [ec_send] = std::get<0>(send_result);
     if (ec_send) {
-        throw boost::system::system_error(ec_send, "发送请求到 H2 连接 actor 失败");
+        SPDLOG_ERROR("[{}] execute: async_send 错误: {}", id_, ec_send.message());
+        throw boost::system::system_error(ec_send, "发送请求失败");
     }
 
-    // 挂起，等待 actor_loop 通过 response_channel 返回响应
-    auto [ec, response] = co_await response_channel->async_receive(asio::as_tuple(asio::use_awaitable));
+
+    // 设置接收响应的超时定时器（3000 毫秒）TODO:时间在配置文件中配置
+    asio::steady_timer recv_timer(ex);
+    recv_timer.expires_after(std::chrono::milliseconds(3000ms));
+
+    // 并发等待：响应到达 或 超时
+    auto recv_result = co_await (
+        response_channel->async_receive(asio::as_tuple(asio::use_awaitable)) ||
+        recv_timer.async_wait(asio::as_tuple(asio::use_awaitable))
+    );
+
+    // 如果是定时器触发（即响应超时），则标记连接为关闭并抛出异常
+    if (recv_result.index() == 1) {
+        SPDLOG_ERROR(" [{}] : 响应超时", id_);
+
+        // 如果当前没有其他活跃 stream，说明连接可能挂起
+        if (active_streams_ <= 0) {
+            is_closing_ = true;
+            SPDLOG_WARN("[{}], active_streams_ = {} : 无活跃 stream 且响应超时，标记连接关闭", id_,active_streams_.load());
+        }
+        throw boost::system::system_error(my_error::h2::receive_timeout, "接收响应超时");
+    }
+
+    // 获取响应结果
+    auto [ec, response] = std::get<0>(recv_result);
     if (ec) {
-        throw boost::system::system_error(ec, "H2 流执行出错");
+        SPDLOG_WARN("H2 [{}] execute: 响应错误: {}", id_, ec.message());
+        throw boost::system::system_error(ec, "响应失败");
     }
 
-    SPDLOG_DEBUG("Http2Connection [{}] 收到响应，状态码 {}.", id_, response.result_int());
+    // 正常收到响应，记录日志并返回
+    SPDLOG_INFO("H2 [{}] execute: 收到响应，状态码 {}, 当前活动的steam = {}", id_, response.result_int(),active_streams_.load());
     co_return response;
 }
 
 bool Http2Connection::is_usable() const {
     // 一个连接只有在握手成功后才真正可用。
-    return !is_closing_ && handshake_completed_ && stream_ && stream_->lowest_layer().is_open() && session_ != nullptr;
+
+    if (is_closing_ || remote_goaway_received_  || !handshake_completed_ || !stream_ || session_ == nullptr) return false;
+    // socket 仍“开放”不代表 TLS/HTTP2 状态可复用
+    if (!stream_->lowest_layer().is_open()) return false;
+
+    return true;
 }
 
 boost::asio::awaitable<void> Http2Connection::close() {
     // 这个函数现在可以从任何协程安全调用，因为它是最后的清理步骤。
     if (close_called_.exchange(true)) co_return;
-
+    SPDLOG_INFO("Http2Connection (Actor) [{}] 正在关闭连接.", id_);
     is_closing_ = true;
     request_channel_.close();
 
@@ -130,6 +191,7 @@ boost::asio::awaitable<void> Http2Connection::close() {
         boost::system::error_code error_code = stream_->lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
         boost::system::error_code close = stream_->lowest_layer().close(ec);
     }
+    SPDLOG_INFO("Http2Connection (Actor) [{}] 连接关闭完成.", id_);
 }
 
 boost::asio::awaitable<bool> Http2Connection::ping() {
@@ -159,6 +221,9 @@ tcp::socket& Http2Connection::lowest_layer_socket() {
 
 boost::asio::awaitable<void> Http2Connection::do_write() {
     try {
+        SPDLOG_TRACE("H2 [{}] do_write: session_want_write = {}, session_want_read = {}", id_,
+             nghttp2_session_want_write(session_), nghttp2_session_want_read(session_));
+
         // 只要 nghttp2 有数据想发送，就循环写入
         while (session_ && nghttp2_session_want_write(session_)) {
             const uint8_t *data = nullptr;
@@ -172,6 +237,7 @@ boost::asio::awaitable<void> Http2Connection::do_write() {
                 break;
             }
         }
+
     } catch (...) {
         if (!is_closing_) {
             is_closing_ = true;
@@ -205,7 +271,7 @@ asio::awaitable<void> Http2Connection::actor_loop() {
     co_await do_write();
 
     asio::steady_timer handshake_timer(co_await asio::this_coro::executor);
-    handshake_timer.expires_after(std::chrono::seconds(10));
+    handshake_timer.expires_after(std::chrono::seconds(3s));
 
     bool handshake_ok = false;
     while (!is_closing_ && !handshake_ok) {
@@ -215,14 +281,21 @@ asio::awaitable<void> Http2Connection::actor_loop() {
             handshake_timer.async_wait(asio::as_tuple(asio::use_awaitable))
         );
 
-        if (result.index() == 1) { // 超时
+        if (result.index() == 1) {
+            SPDLOG_ERROR("H2 连接 [{}] 握手阶段超时.", id_);
             throw std::runtime_error("HTTP/2 握手超时.");
         }
 
         auto [ec, n] = std::get<0>(result);
-        if (ec) throw boost::system::system_error(ec, "握手期间读取失败");
+        if (ec) {
+            SPDLOG_ERROR("H2 连接 [{}] 握手阶段读取失败: {}", id_, ec.message());
+            throw boost::system::system_error(ec, "握手期间读取失败");
+        }
+
+        SPDLOG_DEBUG("H2 连接 [{}] 握手阶段收到 {} 字节数据.", id_, n);
 
         if (nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t *>(read_buffer_.data()), n) < 0) {
+            SPDLOG_ERROR("H2 连接 [{}] 握手数据处理失败.", id_);
             throw std::runtime_error("处理接收到的握手数据失败.");
         }
 
@@ -233,6 +306,7 @@ asio::awaitable<void> Http2Connection::actor_loop() {
         int32_t remote_val = nghttp2_session_get_remote_settings(session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
         if (remote_val >= 0) {
             handshake_ok = true;
+            SPDLOG_INFO("H2 连接 [{}] 握手成功，远端 max_concurrent_streams = {}", id_, remote_val);
         }
     }
 
@@ -249,16 +323,39 @@ asio::awaitable<void> Http2Connection::actor_loop() {
 
         update_last_used_time();
 
+        SPDLOG_TRACE("Actor 循环 [{}]: result.index() = {}", id_, result.index());
+
         if (result.index() == 0) { // 网络可读
             auto [ec, n] = std::get<0>(result);
-            if (ec) { is_closing_ = true; break; }
+
+            if (ec) {
+                SPDLOG_WARN("H2 连接 [{}] 网络读取失败: {}", id_, ec.message());
+                is_closing_ = true;
+                break;
+            }
+
+            SPDLOG_TRACE("H2 连接 [{}] 网络读取 {} 字节.", id_, n);
+
             if (nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t *>(read_buffer_.data()), n) < 0) {
+                SPDLOG_ERROR("H2 连接 [{}] 处理网络数据失败，准备关闭连接.", id_);
                 is_closing_ = true;
                 break;
             }
         } else { // 收到新请求
             auto [ec, msg] = std::get<1>(result);
-            if (ec) { is_closing_ = true; break; }
+            if (ec) {
+                SPDLOG_WARN("H2 连接 [{}] 请求通道关闭或错误: {}", id_, ec.message());
+                is_closing_ = true;
+                break;
+            }
+
+            SPDLOG_DEBUG("H2 连接 [{}] 收到新请求: {}", id_, msg.request.target());
+
+            if (is_closing_ || remote_goaway_received_) {
+                SPDLOG_WARN("H2 连接 [{}] 已收到 GOAWAY 或正在关闭，拒绝新请求.", id_);
+                msg.response_channel->try_send(asio::error::operation_aborted, HttpResponse{});
+                continue;
+            }
 
             auto stream_ctx = std::make_unique<StreamContext>();
             stream_ctx->response_channel = msg.response_channel;
@@ -275,14 +372,20 @@ asio::awaitable<void> Http2Connection::actor_loop() {
 
             int32_t stream_id = nghttp2_submit_request(session_, nullptr, nva.data(), nva.size(), provider.source.ptr ? &provider : nullptr, stream_ctx.get());
             if (stream_id < 0) {
+                SPDLOG_ERROR("H2 连接 [{}] 提交请求失败: stream_id = {}", id_, stream_id);
                 stream_ctx->response_channel->try_send(boost::system::error_code(NGHTTP2_ERR_INVALID_ARGUMENT, boost::system::generic_category()), HttpResponse{});
             } else {
+                SPDLOG_INFO("H2 连接 [{}] 成功提交请求: stream_id = {}, target = {}", id_, stream_id, msg.request.target());
                 streams_.emplace(stream_id, std::move(stream_ctx));
                 ++active_streams_;
+                SPDLOG_DEBUG("H2 连接 [{}] 当前活跃流数量 = {}", id_, active_streams_.load());
             }
         }
 
         // 在每次循环的末尾，统一处理所有待发送的数据
+        SPDLOG_DEBUG("H2 [{}] actor_loop end: active_streams = {}, is_closing = {}, remote_goaway_received = {}",
+             id_, active_streams_.load(), is_closing_.load(), remote_goaway_received_.load());
+
         co_await do_write();
     }
 }
@@ -319,6 +422,25 @@ int Http2Connection::on_stream_close_callback(nghttp2_session *, int32_t stream_
 
 int Http2Connection::on_frame_recv_callback(nghttp2_session *, const nghttp2_frame *frame, void *user_data) {
     auto self = static_cast<Http2Connection *>(user_data);
+
+    if (frame->hd.type == NGHTTP2_GOAWAY) {
+        SPDLOG_WARN("在连接 [{}] 上收到 GOAWAY 帧, 错误码: {}", self->id_, frame->goaway.error_code);
+        self->remote_goaway_received_ = true;
+        self->is_closing_ = true;
+
+        // 立即拒绝新流，取消未完成流
+        for (auto& [id, ctx] : self->streams_) {
+            if (ctx && ctx->response_channel) {
+                ctx->response_channel->try_send(asio::error::operation_aborted, HttpResponse{});
+            }
+        }
+        self->streams_.clear();
+        self->active_streams_ = 0;
+
+        // 主动向对端发送本地 GOAWAY，并驱动写出
+        nghttp2_session_terminate_session(self->session_, NGHTTP2_NO_ERROR);
+    }
+
     if (frame->hd.type == NGHTTP2_SETTINGS && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
         uint32_t max_streams = nghttp2_session_get_remote_settings(
             self->session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
@@ -328,10 +450,6 @@ int Http2Connection::on_frame_recv_callback(nghttp2_session *, const nghttp2_fra
             self->max_concurrent_streams_ = max_streams;
             SPDLOG_INFO("H2 [{}]: 服务器更新 max_concurrent_streams 为 {}", self->id_, max_streams);
         }
-    }
-    if (frame->hd.type == NGHTTP2_GOAWAY) {
-        SPDLOG_WARN("在连接 [{}] 上收到 GOAWAY 帧, 错误码: {}", self->id_, frame->goaway.error_code);
-        self->is_closing_ = true;
     }
     return 0;
 }

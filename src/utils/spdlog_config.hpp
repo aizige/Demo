@@ -22,7 +22,7 @@ public:
     static void initLoggers() {
         // 初始化 spdlog 的线程池。这是异步日志的关键，
         // 指定了日志消息队列的容量和处理这些消息的后台线程数量。
-        spdlog::init_thread_pool(202400, 1); // 队列容量 & 后台线程数
+        spdlog::init_thread_pool(65536, 2); // 队列容量 & 后台线程数
 
 
         // 创建用于不同输出目标的 sinks（日志目的地）。
@@ -46,7 +46,7 @@ public:
         // 这个日志器会使用上面定义的 sinks 来输出日志，并利用线程池实现异步写入。
         const auto combined_logger = std::make_shared<spdlog::async_logger>("combined_logger", sinks.begin(), sinks.end(),
                                                                             spdlog::thread_pool(),
-                                                                            spdlog::async_overflow_policy::block);
+                                                                            spdlog::async_overflow_policy::overrun_oldest);
 
 
         // 将我们自定义的 combined_logger 设置为 spdlog 的全局默认日志器。
@@ -68,7 +68,7 @@ public:
         // 配置日志的刷新策略。
         // flush_every(): 每隔 5 秒强制刷新一次日志，确保日志不会长时间滞留在缓冲区。
         // flush_on(): 当日志级别达到 ERROR 或更高时，立即刷新日志。
-        spdlog::flush_every(50s);
+        spdlog::flush_every(std::chrono::seconds(5s));
         spdlog::flush_on(spdlog::level::err);
 
     }

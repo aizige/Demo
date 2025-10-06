@@ -37,7 +37,18 @@ namespace utils::compression {
          */
         static std::string deflate_decompress(std::string_view compressed_data);
 
+        /**
+         * @brief 线程安全的压缩数据为gzip
+         * @param data 需要压缩的数据
+         * @return 压缩后的数据
+         */
         static std::string gzip_compress(std::string_view data);
+
+        /**
+         * @brief 线程安全的压缩数据为deflate
+         * @param data 需要压缩的数据
+         * @return 压缩后的数据
+         */
         static std::string deflate_compress(std::string_view data);
 
     private:

@@ -8,7 +8,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # --- 查找所有依赖 ---
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
-#find_package(Boost REQUIRED COMPONENTS system thread coroutine)
 find_package(Boost REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(libnghttp2 REQUIRED) # **确保是 REQUIRED，如果找不到就应该立即失败**
@@ -17,10 +16,10 @@ find_package(stduuid REQUIRED)
 find_package(ada REQUIRED)
 
 #add_compile_options(-fcoroutines)
-set(CMAKE_VERBOSE_MAKEFILE ON)
-# 调试用的是hhhh
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
-set(CMAKE_BUILD_TYPE Debug)
+#set(CMAKE_VERBOSE_MAKEFILE ON)
+# 调试用的
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+#set(CMAKE_BUILD_TYPE Debug)
 
 add_executable(untitled1
         src/main.cpp
@@ -37,15 +36,10 @@ add_executable(untitled1
         src/core/client/http_ssl_connection.cpp
         src/core/client/h2_connection.cpp
         src/core/client/h2c_connection.cpp
-        src/utils/finally.hpp
-        src/core/client/IWebSocketClientHandler.hpp
         src/core/client/WebSocketConnection.cpp
-        src/core/client/WebSocketConnection.hpp
         src/core/client/WebSocketClient.cpp
-        src/core/client/WebSocketClient.hpp
-        src/core/client/UserStatusHandler.hpp
         src/impl/user_service.cpp
-        src/impl/user_service.hpp
+        src/utils/config/config_loader.cpp
 )
 
 add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
@@ -54,8 +48,7 @@ target_include_directories(untitled1 PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 
 target_link_libraries(untitled1 PRIVATE
-        Boost::system
-        Boost::thread
+        Boost::boost
         openssl::openssl
         ZLIB::ZLIB
         nlohmann_json::nlohmann_json
