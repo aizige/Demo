@@ -131,7 +131,7 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
     upgrade_req.set(http::field::host, target.host);
     upgrade_req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     upgrade_req.set(http::field::accept, "*/*");
-    upgrade_req.set(http::field::accept_encoding, "gzip, deflate, br");
+    upgrade_req.set(http::field::accept_encoding, "gzip, deflate");
     upgrade_req.set(http::field::accept_language, "en-US,en;q=0.9");
 
     // WebSocket 专用头部

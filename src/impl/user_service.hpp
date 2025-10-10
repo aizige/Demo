@@ -27,7 +27,7 @@ public:
 
     boost::asio::awaitable<void> test_http_client(RequestContext &ctx);
 
-    boost::asio::awaitable<void> connect_to_status_stream(RequestContext &ctx);
+    boost::asio::awaitable<void> connect_to_status_stream(RequestContext &ctx) ;
 
 private:
     std::remove_reference_t<std::shared_ptr<IHttpClient> &> http_client_;

@@ -2,4 +2,5 @@
 build
 logs
 src/logs
-.idea
+.idea/
+*.cmake

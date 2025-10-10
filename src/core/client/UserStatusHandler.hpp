@@ -46,7 +46,7 @@ public:
     }
 
     boost::asio::awaitable<void> on_message(std::string message) override {
-        SPDLOG_INFO("UserStatusHandler: Received message: {}", message);
+        SPDLOG_DEBUG("UserStatusHandler: Received message: {}", message);
         // 到时候单独在静态类中创建一个消息队列，例如：    using BusinessMessageChannel = boost::asio::experimental::channel<void(boost::system::error_code, std::string)>;   BusinessMessageChannel business_channel_;
         // 然后由websocket客户端链接创建者自行选择是否使用消息队列
         //

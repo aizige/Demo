@@ -106,11 +106,11 @@ boost::asio::awaitable<void> ConnectionManager::stop() {
     h2_pool_.clear(); // 清空池
 
     if (all_conns_to_close.empty()) {
-        SPDLOG_INFO("ConnectionManager: No active connections to close.");
+        SPDLOG_DEBUG("ConnectionManager: No active connections to close.");
         co_return;
     }
 
-    SPDLOG_INFO("ConnectionManager: Closing {} connections in parallel...", all_conns_to_close.size());
+    SPDLOG_DEBUG("ConnectionManager: Closing {} connections in parallel...", all_conns_to_close.size());
 
     // --- 使用 co_spawn + channel 实现健壮的并行等待 ---
 
@@ -154,7 +154,7 @@ boost::asio::awaitable<void> ConnectionManager::stop() {
         co_await completion_channel->async_receive(boost::asio::use_awaitable);
     }
 
-    SPDLOG_INFO("ConnectionManager: All connections have been successfully closed.");
+    SPDLOG_DEBUG("ConnectionManager: All connections have been successfully closed.");
 }
 
 void ConnectionManager::start_maintenance() {
@@ -393,7 +393,7 @@ boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::
     auto it = creation_in_progress_.find(key);
     if (it == creation_in_progress_.end()) {
         // --- A. 如果没有，当前协程成为“创建者” ---
-        SPDLOG_DEBUG("没有连接 '{}'，发起新的创建任务。", key);
+        SPDLOG_DEBUG("连接池里没有连接 '{}'，发起新的创建任务。", key);
 
         // a. 创建共享状态并放入 map
         auto new_creation = std::make_shared<CreationInProgress>(ex);
@@ -411,7 +411,7 @@ boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::
                     // 任务结束后，回到 strand 清理 map
                     boost::asio::post(self->strand_, [self, key] {
                         self->creation_in_progress_.erase(key);
-                        SPDLOG_DEBUG("连接 '{}' 的创建占位符已被移除。", key);
+                        SPDLOG_DEBUG("创建新连接 '{}' 的创建占位符已被移除。", key);
                     });
                 });
 
@@ -559,7 +559,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
                 auto conn = Http2Connection::create(stream, key);
 
                 // b. 调用同步的 run() 方法来启动后台 actor_loop
-                conn->run();
+               co_await  conn->run();
 
                 // c. **立即返回**。我们不再等待 H2 握手完成。
                 //    H2 握手现在是 actor_loop 内部的第一阶段。

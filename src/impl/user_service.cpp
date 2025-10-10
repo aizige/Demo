@@ -14,7 +14,7 @@ UserService::UserService(std::shared_ptr<IHttpClient> http_client,std::shared_pt
 }
 
 boost::asio::awaitable<void> UserService::get_user_by_id(RequestContext &ctx) {
-    SPDLOG_INFO("User ID:");
+    SPDLOG_DEBUG("User ID:");
     // 从 ctx 中获取路径参数
     // auto id_str = ctx.path_param("id");
     // if (!id_str) {
@@ -57,9 +57,9 @@ boost::asio::awaitable<void> UserService::test_http_client(RequestContext &ctx) 
     // 2. 从上下文中获取名为 "kw" 和 "page" 的查询参数
     auto url = ctx.query_param("url");
     std::string_view value = url.value();
+    SPDLOG_DEBUG("准备对：{} 发起请求", value);
     try {
         // 直接使用注入的 http_client_ 实例
-        SPDLOG_DEBUG("准备对：{} 发起请求", value);
         HttpResponse response = co_await http_client_->get(value, {});
 
         if (response.result() == http::status::ok) {
@@ -86,7 +86,7 @@ boost::asio::awaitable<void> UserService::test_http_client(RequestContext &ctx) 
     }
 }
 
-boost::asio::awaitable<void> UserService::connect_to_status_stream(RequestContext &ctx) {
+boost::asio::awaitable<void> UserService::connect_to_status_stream(RequestContext &ctx)  {
     try {
         // 1. 创建一个 Handler 实例
         auto handler = UserStatusHandler::create();

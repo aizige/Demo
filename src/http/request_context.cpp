@@ -48,7 +48,7 @@ void RequestContext::string(http::status status, std::string_view body, std::str
     response_.set(http::field::content_type, content_type);
     response_.set(http::field::server, "Aiziboyserver/1.0");
     response_.body() = body;
-    //compress_if_acceptable();
+    compress_if_acceptable();
     response_.prepare_payload();
 }
 
@@ -57,7 +57,9 @@ void RequestContext::json(http::status status, const nlohmann::json &j) {
     response_.set(http::field::content_type, "application/json");
     response_.set(http::field::server, "Aiziboyserver/1.0");
     response_.body() = j.dump(); // nlohmann::json::dump() 返回 std::string
+    compress_if_acceptable();
     response_.prepare_payload();
+
 }
 
 void RequestContext::json(http::status status, std::string_view json) {
@@ -65,7 +67,9 @@ void RequestContext::json(http::status status, std::string_view json) {
     response_.set(http::field::content_type, "application/json");
     response_.set(http::field::server, "Aiziboyserver/1.0");
     response_.body() = json;
+    compress_if_acceptable();
     response_.prepare_payload();
+
 }
 
 // --- 私有辅助函数实现 ---
@@ -168,4 +172,5 @@ void RequestContext::compress_if_acceptable() {
     response_.set(http::field::content_encoding, client_accepts_gzip);
 
     // 6. prepare_payload() 会在 dispatch 中被调用，它会更新 Content-Length
+
 }

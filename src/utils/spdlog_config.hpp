@@ -17,9 +17,10 @@
 
 // 将 C++14 的时间字面量（如 30s）引入当前作用域
 using namespace std::literals::chrono_literals;
+
 class spdlog_config {
 public:
-    static void initLoggers() {
+    static void initLoggers(std::string level) {
         // 初始化 spdlog 的线程池。这是异步日志的关键，
         // 指定了日志消息队列的容量和处理这些消息的后台线程数量。
         spdlog::init_thread_pool(65536, 2); // 队列容量 & 后台线程数
@@ -64,11 +65,11 @@ public:
         // 设置全局日志器的最低输出级别为 DEBUG。
         // 这一步至关重要，因为它确保了 DEBUG 级别的消息能够通过默认日志器输出。
         // 放置在这里是为了在 combined_logger 成为默认日志器后立即对其生效。
-        //spdlog::set_level(level == spdlog::level::debug ? spdlog::level::debug : spdlog::level::warn);
+        spdlog::set_level(level == "DEV" ? spdlog::level::debug : spdlog::level::warn);
         // 配置日志的刷新策略。
         // flush_every(): 每隔 5 秒强制刷新一次日志，确保日志不会长时间滞留在缓冲区。
         // flush_on(): 当日志级别达到 ERROR 或更高时，立即刷新日志。
-        spdlog::flush_every(std::chrono::seconds(5s));
+        spdlog::flush_every(5s);
         spdlog::flush_on(spdlog::level::err);
 
     }

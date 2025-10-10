@@ -60,7 +60,7 @@ public:
         X509_NAME_print_ex_fp(stdout, X509_get_subject_name(cert), 0, XN_FLAG_ONELINE);
         std::cout << std::endl;
 
-        std::cout << "📅 证书有效期:\n";
+        std::cout << "📅 证书有效期: ";
         // 使用 BIO (OpenSSL 的 I/O 抽象) 来打印 ASN.1 格式的时间
         BIO* out = BIO_new_fp(stdout, BIO_NOCLOSE); // BIO_NOCLOSE 表示 BIO_free 时不关闭底层的文件指针 (stdout)
         ASN1_TIME_print(out, X509_get_notBefore(cert)); std::cout << " → ";

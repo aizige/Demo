@@ -53,7 +53,7 @@ private:
 
 
     //  将解压器作为成员变量
-    Decompressor decompressor_{Decompressor::Format::GZIP};
+
 
 
     bool follow_redirects_ = true;

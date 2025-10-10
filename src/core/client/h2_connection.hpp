@@ -65,7 +65,7 @@ public:
     }
 
     // 同步方法，用于启动后台运行的 Actor。
-    void run();
+    boost::asio::awaitable<void> run();
 
 
     // --- IConnection 接口实现 ---
@@ -88,6 +88,8 @@ public:
 
 
 private:
+
+
 
     // 唯一的、统一的 Actor 协程，管理所有状态和 I/O。
     boost::asio::awaitable<void> actor_loop();
@@ -115,7 +117,9 @@ private:
     std::string id_;
 
     RequestChannel request_channel_; // Actor 的“邮箱”
+    boost::asio::experimental::channel<void(boost::system::error_code)> handshake_signal_;    // 新增一个 channel 用于握手信号
     std::array<char, 8192> read_buffer_{};
+
 
     nghttp2_session* session_ = nullptr;
     std::unordered_map<int32_t, std::unique_ptr<StreamContext>> streams_;
