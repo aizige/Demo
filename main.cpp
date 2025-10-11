@@ -1,13 +1,13 @@
-#include "core/server.hpp"
-#include "utils/spdlog_config.hpp"
-#include "controller/user_controller.hpp"
+#include "src/core/server.hpp"
+#include "src/utils/spdlog_config.hpp"
+#include "src/controller/user_controller.hpp"
 #include <filesystem>
 #include <chrono>
-#include "core/client/http_client.hpp"
-#include "utils/toml.hpp"
+#include "src/core/client/http_client.hpp"
+#include "src/utils/toml.hpp"
 #include <spdlog/sinks/null_sink.h>
 
-#include "utils/logger_manager.hpp"
+#include "src/utils/logger_manager.hpp"
 
 using namespace std::literals::chrono_literals;
 
@@ -38,7 +38,7 @@ int main() {
         auto worker_pool = std::make_shared<boost::asio::thread_pool>(worker_threads_count);
 
         Server server(ioc, 8080);
-        server.set_tls("dev-cert/server.crt", "dev-cert/server.key");
+        server.set_tls("../dev-cert/server.crt1", "../dev-cert/server.key1");
 
         auto connection_manager = std::make_shared<ConnectionManager>(ioc);
         // 1. 创建底层服务

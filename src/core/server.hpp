@@ -83,7 +83,6 @@ public:
         } catch (std::exception& e) {
             use_ssl_ = false;
             SPDLOG_ERROR("开启SSL失败: {}", e.what());
-
         }
 
         // [可选但推荐] 在启动时检查证书是否包含了所有必需的域名/IP，以进行部署验证
@@ -102,9 +101,7 @@ public:
         boost::asio::co_spawn(io_context_, listener(), boost::asio::detached);
     }
 
-    // 在 Server.hpp 或 Server.cpp 的 Server 类中
 
-    // 在 Server.hpp 或 Server.cpp 的 Server 类中
     // **注意：返回类型是 void，不再是 awaitable<void>**
     void stop() {
         // 1. 立即停止接受新连接
@@ -137,25 +134,6 @@ public:
                 }
             }
             h2_sessions_.clear(); // 清空列表
-
-            SPDLOG_INFO("Spawning shutdown tasks for {} H2C sessions...", h2c_sessions_.size());
-            // --- 处理 H2cSession ---
-            for (const auto& weak_session : h2c_sessions_) {
-                if (auto session = weak_session.lock()) {
-                    boost::asio::co_spawn(
-                        io_context_,
-                        [session]() -> boost::asio::awaitable<void> {
-                            try {
-                                co_await session->graceful_shutdown();
-                            } catch (const std::exception& e) {
-                                SPDLOG_WARN("Exception in H2C graceful_shutdown task: {}", e.what());
-                            }
-                        },
-                        boost::asio::detached
-                    );
-                }
-            }
-            h2c_sessions_.clear(); // 清空列表
         }
 
         SPDLOG_INFO("All shutdown tasks have been spawned.");
@@ -217,7 +195,7 @@ private:
                 HttpResponse resp{http::status::bad_request, 11};
                 resp.set(http::field::content_type, "text/html");
                 resp.set(http::field::connection, "close");
-                resp.set(http::field::server, "Aiziboyserver/1.0");
+                //resp.set(http::field::server, "Aiziboyserver/1.0");
                 resp.body() = "<html><body><h1>400 Bad Request</h1>"
                     "<p>This port requires HTTPS, but a plain HTTP request was received.</p>"
                     "</body></html>";
@@ -228,10 +206,9 @@ private:
                 auto [write_ec, bytes] = co_await http::async_write(sock,
                                                                     resp,
                                                                     boost::asio::as_tuple(boost::asio::use_awaitable));
+                SPDLOG_ERROR("TLS handshake failed (likely HTTP request on HTTPS port) from {}: {}", tls_stream->next_layer().remote_endpoint().address().to_string(), ec.message());
                 // 无论如何都关闭连接
                 sock.close();
-
-                SPDLOG_ERROR("TLS handshake failed (likely HTTP request on HTTPS port) from {}: {}", tls_stream->next_layer().remote_endpoint().address().to_string(), ec.message());
                 continue; // 握手失败，放弃此连接
             }
 
@@ -270,30 +247,33 @@ private:
     /**
      * @brief 处理普通（非加密）的 HTTP/1.1 连接的协程。
      */
-    boost::asio::awaitable<void> handle_plain(tcp::socket sock) {
-        // 将 socket 包装在 shared_ptr 中，以便在 H2C 升级时安全地转移所有权
-        auto sock_ptr = std::make_shared<tcp::socket>(std::move(sock));
-        boost::beast::flat_buffer buf;
-
+    boost::asio::awaitable<void> handle_plain(tcp::socket sock) const {
         try {
-            // --- [新增] 协议检测逻辑 ---
+            // 使用 Beast 推荐的 flat_buffer 来提高性能
+            boost::beast::flat_buffer buf;
+
+            // --- 协议错配检测：检查客户端是否错误地发送了 TLS 握手 ---
             char first_byte;
+
+            // 使用 peek 选项来“窥视”第一个字节，而不从流中消耗它
+            // asio::transfer_exactly(1) 是必须的
+            // as_tuple 使得超时或错误不会抛出异常
             auto [ec, n] = co_await boost::asio::async_read(
-                *sock_ptr,
+                sock,
                 boost::asio::buffer(&first_byte, 1),
                 boost::asio::as_tuple(boost::asio::use_awaitable)
             );
 
             if (ec) {
-                // 读取第一个字节就失败了，直接返回
+                // 读取第一个字节就失败了（例如，客户端立即断开），直接返回
                 co_return;
             }
 
-            // 检查第一个字节是否是 TLS Handshake (0x16)
-            // 0x80 是 SSLv2 ClientHello 的第一个字节，也可以加上
+            // 检查第一个字节是否是 TLS Handshake (0x16) 或 SSLv2 ClientHello (0x80)
             if (first_byte == 0x16 || first_byte == '\x80') {
-                // 关闭连接并立即返回
-                sock_ptr->close();
+                SPDLOG_WARN("Detected TLS/SSL handshake on plain HTTP port from {}. Closing connection.",sock.remote_endpoint().address().to_string());
+                // 检测到协议错误，直接关闭连接
+                sock.close();
                 co_return;
             }
 
@@ -307,101 +287,102 @@ private:
             // --- 协议检测结束 ---
 
 
+            // 创建一个可复用的定时器
             boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
-            constexpr auto initial_timeout = 10s; // 定义超时策略
-            constexpr auto keep_alive_timeout = 5s;
-            http::request_parser<http::string_body> parser; // 创建一个可复用的解析器
+            // 为新连接的第一个请求设置一个较短的超时
+            constexpr auto initial_timeout = 5s;
+            // 为 keep-alive 的空闲连接设置一个较短的超时
+            constexpr auto keep_alive_timeout = 10s;
 
-            //  1. 设置初始超时并一次性读取整个请求
 
-            timer.expires_after(initial_timeout);
-            auto read_result = co_await (http::async_read(*sock_ptr, buf, parser, boost::asio::use_awaitable) || timer.async_wait(boost::asio::use_awaitable));
-
-            // 如果是超时（计时器先完成），则直接退出
-            if (read_result.index() == 1) {
-                SPDLOG_INFO("HTTP initial request header timeout.");
-                co_return;
-            }
-            timer.cancel(); // 成功读取，取消计时器
-
-            // 2. 获取请求对象并检查 H2C Upgrade
-            HttpRequest req = parser.release(); // 先把请求拿出来
-            if (req.count(http::field::upgrade) && boost::beast::iequals(req.at(http::field::upgrade), "h2c")) {
-                SPDLOG_INFO("HTTP/1.1 to H2C upgrade requested.");
-
-                HttpResponse resp{http::status::switching_protocols, req.version()};
-                resp.set(http::field::connection, "Upgrade");
-                resp.set(http::field::upgrade, "h2c");
-                resp.prepare_payload();
-
-                co_await http::async_write(*sock_ptr, resp, boost::asio::use_awaitable);
-
-                // ... 启动 H2cSession ...
-                auto session = H2cSession::create(sock_ptr, router_);
-                {
-                    std::lock_guard<std::mutex> lock(session_mutex_);
-                    h2c_sessions_.insert(session);
-                }
-                co_await session->start(std::move(req), buf);
-                co_return; // 协议已切换，此协程任务完成
-            }
-
-            // --- 3. 如果不是 H2C 升级，进入keep-alive 主处理循环 ---
+            // --- Keep-Alive 主处理循环 ---
             for (;;) {
+                // 创建一个生命周期仅限于单次循环的 parser
+                // 这比在循环外创建 parser 更安全，可以避免状态残留
+                http::request_parser<http::string_body> parser;
+
+                // 为读取请求设置超时
+                // 在循环的第一次迭代中，使用 initial_timeout
+                timer.expires_after(buf.size() > 1 ? keep_alive_timeout : initial_timeout);
+
+                // 并发地等待读取完成或超时
+                auto read_result = co_await (
+                    http::async_read(sock, buf, parser, boost::asio::use_awaitable) ||
+                    timer.async_wait(boost::asio::use_awaitable)
+                );
+
+                if (read_result.index() == 1) { // index 1 代表定时器先完成
+                    SPDLOG_INFO("HTTP/1.1 connection timeout ({}s).",
+                               (buf.size() > 1 ? keep_alive_timeout : initial_timeout).count());
+                    break; // 超时，退出循环
+                }
+                timer.cancel(); // 成功读取，取消计时器
+
+                // 从 parser 中取出请求对象
+                HttpRequest req = parser.release();
+
+                // 查找匹配的路由和处理器
                 auto match = router_.dispatch(req.method(), req.target());
 
-                // 2. 创建 RequestContext。
-                //    这里很重要：req 会被移动到 ctx 中，原始的 req 变量将不再有效。
-                //    我们在循环的最后需要一个新的 req 对象，所以这里需要先保存 keep-alive 状态。
+                //  我们在循环的最后需要一个新的 req 对象，所以这里需要先保存 keep-alive 状态。
                 bool const keep_alive = req.keep_alive();
+
+                // 2. 创建RequestContext请求上下文
+                //    这里很重要：req 会被移动到 ctx 中，原始的 req 变量将不再有效。
                 RequestContext ctx(std::move(req), std::move(match.path_params));
 
+                // 执行业务逻辑处理器
                 try {
                     co_await match.handler(ctx);
                 } catch (const std::exception& e) {
                     SPDLOG_ERROR("Exception in HTTP handler for [{}]: {}",
-                                  ctx.request().target(),
-                                  e.what());
-                    ctx.string(http::status::internal_server_error, "error, Internal Server Error");
+                                    ctx.request().target(), e.what());
+                    // 确保在异常情况下也能返回一个标准的错误响应
+                    ctx.string(http::status::internal_server_error, "Internal Server Error");
                 }
 
 
-                // 5. 统一的响应后处理。
-                //    从 ctx 中取出最终的响应对象。
+                //  统一的响应后处理。
+                //  从 ctx 中取出最终的响应对象。
                 auto& resp = ctx.response();
-                // 6. 根据原始请求的 keep_alive 状态，设置响应的 keep_alive 头部。
+
+                // TODO: 最佳压缩时机
+
+                //  根据原始请求的 keep_alive 状态，设置响应的 keep_alive 头部。
                 resp.keep_alive(keep_alive);
-                co_await http::async_write(*sock_ptr, resp, boost::asio::use_awaitable);
+
+                resp.prepare_payload(); // 最佳prepare_payload时机而不是在RequestContext::json内
+
+
+                // 异步发送响应
+                co_await http::async_write(sock, resp, boost::asio::use_awaitable);
+
 
                 if (!keep_alive) { break; } // 客户端不希望或协议不支持保持连接，退出循环
 
-                // --- 5. 为等待下一个请求设置 keep-alive 空闲超时 ---
-                timer.expires_after(keep_alive_timeout);
-                http::request_parser<http::string_body> next_parser;
-
-                auto next_read_result = co_await (http::async_read(*sock_ptr, buf, next_parser, boost::asio::use_awaitable) || timer.async_wait(boost::asio::use_awaitable));
-
-                if (next_read_result.index() == 1) {
-                    // 空闲超时
-                    SPDLOG_INFO("HTTP/1.1 keep-alive connection idle timeout.");
+                // 如果 parser 还有未处理的数据（HTTP Pipelining），
+                // 我们在这里不做处理，直接关闭连接以简化逻辑。
+                // 现代客户端很少使用 Pipelining。
+                if(parser.is_done() == false) {
+                    SPDLOG_WARN("HTTP pipelining detected, which is not fully supported. Closing connection.");
                     break;
                 }
-
-                // 成功读取到新请求，准备下一次循环
-                req = next_parser.release();
+            }
+        } catch (const boost::system::system_error& e) {
+            // 捕获 Asio/Beast 的 I/O 错误，例如 EOF (客户端正常关闭)
+            if (e.code() != http::error::end_of_stream) {
+                SPDLOG_DEBUG("Error in plain HTTP session: {}", e.what());
             }
         } catch (const std::exception& e) {
-            // 捕获所有 I/O 错误（如 EOF）或其它异常，准备关闭连接
-            SPDLOG_ERROR("Error in plain HTTP session: {}", e.what());
+            // 捕获其他非 I/O 异常
+            SPDLOG_ERROR("Unexpected exception in plain HTTP session: {}", e.what());
         }
 
         // --- 最终关闭逻辑 ---
         boost::system::error_code ec;
         // 对于明文 TCP，我们直接 shutdown
-        sock_ptr->shutdown(tcp::socket::shutdown_send, ec);
-        //sock_ptr->shutdown(tcp::socket::shutdown_both, ec);
+        sock.shutdown(tcp::socket::shutdown_send, ec);
         SPDLOG_INFO("HTTP tcp socket closed with code: {}", ec.message());
-        co_return;
     }
 
     /**
@@ -448,15 +429,20 @@ private:
                     co_await match.handler(ctx);
                 } catch (const std::exception& e) {
                     SPDLOG_ERROR("Exception in HTTPS handler for [{}]: {}",
-                                  ctx.request().target(),
-                                  e.what());
+                                 ctx.request().target(),
+                                 e.what());
                     ctx.string(http::status::internal_server_error, "error Internal Server Error");
                 }
 
 
                 auto& resp = ctx.response();
+
+                // TODO: 最佳压缩时机
+
                 // 根据请求决定响应是否 keep-alive
                 resp.keep_alive(keep_alive);
+
+                resp.prepare_payload(); // 最佳prepare_payload时机而不是在RequestContext::json内
 
                 // 发送响应
                 co_await http::async_write(*tls_stream, resp, boost::asio::use_awaitable);
@@ -549,7 +535,6 @@ private:
     std::mutex session_mutex_;
     // **使用 std::set 和 std::owner_less，这是最简单、最正确的方案**
     std::set<std::weak_ptr<Http2Session>, std::owner_less<std::weak_ptr<Http2Session>>> h2_sessions_;
-    std::set<std::weak_ptr<H2cSession>, std::owner_less<std::weak_ptr<H2cSession>>> h2c_sessions_;
 };
 
 #endif // SERVER_HPP

@@ -14,7 +14,7 @@ HttpSslConnection::HttpSslConnection(StreamPtr  stream, std::string pool_key)
     : stream_(std::move(stream)), // 直接移动传入的 stream
       id_(generate_simple_uuid()),
       pool_key_(std::move(pool_key)),
-      last_used_timestamp_seconds_(steady_clock_seconds_since_epoch()) {
+      last_used_timestamp_seconds_(time_utils::steady_clock_seconds_since_epoch()) {
     SPDLOG_DEBUG("HttpSslConnection [{}] for pool [{}] created.", id_, pool_key_);
 }
 
@@ -125,7 +125,7 @@ boost::asio::awaitable<void> HttpSslConnection::close() {
 }
 
 void HttpSslConnection::update_last_used_time() {
-    last_used_timestamp_seconds_ = steady_clock_seconds_since_epoch();
+    last_used_timestamp_seconds_ = time_utils::steady_clock_seconds_since_epoch();
 }
 
 const std::string &HttpSslConnection::id() const { return id_; }

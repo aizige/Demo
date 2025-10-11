@@ -4,9 +4,12 @@
 
 #include "router.hpp"
 
+#include <iostream>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <vector>
+#include <spdlog/spdlog.h>
+
 #include "http_common_types.hpp" // 包含 RouteMatch, HandlerFunc 等
 #include "request_context.hpp"
 
@@ -33,6 +36,7 @@ Router::~Router() = default; // 必须要有，因为 unique_ptr 需要知道 Tr
 
 // --- 路由注册实现 ---
 void Router::add_route(http::verb method, std::string_view path, HandlerFunc handler) {
+
     if (routes_.find(method) == routes_.end()) {
         routes_[method] = std::make_unique<routing::TrieNode>();
     }
@@ -43,7 +47,6 @@ void Router::add_route(http::verb method, std::string_view path, HandlerFunc han
 
     for (const auto& part_str : parts) {
         if (part_str.empty()) continue;
-
         std::string_view part(part_str);
         if (part[0] == ':') { // 参数化路由
             if (!current->param_child) {
@@ -51,10 +54,12 @@ void Router::add_route(http::verb method, std::string_view path, HandlerFunc han
             }
             current->param_name = part.substr(1);
             current = current->param_child.get();
+            SPDLOG_DEBUG("注册路由：{}",current->param_name);
         } else { // 静态路由
             auto it = current->children.find(std::string(part));
             if (it == current->children.end()) {
                 current->children[std::string(part)] = std::make_unique<routing::TrieNode>();
+                SPDLOG_DEBUG("注册路径路由：{}",part);
             }
             current = current->children.at(std::string(part)).get();
         }
@@ -63,6 +68,7 @@ void Router::add_route(http::verb method, std::string_view path, HandlerFunc han
 }
 
 Router& Router::GET(std::string_view path, HandlerFunc handler) {
+    SPDLOG_DEBUG("创建路由：{}",path);
     add_route(http::verb::get, strip_query(path), std::move(handler));
     return *this;
 }

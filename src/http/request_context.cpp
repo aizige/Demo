@@ -1,111 +1,205 @@
 #include "request_context.hpp"
-#include <nlohmann/json.hpp> // 在 .cpp 文件中包含完整的 json.hpp
 
-#include "utils/decompression_manager.hpp"
+#include <iostream>
+#include <spdlog/spdlog.h>
+#include <boost/url.hpp>
+#include <cctype>
+#include <cstdlib>
+#include "utils/compression_manager.hpp"
+#include "utils/param_parser.hpp"
 
 // --- 构造函数实现 ---
 
 RequestContext::RequestContext(HttpRequest req, PathParams params)
     : request_(std::move(req)),
       path_params_(std::move(params)) {
-    // 构造时不做任何事情，查询参数的解析被推迟到第一次访问时
+    // 在构造时，可以为 response 对象设置一些通用的默认值
+    // response_.version(request_.version());
+    response_.keep_alive(request_.keep_alive());
+    response_.set(http::field::server, "AiziboyFramework/1.0");
+
 }
 
 // --- 请求数据访问实现 ---
 
-const HttpRequest &RequestContext::request() const {
+const HttpRequest& RequestContext::request() const {
     return request_;
 }
 
-std::optional<std::string_view> RequestContext::path_param(const std::string &key) const {
+std::optional<std::string_view> RequestContext::pathParam( std::string_view key) const {
     if (auto it = path_params_.find(key); it != path_params_.end()) {
         return it->second;
     }
     return std::nullopt;
 }
 
-std::optional<std::string_view> RequestContext::query_param(const std::string &key) const {
-    parse_query_if_needed(); // 确保已解析
-    if (auto it = query_params_.find(key); it != query_params_.end()) {
-        return it->second;
+
+
+
+std::optional<std::string_view> RequestContext::queryParam( std::string_view key) const {
+    parseQueryIfNeeded(); // 确保已解析
+    auto it = queryParams_.find(key);
+    if (it != queryParams_.end() && !it->second.empty()) {
+        return it->second.front(); // 返回第一个值
     }
     return std::nullopt;
 }
 
-const std::unordered_map<std::string_view, std::string_view> &RequestContext::query_params() const {
-    parse_query_if_needed(); // 确保已解析
-    return query_params_;
+
+
+
+std::vector<std::string_view> RequestContext::queryParamList( std::string_view key) const {
+    parseQueryIfNeeded(); // 确保已解析
+
+    auto it = queryParams_.find(key);
+    if (it != queryParams_.end()) {
+        return it->second; // 返回所有值
+    }
+    return {}; // 空 vector
+}
+
+const std::unordered_map<std::string_view, std::vector<std::string_view>>& RequestContext::queryParamAll() const {
+    parseQueryIfNeeded(); // 确保已解析
+
+    // 返回所有参数键值对
+    return queryParams_;
 }
 
 // --- 响应构建实现 ---
 
-HttpResponse &RequestContext::response() {
+HttpResponse& RequestContext::response() {
     return response_;
 }
 
 void RequestContext::string(http::status status, std::string_view body, std::string_view content_type) {
     response_.result(status);
     response_.set(http::field::content_type, content_type);
-    response_.set(http::field::server, "Aiziboyserver/1.0");
     response_.body() = body;
-    compress_if_acceptable();
+    compressIfAcceptable();
     response_.prepare_payload();
 }
 
-void RequestContext::json(http::status status, const nlohmann::json &j) {
+/*void RequestContext::json(http::status status, const nlohmann::json& j) {
     response_.result(status);
     response_.set(http::field::content_type, "application/json");
-    response_.set(http::field::server, "Aiziboyserver/1.0");
     response_.body() = j.dump(); // nlohmann::json::dump() 返回 std::string
-    compress_if_acceptable();
-    response_.prepare_payload();
-
-}
+    compressIfAcceptable();
+    //response_.prepare_payload();
+}*/
 
 void RequestContext::json(http::status status, std::string_view json) {
     response_.result(status);
     response_.set(http::field::content_type, "application/json");
-    response_.set(http::field::server, "Aiziboyserver/1.0");
     response_.body() = json;
-    compress_if_acceptable();
+    compressIfAcceptable();
     response_.prepare_payload();
-
 }
+
+
 
 // --- 私有辅助函数实现 ---
 
-void RequestContext::parse_query_if_needed() const {
-    if (query_params_parsed_) {
-        return;
-    }
+void RequestContext::parseQueryIfNeeded() const {
+    if (queryParamsParsed_) return;
+
+    // 标记为已解析，即使没有查询参数也只执行一次
+    queryParamsParsed_ = true;
 
     std::string_view target = request_.target();
     auto pos = target.find('?');
-    if (pos != std::string_view::npos) {
-        std::string_view q = target.substr(pos + 1);
-        size_t start = 0;
-        while (start < q.size()) {
-            size_t end = q.find('&', start);
-            if (end == std::string_view::npos) {
-                end = q.size();
-            }
+    if (pos == std::string_view::npos) {
+        return; // 没有查询字符串
+    }
 
-            auto kv = q.substr(start, end - start);
-            auto eq = kv.find('=');
+    std::string_view query_str = target.substr(pos + 1);
+    if (query_str.empty()) {
+        return; // 查询字符串为空
+    }
 
-            if (eq != std::string_view::npos) {
-                // key 和 value 都是 request_.target() 的视图，无拷贝
-                query_params_[kv.substr(0, eq)] = kv.substr(eq + 1);
+    // 清空 buffer，为本次解析做准备
+    decodeBuffer_.clear();
+    // 可以预分配一些空间以提高性能
+    decodeBuffer_.reserve(query_str.length());
+
+    // 注意：这里如果直接 .value() 可能会在解析失败时BOOST_ASSERT_IS_ON或std::terminate()导致程序崩溃
+    //boost::urls::params_view params = boost::urls::parse_query(query_str).value();
+    auto result = boost::urls::parse_query(query_str);
+
+    if (!result.has_value()) {
+        spdlog::warn("Query parse failed: {}", query_str);
+        return;
+    }
+    boost::urls::params_view params = result.value(); // 安全
+    for (const auto& param : params) {
+        // param.key 和 param.value 已经是解码后的 std::string
+        // 我们需要将它们的内容拷贝到我们自己的稳定 buffer 中
+
+        // 1. 将解码后的 Key 存入 buffer
+        size_t key_start_pos = decodeBuffer_.length();
+        decodeBuffer_.append(param.key); // 直接追加已解码的 key
+        std::string_view key_sv(decodeBuffer_.data() + key_start_pos, param.key.length());
+
+        // 2. 将解码后的 Value 存入 buffer
+        size_t value_start_pos = decodeBuffer_.length();
+        if (param.has_value) {
+            decodeBuffer_.append(param.value); // 直接追加已解码的 value
+        }
+        std::string_view value_sv(decodeBuffer_.data() + value_start_pos, param.has_value ? param.value.length() : 0);
+
+        // 3. 将指向 buffer 的稳定 string_view 存入 map
+        queryParams_[key_sv].push_back(value_sv);
+    }
+}
+
+
+void RequestContext::urlDecode(std::string_view sv, std::string& buffer) const {
+    for (size_t i = 0; i < sv.size(); ++i) {
+        if (sv[i] == '%' && i + 2 < sv.size()) {
+            char hex[3] = {sv[i + 1], sv[i + 2], '\0'};
+            if (isxdigit(hex[0]) && isxdigit(hex[1])) {
+                buffer += static_cast<char>(std::strtol(hex, nullptr, 16));
+                i += 2;
             } else {
-                // 处理没有值的参数，如 /path?flag
-                query_params_[kv] = ""; // 值是一个空的 string_view
+                buffer += '%'; // 非法编码，保留原始字符
             }
+        } else if (sv[i] == '+') {
+            buffer += ' ';
+        } else {
+            buffer += sv[i];
+        }
+    }
+}
 
-            start = end + 1;
+bool contains_ci(std::string_view haystack, std::string_view needle) {
+    return std::search(
+        haystack.begin(), haystack.end(),
+        needle.begin(), needle.end(),
+        [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+        }
+    ) != haystack.end();
+}
+
+bool is_compressible_content_type(std::string_view content_type) {
+    // 常见可压缩类型（可扩展）
+    constexpr std::string_view compressible_keywords[] = {
+        "text/",
+        "json",
+        "xml",
+        "javascript",
+        "x-www-form-urlencoded",
+        "csv",
+        "yaml",
+        "log"
+    };
+
+    for (auto keyword : compressible_keywords) {
+        if (contains_ci(content_type, keyword)) {
+            return true;
         }
     }
 
-    query_params_parsed_ = true;
+    return false;
 }
 
 /**
@@ -126,7 +220,7 @@ void RequestContext::parse_query_if_needed() const {
  * 视频/音频: MP4, MP3, AAC。同理，这些也是压缩格式。
  * 二进制文件: .zip, .gz, .pdf, .docx 等。这些文件格式内部已经包含了压缩。
  */
-void RequestContext::compress_if_acceptable() {
+void RequestContext::compressIfAcceptable() {
     // 1. 检查客户端是否支持压缩
     std::string client_accepts_gzip;
     if (request_.count(http::field::accept_encoding)) {
@@ -144,33 +238,31 @@ void RequestContext::compress_if_acceptable() {
     if (response_.count(http::field::content_type)) {
         std::string_view content_type = response_.at(http::field::content_type);
         // 只压缩已知的文本类型
-        if (!(content_type.starts_with("text/") ||
-              content_type.find("json") != std::string_view::npos ||
-              content_type.find("xml") != std::string_view::npos ||
-              content_type.find("javascript") != std::string_view::npos)) {
+        if (!is_compressible_content_type(content_type)) {
             return; // 不是可压缩的类型，直接返回
         }
     }
 
     // 2. 检查响应体是否值得压缩
-    constexpr size_t MIN_COMPRESSION_SIZE = 1024; // 1KB
-    if (response_.body().size() < MIN_COMPRESSION_SIZE) {
+    constexpr size_t min_compress_size = 1024 * 5; // 最小压缩大小 5KB
+    constexpr size_t min_async_compression_size  = 1024 * 10; // 最小异步压缩大小 10KB
+    if (response_.body().size() < min_compress_size) {
         return; // body 太小，不值得压缩
     }
 
+    // todo:判断body的大小再决定是再io线程上压缩还是在worker_pool_线程上压缩
     // 3. 检查响应是否已经被压缩过了（防止重复压缩）
     if (response_.count(http::field::content_encoding)) {
         return;
     }
 
+
     // 4. 执行压缩
     // 注意：这里我们直接修改内部的 response_ 对象
-    std::string compressed_body = client_accepts_gzip == "gzip"?utils::compression::DecompressionManager::gzip_compress(response_.body()) : utils::compression::DecompressionManager::deflate_compress(response_.body());
+    std::string compressed_body = client_accepts_gzip == "gzip" ? utils::compression::compression_manager::gzip_compress(response_.body()) : utils::compression::compression_manager::deflate_compress(response_.body());
 
     // 5. 更新响应对象
     response_.body() = std::move(compressed_body);
     response_.set(http::field::content_encoding, client_accepts_gzip);
-
-    // 6. prepare_payload() 会在 dispatch 中被调用，它会更新 Content-Length
 
 }

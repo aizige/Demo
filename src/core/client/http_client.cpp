@@ -6,11 +6,10 @@
 #include <ada.h>
 #include <boost/asio/detail/impl/scheduler.ipp>
 
-#include "h2c_connection.hpp"
 #include "h2_connection.hpp"
 #include "iconnection.hpp"
 #include "error/my_error.hpp"
-#include "utils/decompression_manager.hpp"
+#include "utils/compression_manager.hpp"
 #include "utils/finally.hpp"
 
 
@@ -59,170 +58,6 @@ std::string HttpClient::resolve_url(const std::string &base_url, const std::stri
 }
 
 // 实现接口中的 execute 方法，这是所有请求的最终入口
-//旧的v1.0
-/*boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std::string_view url, std::string body, const Headers &headers) {
-    int redirects_left = follow_redirects_ ? max_redirects_ : 0;
-
-
-    // --- **[关键]** 将请求参数保存起来，以便在循环中修改 ---
-    std::string current_url(url);
-    http::verb current_method = method;
-    std::string current_body = std::move(body);
-    Headers current_headers = headers;
-    bool is_first_request = true; // [新增] 标志位，用于判断是否是第一次请求
-    try {
-        while (redirects_left-- >= 0) {
-            ParsedUrl target = parse_url(current_url);
-            SPDLOG_DEBUG("正在对 {} 发起请求", current_url);
-
-            // 1. 创建 Request 对象
-            HttpRequest req{current_method, target.target, 11};
-            req.set(http::field::host, target.host);
-            req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-
-            // 设置通用头 (Accept, etc.)
-            if (current_headers.find(http::field::accept) == current_headers.end()) {
-                req.set(http::field::accept, "#1#*");
-            }
-            if (current_headers.find(http::field::accept_encoding) == current_headers.end()) {
-                req.set(http::field::accept_encoding, "gzip, deflate");
-            }
-            if (current_headers.find(http::field::accept_language) == current_headers.end()) {
-                req.set(http::field::accept_language, "en-US,en;q=0.9");
-            }
-            if (current_headers.find(http::field::connection) == current_headers.end()) {
-                req.set(http::field::connection, "keep-alive");
-            }
-
-            // 合并用户头
-            for (const auto &field: current_headers) {
-                req.set(field.name(), field.value());
-            }
-
-            // --- **[新增]** H2C Upgrade 头部注入 ---
-            // 只在第一次请求、明文HTTP、且是幂等方法时尝试升级
-            if (is_first_request && target.scheme == "http:" && (current_method == http::verb::get || current_method == http::verb::head)) {
-                req.set(http::field::connection, "Upgrade, HTTP2-Settings");
-                req.set(http::field::upgrade, "h2c");
-
-                // HTTP2-Settings header: base64url 编码的空 SETTINGS 帧 payload
-                // 对于客户端请求，一个空的 settings payload "AAAAAA==" 是常见且安全的
-                req.set(http::field::http2_settings, "AAAAAA==");
-                SPDLOG_INFO("设置H2C", current_url);
-            }
-            is_first_request = false; // 后续重定向不再是第一次请求
-
-            // 设置 body
-            if (!current_body.empty()) {
-                if (req.find(http::field::content_type) == req.end()) {
-                    req.set(http::field::content_type, "application/octet-stream");
-                }
-                req.body() = current_body;
-                req.prepare_payload();
-            }
-
-            // 2. 执行一次请求
-
-            auto [res, conn] = co_await execute_internal(req, target);
-
-
-            // --- **[新增]** H2C Upgrade 响应处理 ---
-            if (res.result() == http::status::switching_protocols && res.count(http::field::upgrade) && boost::beast::iequals(res.at(http::field::upgrade), "h2c")) {
-                SPDLOG_INFO("H2C Upgrade successful for {}. Replacing connection.", current_url);
-
-
-                // a. 从 Http1Connection 中“窃取” socket
-                auto socket_opt = co_await conn->release_socket();
-                if (!socket_opt || !socket_opt->is_open()) {
-                    throw std::runtime_error("Failed to release socket for H2C upgrade.");
-                }
-
-                // b. 创建一个新的 H2cConnection
-                auto h2c_stream = std::make_shared<Http2cConnection::StreamType>(std::move(*socket_opt));
-                auto h2c_conn = std::make_shared<Http2cConnection>(h2c_stream, conn->get_pool_key());
-                // c. 启动 H2C 会话（发送 preface settings）
-                h2c_conn->run();
-
-                // d. 在连接池中用新连接替换旧连接
-                manager_->release_connection(conn);
-
-                // e. 在【新的 H2C 连接】上【重新发送】原始请求
-                //    我们直接 co_return，因为升级后不会再有重定向
-                co_return co_await h2c_conn->execute(req);
-            }
-
-
-            // 3. 检查是否是重定向状态码
-            auto status_code = res.result_int();
-            if (status_code >= 300 && status_code < 400) {
-                auto loc_it = res.find(http::field::location);
-                if (loc_it == res.end()) {
-                    // 重定向响应没有 Location 头，这是一个服务器错误，我们直接返回
-                    co_return res;
-                }
-                std::string new_location(loc_it->value());
-
-                // 检查是否还有重试次数
-                if (redirects_left < 0) {
-                    throw std::runtime_error("Too many redirects");
-                }
-
-                SPDLOG_DEBUG("Redirecting from {} to {}", current_url, new_location);
-                current_url = resolve_url(current_url, new_location);
-
-                // --- **[关键]** 根据不同的重定向码，更新请求参数 ---
-                if (status_code == 301 || status_code == 302 || status_code == 303) {
-                    // 对于这些状态码，非 GET/HEAD 请求通常会变成 GET
-                    if (current_method != http::verb::get && current_method != http::verb::head) {
-                        current_method = http::verb::get;
-                        current_body.clear();
-                        // 清除与 body 相关的头部
-                        current_headers.erase(http::field::content_length);
-                        current_headers.erase(http::field::content_type);
-                        current_headers.erase(http::field::transfer_encoding);
-                    }
-                }
-                // 对于 307 和 308 (以及其他未明确处理的)，我们保持方法和 body 不变
-
-                // 继续下一次循环
-                continue;
-            }
-
-
-            // 4. 如果不是重定向，则返回最终的响应
-            // 解压Body数据
-            auto it = res.find(http::field::content_encoding);
-            if (it != res.end()) {
-                SPDLOG_DEBUG("正在解压Body");
-                std::string decompressed_body;
-                if (boost::beast::iequals(it->value(), "gzip")) {
-                    // **直接调用线程安全的静态方法**
-                    decompressed_body = utils::compression::DecompressionManager::gzip_decompress(res.body());
-                    res.body() = std::move(decompressed_body);
-
-                    // 4. **非常重要**：移除或更新头部
-                    //    因为 body 已经变了，原始的 Content-Length 不再有效
-                    //    同时，内容也不再是 gzip 编码了
-                    res.erase(http::field::content_encoding);
-                    res.prepare_payload();
-                } else if (boost::beast::iequals(it->value(), "deflate")) {
-                    // 切换解压器到 DEFLATE 模式
-                    decompressed_body = utils::compression::DecompressionManager::deflate_decompress(res.body());
-                    res.body() = std::move(decompressed_body);
-                    res.erase(http::field::content_encoding);
-                    res.prepare_payload();
-                }
-                SPDLOG_DEBUG("正在解压Body 完毕");
-            }
-            co_return res;
-        }
-    } catch (const std::exception &e) {
-
-        throw;
-    }
-    // 不可达，但为了编译器满意
-    throw std::runtime_error("Too many redirects.");
-}*/
 boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std::string_view url, std::string body, const Headers &headers) {
     int redirects_left = follow_redirects_ ? max_redirects_ : 0;
 
@@ -296,7 +131,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
                 auto loc_it = res.find(http::field::location);
                 if (loc_it == res.end()) {
                     // 重定向响应没有 Location 头，这是一个服务器错误，我们直接返回
-                    co_return res;
+                    co_return std::move(res);
                 }
                 std::string new_location(loc_it->value());
 
@@ -335,7 +170,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
                 std::string decompressed_body;
                 if (boost::beast::iequals(it->value(), "gzip")) {
                     // **直接调用线程安全的静态方法**
-                    decompressed_body = utils::compression::DecompressionManager::gzip_decompress(res.body());
+                    decompressed_body = utils::compression::compression_manager::gzip_decompress(res.body());
                     res.body() = std::move(decompressed_body);
 
                     // 4. **非常重要**：移除或更新头部
@@ -345,7 +180,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
                     res.prepare_payload();
                 } else if (boost::beast::iequals(it->value(), "deflate")) {
                     // 切换解压器到 DEFLATE 模式
-                    decompressed_body = utils::compression::DecompressionManager::deflate_decompress(res.body());
+                    decompressed_body = utils::compression::compression_manager::deflate_decompress(res.body());
                     res.body() = std::move(decompressed_body);
                     res.erase(http::field::content_encoding);
                     res.prepare_payload();
@@ -377,72 +212,7 @@ bool is_retryable_network_error(const boost::system::error_code &ec) {
 // 统一的内部执行函数，负责连接管理
 // in HttpClient.cpp
 //旧的v1.0与execute v1.0一起的
-/*boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_internal(HttpRequest& request, const ParsedUrl& target) {
 
-    // 初始化重试计数器（最多尝试两次）
-    int attempt = 1;
-
-    // 使用 while 循环代替 for，显式递增 attempt，避免编译器警告
-    while (true) {
-        if (attempt > 2) {
-            throw std::runtime_error("HttpClient: All retry attempts failed after stale connection.");
-        }
-
-        PooledConnection pooled_conn;
-        std::shared_ptr<IConnection> conn;
-
-        try {
-            // 🔹 第一步：从连接池获取连接（可能是复用连接）
-            pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
-            conn = pooled_conn.connection;
-
-            // 🔹 如果连接获取失败，抛出异常
-            if (!conn) {
-                throw std::runtime_error("Failed to acquire a connection.");
-            }
-
-            // 🔹 第二步：使用 RAII 机制确保连接一定会被释放
-            //     无论请求成功、失败还是重试，conn 离开作用域时都会被 release
-            auto guard = Finally([this, conn] {
-                manager_->release_connection(conn);
-            });
-
-            // 🔹 第三步：执行请求（可能抛出 system_error）
-            HttpResponse response = co_await conn->execute(request);
-
-            // ✅ 请求成功，立即返回响应和连接
-            co_return std::make_pair(std::move(response), conn);
-
-        } catch (const boost::system::system_error& e) {
-
-            // 🔹 判断是否满足重试条件：
-            //   - 还有重试次数
-            //   - 当前连接是复用的（可能是 stale）
-            //   - 错误码属于可重试的网络错误
-            bool should_retry = (
-                attempt < 2 &&
-                pooled_conn.is_reused &&
-                is_retryable_network_error(e.code())
-            );
-
-            // ❌ 不满足重试条件，记录日志并向上抛出异常
-            if (!should_retry) {
-                SPDLOG_ERROR("Request failed and is not retryable (attempt {}): {}", attempt, e.what());
-                throw;
-            }
-
-            // ✅ 满足重试条件，记录日志，继续下一轮尝试
-            SPDLOG_WARN("Stale connection [{}] detected. Retrying (attempt {}/2)...",
-                        conn ? conn->id() : "N/A",
-                        attempt + 1);
-
-            // RAII guard 会在此处析构，释放掉坏掉的连接
-        }
-
-        // 🔹 显式递增重试计数器，进入下一轮尝试
-        ++attempt;
-    }
-}*/
 
 boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_internal(HttpRequest& request, const ParsedUrl& target) {
 

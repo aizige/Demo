@@ -196,7 +196,7 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
                 }
 
                 // 规则2：如果连接空闲时间太长（例如超过60秒），主动关闭它
-                const auto now = steady_clock_seconds_since_epoch();
+                const auto now = time_utils::steady_clock_seconds_since_epoch();
                 if (now - conn->get_last_used_timestamp_seconds() > 60) {
                     SPDLOG_INFO("关闭闲置时间过长的连接 {}", conn->id());
                     boost::asio::co_spawn(

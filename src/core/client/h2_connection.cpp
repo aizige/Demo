@@ -37,7 +37,7 @@ Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
       id_(generate_simple_uuid()),
       request_channel_(stream_->get_executor(), 256), // 邮箱，带有 256 个消息的缓冲区
       handshake_signal_(stream_->get_executor(), 1),
-      last_used_timestamp_seconds_(steady_clock_seconds_since_epoch()) {
+      last_used_timestamp_seconds_(time_utils::steady_clock_seconds_since_epoch()) {
     SPDLOG_DEBUG("H2连接 [{}] 已创建.", id_);
 }
 
@@ -243,7 +243,7 @@ boost::asio::awaitable<bool> Http2Connection::ping() {
 }
 
 void Http2Connection::update_last_used_time() {
-    last_used_timestamp_seconds_ = steady_clock_seconds_since_epoch();
+    last_used_timestamp_seconds_ = time_utils::steady_clock_seconds_since_epoch();
 }
 
 size_t Http2Connection::get_active_streams() const {

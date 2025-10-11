@@ -14,7 +14,7 @@ Http1Connection::Http1Connection(tcp::socket socket, std::string pool_key)
     : socket_(std::move(socket)),
       id_(generate_simple_uuid()),
       pool_key_(std::move(pool_key)),
-      last_used_timestamp_seconds_(steady_clock_seconds_since_epoch())
+      last_used_timestamp_seconds_(time_utils::steady_clock_seconds_since_epoch())
 // 初始化新成员
 {
     SPDLOG_DEBUG("Http1Connection [{}] for pool [{}] created.", id_, pool_key_);
@@ -117,7 +117,7 @@ bool Http1Connection::is_usable() const {
 }
 
 void Http1Connection::update_last_used_time(){
-    last_used_timestamp_seconds_ = steady_clock_ms_since_epoch();
+    last_used_timestamp_seconds_ = time_utils::steady_clock_ms_since_epoch();
 }
 
 size_t Http1Connection::get_active_streams() const {

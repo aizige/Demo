@@ -176,7 +176,7 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
             // as_tuple(use_awaitable) 会让 timer_op 返回 std::tuple<error_code>
             auto [ec_timer] = std::get<1>(result);
             if (!ec_timer) {
-                SPDLOG_INFO("H2 connection idle timeout. Sending GOAWAY.");
+                SPDLOG_DEBUG("H2 connection idle timeout. Sending GOAWAY.");
                 // --- 关键修改 ---
                 // 调用我们新的优雅关闭协程
                 // NGHTTP2_NO_ERROR 表示这是一个计划内的关闭，而不是协议错误
@@ -392,7 +392,7 @@ boost::asio::awaitable<void> Http2Session::graceful_shutdown(uint32_t error_code
         co_return;
     }
 
-    SPDLOG_INFO("Initiating graceful shutdown for Http2Session with error_code={}", error_code);
+    SPDLOG_DEBUG("Initiating graceful shutdown for Http2Session with error_code={}", error_code);
 
     int32_t last_stream_id = nghttp2_session_get_last_proc_stream_id(session_);
 

@@ -18,28 +18,31 @@ class RequestContext;
 
 class UserController : public Controller {
 public:
-    explicit UserController(std::shared_ptr<UserService> user_service)
-        : user_service_(std::move(user_service)) {}
+    explicit UserController(std::shared_ptr<UserService> user_service);
 
     void register_routes(Router& router) override {
         // 实现保持不变，现在它应该可以编译通过了
         router.GET("/user/:id/:name", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
-            co_await user_service_->get_user_by_id(ctx);
+            return this->handle_get_user(ctx);
         });
 
-        router.GET("/search?kw={}}&page={}", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
-            co_await user_service_->search_users(ctx);
+        router.GET("/search?kw={}&page={}", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
+            return this->handle_search_users(ctx);
         });
         
-        router.GET("/request", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
-            co_await user_service_->test_http_client(ctx);
+        router.GET("/request?url={}", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
+            return this->handle_http_client(ctx);
         });
         router.GET("/ws", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
-            co_await user_service_->connect_to_status_stream(ctx);
+            return this->handle_test_wss(ctx);
         });
     }
 
 private:
+    boost::asio::awaitable<void> handle_get_user(RequestContext& ctx);
+    boost::asio::awaitable<void> handle_search_users(RequestContext& ctx);
+    boost::asio::awaitable<void> handle_http_client(RequestContext& ctx);
+    boost::asio::awaitable<void> handle_test_wss(RequestContext& ctx);
     std::shared_ptr<UserService> user_service_;
 };
 

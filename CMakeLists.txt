@@ -9,7 +9,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(Boost REQUIRED)
-find_package(nlohmann_json REQUIRED)
 find_package(libnghttp2 REQUIRED) # **确保是 REQUIRED，如果找不到就应该立即失败**
 find_package(spdlog REQUIRED)
 find_package(stduuid REQUIRED)
@@ -27,16 +26,17 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-point
 #set(CMAKE_BUILD_TYPE Debug)  # 设置构建类型为 Debug
 
 add_executable(untitled1
-        src/main.cpp
+        main.cpp
         src/core/h2_session.cpp
         src/core/h2c_session.cpp
         src/core/client/http1_connection.cpp
         src/core/client/connection_manager.cpp
         src/core/client/http_client.cpp
+        src/controller/user_controller.cpp
         src/http/request_context.cpp
         src/http/router.cpp
         src/utils/decompressor.cpp
-        src/utils/decompression_manager.cpp
+        src/utils/compression_manager.cpp
         src/utils/compressor.cpp
         src/core/client/http_ssl_connection.cpp
         src/core/client/h2_connection.cpp
@@ -45,6 +45,8 @@ add_executable(untitled1
         src/core/client/WebSocketClient.cpp
         src/impl/user_service.cpp
         src/utils/config/config_loader.cpp
+        src/http/parameter_set.hpp
+        src/utils/param_parser.hpp
 )
 
 add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
@@ -53,10 +55,12 @@ target_include_directories(untitled1 PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 
 target_link_libraries(untitled1 PRIVATE
-        Boost::boost
+        Boost::system
+        Boost::thread
+        Boost::url
+        Boost::json
         openssl::openssl
         ZLIB::ZLIB
-        nlohmann_json::nlohmann_json
         libnghttp2::libnghttp2
         spdlog::spdlog
         stduuid::stduuid
