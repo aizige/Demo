@@ -6,8 +6,8 @@
 #define WEBSOCKET_CLIENT_HPP
 
 #include "connection_manager.hpp" // 需要它的基础设施
-#include "WebSocketConnection.hpp"
-#include "IWebSocketClientHandler.hpp"
+#include "websocket_connection.hpp"
+#include "iwebsocket_client_handler.hpp"
 #include <string_view>
 
 class WebSocketClient {
@@ -23,7 +23,7 @@ public:
      */
     boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> connect(
         std::string_view url,
-        std::shared_ptr<IWebSocketClientHandler> handler,
+        std::shared_ptr<IWebsocketClientHandler> handler,
         const Headers& headers = {});
 
 private:

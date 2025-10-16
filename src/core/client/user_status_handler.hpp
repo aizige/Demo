@@ -5,19 +5,19 @@
 #ifndef USER_STATUS_HANDLER_HPP
 #define USER_STATUS_HANDLER_HPP
 
-#include "core/client/IWebSocketClientHandler.hpp"
+#include "core/client/iwebsocket_client_handler.hpp"
 #include <spdlog/spdlog.h>
 
-#include "WebSocketConnection.hpp"
+#include "websocket_connection.hpp"
 
-class UserStatusHandler : public IWebSocketClientHandler, public std::enable_shared_from_this<UserStatusHandler> {
+class UserStatusHandler : public IWebsocketClientHandler, public std::enable_shared_from_this<UserStatusHandler> {
 public:
     static std::shared_ptr<UserStatusHandler> create() {
         // [修复] 分两步创建，以绕过私有构造函数的限制
         return std::shared_ptr<UserStatusHandler>(new UserStatusHandler());
     }
 
-    // ~~~ IWebSocketClientHandler 接口实现 ~~~
+    // ~~~ IWebsocketClientHandler 接口实现 ~~~
 
     boost::asio::awaitable<void> on_connect(std::shared_ptr<WebSocketConnection> connection) override {
         SPDLOG_INFO("UserStatusHandler: Connection successful to user status stream.");

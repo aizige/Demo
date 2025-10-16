@@ -1,6 +1,7 @@
 #ifndef SERVER_HPP
 #define SERVER_HPP
 
+#include <fstream>
 #include <iostream>
 #include <set>
 #include <unordered_set>
@@ -9,22 +10,22 @@
 #include <boost/asio/ssl.hpp>     // Asio 的 SSL/TLS 功能
 #include <boost/beast/http.hpp>   // Beast 的 HTTP/1.1 功能
 #include <boost/asio/experimental/parallel_group.hpp> // 引入 parallel_group
-#include "h2c_session.hpp"
 #include "http/router.hpp"
-#include "ssl_context_manager.hpp"
+
 #include "h2_session.hpp"
-#include "http/handler.hpp"
 #include "utils/cert_checker.hpp"  // 证书检查工具
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/system/error_code.hpp> // 通常已经间接包含了
 #include <boost/asio/ssl/error.hpp>    // 包含了 SSL 相关的错误码和类别
 #include "http/request_context.hpp"
+#include "utils/finally.hpp"
+#include "http/http_common_types.hpp"
+#include "http/network_constants.hpp"
 
-// 命名空间别名，方便使用
+
+// 命名空间别名
 namespace http = boost::beast::http;
 using tcp = boost::asio::ip::tcp;
-
-// 将 C++14 的时间字面量（如 30s）引入当前作用域
 using namespace std::literals::chrono_literals;
 using namespace boost::asio::experimental::awaitable_operators;
 /**
@@ -39,25 +40,29 @@ using namespace boost::asio::experimental::awaitable_operators;
  * 4. 通过 ALPN (Application-Layer Protocol Negotiation) 判断客户端期望使用的协议。
  * 5. 如果是 HTTP/2 (`h2`)，则将连接交给 `Http2Session` 处理。
  * 6. 如果是 HTTP/1.1 或未知协议，则回退到基于 Boost.Beast 的 HTTPS 或 HTTP 处理器。
- * 7. 管理服务器范围内的资源，如路由器 (`Router`) 和 SSL 上下文 (`SslContextManager`)。
+ * 7. 管理服务器范围内的资源，如路由器 (`Router`)
  */
 class Server {
 public:
     /**
-     * @brief Server 构造函数。
-     * @param ioc 对主 `io_context` 的引用，所有异步操作都在此上运行。
-     * @param ip 绑定ip地址
+     * @brief 构造函数 (带 IP 和端口)。
+     * @param ioc 对主 `io_context` 的引用。
+     * @param ip 要绑定的 IP 地址。
      * @param port 要监听的端口号。
-     * @param use_ssl 是否启用 SSL/TLS。
      */
     Server(boost::asio::io_context& ioc, const std::string& ip, const uint16_t port)
         : io_context_(ioc),
-          acceptor_(ioc) // 先用 io_context 构造 acceptor
-    {
+          ssl_context_(boost::asio::ssl::context::tlsv12_server), // 先用 io_context 构造 acceptor
+          acceptor_(ioc) {
         // 调用一个辅助函数来完成剩下的设置
         setup_acceptor(port, ip);
     }
 
+    /**
+    * @brief 构造函数 (只带端口，IP 默认为 "0.0.0.0")。
+    * @param ioc 对主 `io_context` 的引用。
+    * @param port 要监听的端口号。
+    */
     Server(boost::asio::io_context& ioc, const uint16_t port)
         : Server(ioc, "0.0.0.0", port) // 调用另一个构造函数
     {
@@ -71,22 +76,55 @@ public:
     Router& router() { return router_; }
 
     /**
-     * @brief 设置并加载 TLS 证书和私钥。
-     * @param cert 证书文件路径。
-     * @param key 私钥文件路径。
+     * @brief 配置服务器以启用 TLS (HTTPS, H2)。
+     * @param cert_file PEM 格式的证书链文件路径。
+     * @param key_file PEM 格式的私钥文件路径。
+     * @note [逻辑问题]：此函数在加载失败时不会抛出异常，而是静默地将服务器
+     *       降级为 HTTP 模式，这在生产环境中可能导致严重的安全风险。
      */
-    void set_tls(const std::string& cert, const std::string& key) {
+    void set_tls(const std::string& cert_file, const std::string& key_file) {
         // 加载证书和私钥到 SSL 上下文管理器
         try {
-            ssl_mgr_.load(cert, key);
+            // 启动前检查文件是否存在，如果不存在则抛出异常，使服务器启动失败
+            if (!std::ifstream(cert_file))
+                throw std::runtime_error("未找到证书: " + cert_file);
+            if (!std::ifstream(key_file))
+                throw std::runtime_error("未找到证书密钥: " + key_file);
+
+            // --- 设置安全选项 ---
+            // 这是增强服务器安全性的重要步骤
+            ssl_context_.set_options(network::ssl::CONTEXT_OPTIONS);
+
+            // 动态设置协议版本范围
+            std::vector<std::string> versions = {"TLSv1.3", "TLSv1.2"}; // todo: 应来自配置文件
+            network::ssl::configure_tls_versions(ssl_context_.native_handle(), versions);
+
+            // --- 加载证书和私钥 ---
+            ssl_context_.use_certificate_chain_file(cert_file);
+            ssl_context_.use_private_key_file(key_file, boost::asio::ssl::context::pem);
+
+            // 加入额外的 TLS 安全选项
+            // 禁止 TLS 会话重协商，这可以防止一种潜在的 DoS 攻击
+            SSL_CTX_set_options(ssl_context_.native_handle(), SSL_OP_NO_RENEGOTIATION);
+
+            // --- 设置 ALPN (Application-Layer Protocol Negotiation) 回调函数 ---
+            // ALPN 是 TLS 握手期间的一个扩展，允许客户端和服务器协商接下来要使用的应用层协议
+            // (例如，是使用 HTTP/2 还是 HTTP/1.1)。
+            // 我们需要直接调用 OpenSSL 的底层 API 来设置这个回调。
+            // `native_handle()` 返回底层的 `SSL_CTX*` 指针。
+            SSL_CTX_set_alpn_select_cb(ssl_context_.native_handle(), alpn_select_callback, nullptr);
+
             use_ssl_ = true;
         } catch (std::exception& e) {
             use_ssl_ = false;
-            SPDLOG_ERROR("开启SSL失败: {}", e.what());
+            SPDLOG_ERROR("开启SSL失败，已经默认使用HTTP: {}", e.what());
+
+            // [!!! 重新抛出异常，中断启动 !!!]
+            //throw std::runtime_error("TLS configuration failed. Server cannot start in HTTPS mode.");
         }
 
         // [可选但推荐] 在启动时检查证书是否包含了所有必需的域名/IP，以进行部署验证
-        CertChecker::inspect(cert,
+        CertChecker::inspect(cert_file,
                              {
                                  "dev.myubuntu.com",
                                  "192.168.1.176"
@@ -95,6 +133,7 @@ public:
 
     /**
      * @brief 启动服务器的监听循环。
+     * 这是一个非阻塞操作，它会启动一个后台协程来处理连接接受。
      */
     void run() {
         // 启动一个常驻的监听协程
@@ -102,43 +141,109 @@ public:
     }
 
 
-    // **注意：返回类型是 void，不再是 awaitable<void>**
-    void stop() {
-        // 1. 立即停止接受新连接
-        if (acceptor_.is_open()) {
-            acceptor_.close();
-            SPDLOG_INFO("Server stopped accepting new connections.");
-        }
 
-        // 2. 在锁的作用域内，为每个会话启动一个独立的关闭协程
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
+/**
+ * @brief [修复后] 异步地、优雅地关闭服务器上的所有活跃会话。
+ *
+ * 这个协程是服务器优雅停机流程的关键部分。它会执行以下步骤：
+ * 1. 立即关闭 acceptor，停止接受任何新的客户端连接。
+ * 2. 安全地从会话管理列表中收集所有当前活跃的会话。
+ * 3. 并发地为每个活跃会话启动一个独立的 `graceful_shutdown` 协程。
+ * 4. 异步地等待所有这些关闭任务都完成后，此协程才会返回。
+ *
+ * @note 调用者应该 `co_await` 这个函数，以确保在继续执行后续的清理
+ *       操作（如停止 `io_context`）之前，所有网络会话都已完全关闭。
+ * @return 一个协程句柄，表示整个关闭流程。
+ */
+boost::asio::awaitable<void> stop() {
+    // TODO: 目前此方法只处理 Http2Session。如果未来添加了其他需要
+    //       优雅关闭的会话类型 (如 H2cSession)，应考虑引入一个
+    //       通用的 IStoppable 接口来统一管理和关闭所有会话，
+    //       以避免此函数中的代码重复。
 
-            SPDLOG_INFO("Spawning shutdown tasks for {} H2 sessions...", h2_sessions_.size());
-            // --- 处理 Http2Session ---
-            for (const auto& weak_session : h2_sessions_) {
-                if (auto session = weak_session.lock()) {
-                    // 为每个 session 启动一个独立的、被分离的协程来执行关闭
-                    // 它会在后台运行，我们不等待它
-                    boost::asio::co_spawn(
-                        io_context_, // 在 server 的 io_context 上运行
-                        [session]() -> boost::asio::awaitable<void> {
-                            try {
-                                co_await session->graceful_shutdown();
-                            } catch (const std::exception& e) {
-                                SPDLOG_WARN("Exception in H2 graceful_shutdown task: {}", e.what());
-                            }
-                        },
-                        boost::asio::detached // 分离协程，我们不关心它的结果
-                    );
-                }
-            }
-            h2_sessions_.clear(); // 清空列表
-        }
-
-        SPDLOG_INFO("All shutdown tasks have been spawned.");
-        // 函数在这里立即返回，不阻塞，不 co_await
+    // 1. 立即停止接受新连接，防止在关闭过程中有新会话建立。
+    if (acceptor_.is_open()) {
+        acceptor_.close();
+        SPDLOG_INFO("Server stopped accepting new connections.");
     }
+
+    // --- 2. 安全地收集所有需要关闭的会话 ---
+    // 创建一个局部 vector 来存储指向活跃会话的 shared_ptr。
+    std::vector<std::shared_ptr<Http2Session>> sessions_to_stop;
+    {
+        // 使用 lock_guard 来保护对共享成员 h2_sessions_ 的访问。
+        // 这确保了在收集过程中，listener 协程不会同时修改列表。
+        std::lock_guard<std::mutex> lock(session_mutex_);
+
+        SPDLOG_INFO("Collecting {} active H2 sessions for shutdown...", h2_sessions_.size());
+
+        // 遍历存储 weak_ptr 的集合。
+        for (const auto& weak_session : h2_sessions_) {
+            // 尝试将 weak_ptr提升为 shared_ptr。
+            // 如果 session 对象仍然存活，.lock() 会成功。
+            if (auto session = weak_session.lock()) {
+                sessions_to_stop.push_back(session);
+            }
+        }
+        // 清空列表，以便 Server 对象可以被安全销毁，即使某些关闭任务仍在运行。
+        h2_sessions_.clear();
+    }
+
+    // 如果没有任何活跃的会话，则无需等待，直接返回。
+    if (sessions_to_stop.empty()) {
+        SPDLOG_INFO("No active H2 sessions to shut down.");
+        co_return;
+    }
+
+    // --- 3. 使用 channel 机制来并行关闭并等待所有会话 ---
+
+    // 获取当前协程的执行器，用于创建 channel。
+    auto ex = co_await boost::asio::this_coro::executor;
+
+    // 创建一个 channel 作为“计数信号量”。它的容量等于任务数量。
+    // 每个关闭任务完成后，都会向 channel 发送一个信号。
+    auto completion_channel = std::make_shared<boost::asio::experimental::channel<void(boost::system::error_code)>>(
+        ex, sessions_to_stop.size()
+    );
+
+    SPDLOG_INFO("Spawning and waiting for {} H2 session shutdown tasks...", sessions_to_stop.size());
+
+    // 4. 为每个需要关闭的会话，并发地启动一个独立的关闭协程。
+    for (const auto& session : sessions_to_stop) {
+        // [!!! 获取 IP 地址用于日志 !!!]
+        // 在启动协程前，在当前作用域安全地获取端点信息
+        // 因为 session 对象在协程中可能被析构
+        // to_string() 可以将 endpoint 格式化为 "ip:port"
+        std::string endpoint_str = session->remote_endpoint().address().to_string() + ":" + std::to_string(session->remote_endpoint().port());
+
+        boost::asio::co_spawn(
+            ex, // 在与 stop() 相同的执行器上启动，以简化调度
+            [session, channel_ptr = completion_channel,endpoint_str]() -> boost::asio::awaitable<void> {
+                try {
+                    // 每个协程只负责关闭一个会话。
+                    co_await session->graceful_shutdown();
+                } catch (const std::exception& e) {
+                    // 忽略关闭单个会话时可能发生的异常，以确保整个 stop() 流程不会被中断。
+                    SPDLOG_WARN("Exception during H2 session [{}] graceful_shutdown: {}", endpoint_str, e.what());
+                }
+
+                // 任务完成，向 channel 发送一个完成信号。
+                // 即使关闭失败，也要发送信号，以防止 stop() 协程无限期等待。
+                co_await channel_ptr->async_send(boost::system::error_code{}, boost::asio::use_awaitable);
+            },
+            boost::asio::detached // 分离协程，我们不直接 await 它，而是通过 channel 等待它的完成信号。
+        );
+    }
+
+    // 5. 在主 stop() 协程中，挂起并等待，直到接收到所有任务发回的完成信号。
+    for (size_t i = 0; i < sessions_to_stop.size(); ++i) {
+        // 每次 async_receive 都会挂起，直到一个关闭任务完成并向 channel 发送信号。
+        // 这个循环会精确地等待 sessions_to_stop.size() 次。
+        co_await completion_channel->async_receive(boost::asio::use_awaitable);
+    }
+
+    SPDLOG_INFO("All H2 server sessions have been shut down.");
+}
 
 private:
     /**
@@ -146,7 +251,7 @@ private:
      */
     boost::asio::awaitable<void> listener() {
         // 获取当前协程的执行器，用于派生新的协程
-        auto exec = co_await boost::asio::this_coro::executor;
+        const auto exec = co_await boost::asio::this_coro::executor;
 
         for (;;) // 无限循环以持续接受连接
         {
@@ -174,7 +279,7 @@ private:
             // 1. 创建一个 SSL 流，将原始 TCP 套接字包装起来
             auto tls_stream = std::make_shared<boost::asio::ssl::stream<tcp::socket>>(
                 std::move(raw_sock),
-                ssl_mgr_.context()
+                ssl_context_
             );
 
             // 2. 异步执行 TLS 握手
@@ -217,9 +322,9 @@ private:
             unsigned int len = 0;
             // 从 SSL 对象中获取协商结果
             SSL_get0_alpn_selected(tls_stream->native_handle(), &proto, &len);
-            std::string_view alpn{reinterpret_cast<const char*>(proto), len};
+            const std::string_view alpn{reinterpret_cast<const char*>(proto), len};
 
-
+            SPDLOG_INFO("ALPN 协商结果: {}", alpn);
             // 4. 根据协商的协议，将连接分发给不同的处理器
             if (alpn == "h2") // 如果协商结果是 HTTP/2
             {
@@ -245,9 +350,10 @@ private:
     }
 
     /**
-     * @brief 处理普通（非加密）的 HTTP/1.1 连接的协程。
+     * @brief [私有] 处理纯文本 HTTP/1.1 连接的协程。
+     *        包含 Keep-Alive 逻辑和超时处理。
      */
-    boost::asio::awaitable<void> handle_plain(tcp::socket sock) const {
+    boost::asio::awaitable<void> handle_plain(tcp::socket sock) {
         try {
             // 使用 Beast 推荐的 flat_buffer 来提高性能
             boost::beast::flat_buffer buf;
@@ -271,7 +377,7 @@ private:
 
             // 检查第一个字节是否是 TLS Handshake (0x16) 或 SSLv2 ClientHello (0x80)
             if (first_byte == 0x16 || first_byte == '\x80') {
-                SPDLOG_WARN("Detected TLS/SSL handshake on plain HTTP port from {}. Closing connection.",sock.remote_endpoint().address().to_string());
+                SPDLOG_WARN("Detected TLS/SSL handshake on plain HTTP port from {}. Closing connection.", sock.remote_endpoint().address().to_string());
                 // 检测到协议错误，直接关闭连接
                 sock.close();
                 co_return;
@@ -287,47 +393,42 @@ private:
             // --- 协议检测结束 ---
 
 
-            // 创建一个可复用的定时器
             boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
+            // --- 定义不同的超时策略 ---
             // 为新连接的第一个请求设置一个较短的超时
-            constexpr auto initial_timeout = 5s;
-            // 为 keep-alive 的空闲连接设置一个较短的超时
-            constexpr auto keep_alive_timeout = 10s;
+            // 为 keep-alive 的空闲连接设置一个较长的超时 TODO:来自配置文件
+            constexpr auto initial_timeout = 10s;
+            constexpr auto keep_alive_timeout = 60s;
 
+            http::request_parser<http::string_body> parser;
+
+            // 1. 读取第一个请求，使用 initial_timeout
+            timer.expires_after(initial_timeout);
+            auto first_read_result = co_await (
+                http::async_read(sock, buf, parser, boost::asio::use_awaitable) ||
+                timer.async_wait(boost::asio::use_awaitable)
+            );
+
+            if (first_read_result.index() == 1) {
+                SPDLOG_INFO("HTTP initial request timeout.");
+                co_return;
+            }
+
+            timer.cancel_one();
+
+
+            HttpRequest req = parser.release();
 
             // --- Keep-Alive 主处理循环 ---
             for (;;) {
-                // 创建一个生命周期仅限于单次循环的 parser
-                // 这比在循环外创建 parser 更安全，可以避免状态残留
-                http::request_parser<http::string_body> parser;
-
-                // 为读取请求设置超时
-                // 在循环的第一次迭代中，使用 initial_timeout
-                timer.expires_after(buf.size() > 1 ? keep_alive_timeout : initial_timeout);
-
-                // 并发地等待读取完成或超时
-                auto read_result = co_await (
-                    http::async_read(sock, buf, parser, boost::asio::use_awaitable) ||
-                    timer.async_wait(boost::asio::use_awaitable)
-                );
-
-                if (read_result.index() == 1) { // index 1 代表定时器先完成
-                    SPDLOG_INFO("HTTP/1.1 connection timeout ({}s).",
-                               (buf.size() > 1 ? keep_alive_timeout : initial_timeout).count());
-                    break; // 超时，退出循环
-                }
-                timer.cancel(); // 成功读取，取消计时器
-
-                // 从 parser 中取出请求对象
-                HttpRequest req = parser.release();
-
+                // 第一个请求已经读完，直接处理
                 // 查找匹配的路由和处理器
                 auto match = router_.dispatch(req.method(), req.target());
 
                 //  我们在循环的最后需要一个新的 req 对象，所以这里需要先保存 keep-alive 状态。
                 bool const keep_alive = req.keep_alive();
 
-                // 2. 创建RequestContext请求上下文
+                // 创建RequestContext请求上下文
                 //    这里很重要：req 会被移动到 ctx 中，原始的 req 变量将不再有效。
                 RequestContext ctx(std::move(req), std::move(match.path_params));
 
@@ -336,37 +437,48 @@ private:
                     co_await match.handler(ctx);
                 } catch (const std::exception& e) {
                     SPDLOG_ERROR("Exception in HTTP handler for [{}]: {}",
-                                    ctx.request().target(), e.what());
+                                 ctx.request().target(), e.what());
                     // 确保在异常情况下也能返回一个标准的错误响应
                     ctx.string(http::status::internal_server_error, "Internal Server Error");
                 }
-
 
                 //  统一的响应后处理。
                 //  从 ctx 中取出最终的响应对象。
                 auto& resp = ctx.response();
 
-                // TODO: 最佳压缩时机
-
                 //  根据原始请求的 keep_alive 状态，设置响应的 keep_alive 头部。
                 resp.keep_alive(keep_alive);
+                // TODO: 最佳压缩时机
+                resp.prepare_payload();
 
-                resp.prepare_payload(); // 最佳prepare_payload时机而不是在RequestContext::json内
-
-
-                // 异步发送响应
+                // 发送响应
                 co_await http::async_write(sock, resp, boost::asio::use_awaitable);
 
-
-                if (!keep_alive) { break; } // 客户端不希望或协议不支持保持连接，退出循环
-
-                // 如果 parser 还有未处理的数据（HTTP Pipelining），
-                // 我们在这里不做处理，直接关闭连接以简化逻辑。
-                // 现代客户端很少使用 Pipelining。
-                if(parser.is_done() == false) {
-                    SPDLOG_WARN("HTTP pipelining detected, which is not fully supported. Closing connection.");
+                //  根据 keep_alive 决定下一步行为
+                if (!keep_alive) {
+                    // 客户端不希望保持连接，我们也不需要等待，直接退出循环
+                    SPDLOG_DEBUG("HTTP 客户端不希望保持连接，我们也不需要等待，直接退出循环");
                     break;
                 }
+
+                //  客户端希望保持连接，我们为等待下一个请求设置一个较长的空闲超时
+                timer.expires_after(keep_alive_timeout);
+                http::request_parser<http::string_body> next_parser;
+
+                auto next_read_result = co_await (
+                    http::async_read(sock, buf, next_parser, boost::asio::use_awaitable) ||
+                    timer.async_wait(boost::asio::use_awaitable)
+                );
+
+                if (next_read_result.index() == 1) {
+                    SPDLOG_DEBUG("HTTP keep-alive connection idle timeout.");
+                    break;
+                }
+
+                timer.cancel_one(); // 取消定时器
+
+                // 成功读取到新请求，准备下一次循环
+                req = next_parser.release();
             }
         } catch (const boost::system::system_error& e) {
             // 捕获 Asio/Beast 的 I/O 错误，例如 EOF (客户端正常关闭)
@@ -382,7 +494,7 @@ private:
         boost::system::error_code ec;
         // 对于明文 TCP，我们直接 shutdown
         sock.shutdown(tcp::socket::shutdown_send, ec);
-        SPDLOG_INFO("HTTP tcp socket closed with code: {}", ec.message());
+        SPDLOG_DEBUG("HTTP tcp socket closed with code: {}", ec.message());
     }
 
     /**
@@ -393,10 +505,11 @@ private:
     boost::asio::awaitable<void> handle_https(std::shared_ptr<boost::asio::ssl::stream<tcp::socket>> tls_stream) {
         boost::beast::flat_buffer buf;
         try {
+            // 创建一个可复用的定时器
             boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
             // --- 定义不同的超时策略 ---
             // 为新连接的第一个请求设置一个较短的超时
-            // 为 keep-alive 的空闲连接设置一个较长的超时
+            // 为 keep-alive 的空闲连接设置一个较长的超时 todo:来自配置文件
             constexpr auto initial_timeout = 10s;
             constexpr auto keep_alive_timeout = 60s;
 
@@ -413,6 +526,8 @@ private:
                 SPDLOG_INFO("HTTPS initial request timeout.");
                 co_return; // 直接返回，外层会关闭连接
             }
+
+            timer.cancel_one(); // 取消定时器
 
             HttpRequest req = parser.release();
 
@@ -438,11 +553,12 @@ private:
                 auto& resp = ctx.response();
 
                 // TODO: 最佳压缩时机
-
                 // 根据请求决定响应是否 keep-alive
                 resp.keep_alive(keep_alive);
+                SPDLOG_DEBUG("HTTPS DDDDDDDDDDDD循环{}",resp.keep_alive());
+                resp.prepare_payload();
 
-                resp.prepare_payload(); // 最佳prepare_payload时机而不是在RequestContext::json内
+
 
                 // 发送响应
                 co_await http::async_write(*tls_stream, resp, boost::asio::use_awaitable);
@@ -450,7 +566,7 @@ private:
                 // 3. 根据 keep_alive 决定下一步行为
                 if (!keep_alive) {
                     // 客户端不希望保持连接，我们也不需要等待，直接退出循环
-                    SPDLOG_INFO("HTTPS 客户端不希望保持连接，我们也不需要等待，直接退出循环");
+                    SPDLOG_DEBUG("HTTPS 客户端不希望保持连接，我们也不需要等待，直接退出循环");
                     break;
                 }
 
@@ -469,6 +585,7 @@ private:
                     SPDLOG_DEBUG("HTTPS keep-alive connection idle timeout.");
                     break;
                 }
+                timer.cancel_one(); // 取消定时器
 
                 // 成功读取到新请求，准备下一次循环
                 req = next_parser.release();
@@ -488,8 +605,10 @@ private:
         }
     }
 
-    // 辅助函数，封装了 acceptor 的设置逻辑，避免代码重复
-    void setup_acceptor(uint16_t port, const std::string& ip) {
+    /**
+     * @brief [私有] 配置并启动 TCP acceptor。
+     */
+    void setup_acceptor(const uint16_t port, const std::string& ip) {
         boost::system::error_code ec;
 
         // 1. 创建 endpoint
@@ -524,16 +643,53 @@ private:
         std::cout << "Success: Server is listening on " << endpoint << std::endl;
     }
 
+    /**
+     * @brief 静态回调函数，用于在 TLS 握手期间选择一个应用层协议。
+     * @param ssl OpenSSL 的 SSL 对象指针。
+     * @param out 用于存放服务器选择的协议的指针。
+     * @param outlen 用于存放服务器选择的协议的长度。
+     * @param in 客户端提供的协议列表。
+     * @param inlen 客户端协议列表的总长度。
+     * @param arg 用户自定义参数（在此未使用）。
+     * @return `SSL_TLSEXT_ERR_OK` 表示成功选择了一个协议，
+     *         `SSL_TLSEXT_ERR_NOACK` 表示没有找到共同支持的协议。
+     */
+    static int alpn_select_callback(SSL* ssl, const unsigned char** out, unsigned char* outlen,
+                                    const unsigned char* in, unsigned int inlen, void* arg) {
+        // 定义服务器支持的协议列表。
+        // 格式是：[1字节长度][协议名称][1字节长度][协议名称]...
+        // 这里的顺序很重要，表示服务器的偏好。我们优先选择 'h2' (HTTP/2)。 // TODO:这里要动态选择
+        const unsigned char* supported_protos = network::alpn::PROTOS_H2_PREFERRED;
 
-    boost::asio::io_context& io_context_; // 对主 io_context 的引用
-    tcp::acceptor acceptor_; // TCP 监听器
-    bool use_ssl_ = false; // 是否启用 SSL 的标志
-    SslContextManager ssl_mgr_; // SSL 上下文管理器
-    Router router_; // 路由器实例
+        // 使用 OpenSSL 提供的辅助函数来从客户端的列表 (`in`) 和服务器的列表 (`supported_protos`) 中选择第一个共同支持的协议。
+        if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, supported_protos, sizeof(supported_protos), in, inlen) == OPENSSL_NPN_NEGOTIATED) {
+            // OPENSSL_NPN_NEGOTIATED 表示协商成功
+            SPDLOG_INFO("ALPN 设置结果: {}", std::string(reinterpret_cast<const char*>(*out), *outlen));
 
-    // --- 新增的成员变量 ---
+            return SSL_TLSEXT_ERR_OK; // 返回成功
+        }
+
+        // 如果没有找到共同的协议，打印警告并返回错误
+        SPDLOG_WARN("ALPN: Could not find a common protocol.");
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+
+    /// @brief 对应用程序主 io_context 的引用。
+    boost::asio::io_context& io_context_;
+    /// @brief 用于创建和配置所有 TLS 连接的 SSL 上下文。
+    boost::asio::ssl::context ssl_context_;
+    /// @brief 负责在指定端口上监听和接受传入的 TCP 连接。
+    tcp::acceptor acceptor_;
+    /// @brief 标志位，指示服务器当前是否应在 SSL/TLS 模式下运行。
+    bool use_ssl_ = false;
+    /// @brief 存储所有已注册路由的路由器实例。
+    Router router_;
+
+    /// @brief 用于保护会话列表 (h2_sessions_) 的互斥锁，确保多线程访问安全。
     std::mutex session_mutex_;
-    // **使用 std::set 和 std::owner_less，这是最简单、最正确的方案**
+    /// @brief 存储所有活跃的 Http2Session 的弱指针。
+    /// 使用 weak_ptr 可以避免循环引用，并允许在不影响 session 自身生命周期的情况下对其进行跟踪。
     std::set<std::weak_ptr<Http2Session>, std::owner_less<std::weak_ptr<Http2Session>>> h2_sessions_;
 };
 

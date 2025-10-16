@@ -2,7 +2,7 @@
 // Created by Aiziboy on 25-8-5.
 //
 
-#include "WebSocketConnection.hpp"
+#include "websocket_connection.hpp"
 
 #include <spdlog/spdlog.h>
 #include <boost/asio/as_tuple.hpp>
@@ -16,7 +16,7 @@
 namespace asio = boost::asio;
 
 
-WebSocketConnection::WebSocketConnection(WsVariantStream stream, HttpRequest upgrade_request, std::shared_ptr<IWebSocketClientHandler> handler, std::string id)
+WebSocketConnection::WebSocketConnection(WsVariantStream stream, HttpRequest upgrade_request, std::shared_ptr<IWebsocketClientHandler> handler, std::string id)
     : stream_(std::move(stream)),
       initial_upgrade_request_(std::move(upgrade_request)),
       handler_(std::move(handler)),

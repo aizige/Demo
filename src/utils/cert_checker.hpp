@@ -28,7 +28,7 @@ public:
     /**
      * @brief 检查指定的证书文件，并验证其 SAN (Subject Alternative Name) 列表。
      * @param cert_path PEM 格式的证书文件的路径。
-     * @param required_hosts一个包含所有必须出现在证书 SAN 列表中的域名或 IP 地址的向量。
+     * @param required_hosts 一个包含所有必须出现在证书 SAN 列表中的域名或 IP 地址的向量。
      *
      * 该函数会执行以下操作：
      * 1. 读取并解析 PEM 证书文件。

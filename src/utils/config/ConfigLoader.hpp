@@ -1,0 +1,40 @@
+//
+// Created by Aiziboy on 2025/10/15.
+//
+
+#ifndef UNTITLED1_CONFIGLOADER_HPP
+#define UNTITLED1_CONFIGLOADER_HPP
+
+#include "config.hpp" // 包含所有结构体定义
+#include <string>
+
+#include "utils/toml.hpp"
+
+
+class ConfigLoader {
+public:
+    /**
+     * @brief 从指定的 TOML 文件路径加载配置。
+     *
+     * @param filepath 配置文件的路径。
+     * @return Config 填充了配置数据的结构体。
+     * @throws std::runtime_error 如果文件不存在或解析失败。
+     */
+    static Config load(const std::string& filepath);
+
+private:
+    // 为了保持接口干净，所有解析函数都作为私有帮助函数
+    static AppConfig parse_app(const toml::table& root_tb);
+    static ServerConfig parse_server(const toml::table& root_tb);
+    static ClientConfig parse_client(const toml::table& root_tb);
+    static DatabaseConfig parse_database(const toml::table& root_tb);
+    static LoggingConfig parse_logging(const toml::table& root_tb);
+
+    // 数据库子解析器
+    static PostgresConfig parse_postgres_from_table(const toml::table& pg_tb);
+    static RedisConfig parse_redis(const toml::table& rd_tb);
+    static ClickhouseConfig parse_clickhouse(const toml::table& ck_tb);
+};
+
+
+#endif //UNTITLED1_CONFIGLOADER_HPP

@@ -12,7 +12,8 @@
 #include <type_traits>
 #include <algorithm> // for std::equal
 #include <string>    // for std::string conversion
-
+#include <chrono>
+#include <sstream>
 namespace param_parser {
 
     // 不区分大小写的string_view比较）
@@ -27,7 +28,7 @@ namespace param_parser {
 
     template<typename T>
     std::optional<T> tryParse(std::string_view sv) {
-        // 对于数字类型（整数和浮点）
+        // 对于数字类型整数和浮点（所有的“算术类型”）
         if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, char>) {
             T value;
             auto result = std::from_chars(sv.data(), sv.data() + sv.size(), value);
@@ -47,6 +48,18 @@ namespace param_parser {
         // 对于 std::string_view 直接返回
         else if constexpr (std::is_same_v<T, std::string_view>) {
             return sv;
+        }
+        // 对于时间类型（如 "2025-10-11T10:00:00Z"）
+        // 例如：ctx.query_param_as<std::chrono::system_clock::time_point>("start_time")
+        else if constexpr (std::is_same_v<T, std::chrono::system_clock::time_point>) {
+            std::chrono::system_clock::time_point tp;
+            // 注意：from_stream 需要一个 null 结尾的字符串，所以这里有开销
+            std::string temp_str{sv};
+            std::stringstream ss{temp_str};
+            ss >> std::chrono::parse("%FT%TZ", tp); // 解析 ISO 8601 格式
+            if (!ss.fail()) {
+                return tp;
+            }
         }
 
         // All other types fail to parse

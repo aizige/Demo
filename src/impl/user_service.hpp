@@ -6,32 +6,42 @@
 #define USER_SERVICE_HPP
 
 
+#include <boost/asio/thread_pool.hpp>
+
 #include "http/request_context.hpp"
 
 
-#include "core/client/http1_connection.hpp"
+#include "core/client/http_connection.hpp"
 #include "core/client/ihttp_client.hpp"
-#include "core/client/WebSocketClient.hpp"
+#include "core/client/websocket_client.hpp"
 
 
 class UserService {
 public:
     // 通过构造函数注入一个 IHttpClient 的共享指针
-    explicit UserService(std::shared_ptr<IHttpClient> http_client, std::shared_ptr<WebSocketClient> ws_client);
+    explicit UserService(boost::asio::any_io_executor io_executor,boost::asio::any_io_executor worker_executor,const std::shared_ptr<IHttpClient>& http_client, const std::shared_ptr<WebSocketClient>& ws_client);
+
+    boost::asio::awaitable<void> simulate_high_concurrency(int num_requests, std::string_view url);
 
 
     boost::asio::awaitable<std::string> get_user_by_id(int id, std::string_view name);
 
 
-    boost::asio::awaitable<std::string> search_users(std::string_view kw, std::string_view page);
+    boost::asio::awaitable<std::string> concurrent_test(int sum, std::string_view url);
 
     boost::asio::awaitable<std::string> test_http_client(std::string_view url);
 
-    boost::asio::awaitable<std::string> connect_to_status_stream(std::string_view body);
+    [[nodiscard]] boost::asio::awaitable<std::string> connect_to_status_stream(std::string_view body) const;
+    boost::asio::awaitable<double> intensiveComputing();
+
 
 private:
-    std::remove_reference_t<std::shared_ptr<IHttpClient>&> http_client_;
-    std::remove_reference_t<std::shared_ptr<WebSocketClient>&> ws_client_;
+    double heavy_compute();
+
+    boost::asio::any_io_executor ioc_executor_;
+    boost::asio::any_io_executor worker_executor_;
+    std::shared_ptr<IHttpClient> http_client_;
+    std::shared_ptr<WebSocketClient> ws_client_;
 };
 
 

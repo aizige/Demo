@@ -4,10 +4,73 @@
 
 #include "user_service.hpp"
 
-#include "core/client/UserStatusHandler.hpp"
+#include <boost/asio/as_tuple.hpp>
 
-UserService::UserService(std::shared_ptr<IHttpClient> http_client, std::shared_ptr<WebSocketClient> ws_client)
-    : http_client_(std::move(http_client)), ws_client_(std::move(ws_client)) {
+#include "core/client/user_status_handler.hpp"
+#include <boost/asio/experimental/parallel_group.hpp>
+#include <exception> // for std::exception_ptr
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/channel.hpp>
+#include <utility>
+
+// 引入 asio 协程操作符，如 || (race)
+using namespace boost::asio::experimental::awaitable_operators;
+using namespace std::chrono_literals;
+UserService::UserService(boost::asio::any_io_executor io_executor,boost::asio::any_io_executor worker_executor,const std::shared_ptr<IHttpClient>& http_client, const std::shared_ptr<WebSocketClient>& ws_client)
+    : ioc_executor_(std::move(io_executor)), worker_executor_(std::move(worker_executor)), http_client_(http_client), ws_client_(ws_client) {
+}
+
+/**
+ * @brief 模拟向服务器并行发起大量（N个）HTTP GET请求。
+ */
+boost::asio::awaitable<void> UserService::simulate_high_concurrency(int num_requests, std::string_view url) {
+    if (num_requests <= 0) {
+        co_return;
+    }
+
+
+
+    // 1. [!!! 关键 !!!] 创建一个 channel 作为“完成计数器”。
+    //    它的容量等于请求数量。
+    auto completion_channel = std::make_shared<
+        boost::asio::experimental::channel<void(boost::system::error_code)>
+    >(ioc_executor_, num_requests);
+
+    // 2. 循环启动所有工作协程
+    for (int i = 0; i < num_requests; ++i) {
+        co_spawn(
+            ioc_executor_,
+            // 工作协程
+            [this, url, channel_ptr = completion_channel]() -> boost::asio::awaitable<void> {
+                try {
+                    // a. 执行单个请求，我们不关心它的返回值
+                    co_await http_client_->get(url, {});
+                } catch (const std::exception& e) {
+                    // b. 捕获并记录失败，但不让异常逃逸
+                    SPDLOG_ERROR("A request in high concurrency test failed: {}", e.what());
+                }
+
+                // c. [!!! 关键 !!!] 任务完成（无论成功或失败），向 channel 发送一个信号
+                boost::system::error_code ignored_ec;
+                co_await channel_ptr->async_send(ignored_ec, boost::asio::use_awaitable);
+            },
+            boost::asio::detached
+        );
+    }
+
+    // 3. [!!! 关键 !!!] 在主协程中，等待接收到所有 N 个完成信号
+    SPDLOG_INFO("Waiting for all {} requests to complete...", num_requests);
+    for (int i = 0; i < num_requests; ++i) {
+        try {
+            // 这个 co_await 能在您的环境中工作，我们在 stop() 中已经验证过
+            co_await completion_channel->async_receive(boost::asio::use_awaitable);
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR("Error waiting on completion channel: {}", e.what());
+            break;
+        }
+    }
+
+    SPDLOG_INFO("All {} requests have completed.", num_requests);
 }
 
 boost::asio::awaitable<std::string> UserService::get_user_by_id(int id, const std::string_view name) {
@@ -23,11 +86,27 @@ boost::asio::awaitable<std::string> UserService::get_user_by_id(int id, const st
     co_return "Hello, World!";
 }
 
-boost::asio::awaitable<std::string> UserService::search_users(std::string_view kw, std::string_view page) {
-    SPDLOG_DEBUG("进来了");
+/**
+ * @brief 并发网络请求
+ * @param sum 并发线程数
+ * @param url 要并发请求的url
+ * @return 简单返回一个字符串
+ */
+boost::asio::awaitable<std::string> UserService::concurrent_test(int sum, std::string_view url) {
 
-    // 5. 返回响应
-    co_return "Hello, World!";
+    try {
+      // // 直接使用注入的 http_client_ 实例
+      // HttpResponse response = co_await http_client_->get("http://192.168.1.176:9001/user/56/DSDS", {});
+      // HttpResponse response2 = co_await http_client_->get("http://192.168.1.176:9001/user/56/123123123", {});
+      co_await  simulate_high_concurrency(sum,url);
+        SPDLOG_DEBUG("<<<<<<<<<<<<<<< {} >>>>>>>>>>>>>>> ");
+        co_return "成功 ";
+    } catch (const boost::system::system_error& e) {
+        // 处理异常
+        SPDLOG_ERROR("Failed to get user from external API: {}", e.what());
+        co_return "Failed ";
+    }
+
 }
 
 boost::asio::awaitable<std::string> UserService::test_http_client(std::string_view url) {
@@ -38,11 +117,12 @@ boost::asio::awaitable<std::string> UserService::test_http_client(std::string_vi
         HttpResponse response = co_await http_client_->get(url, {});
 
 
-        SPDLOG_DEBUG("请求成功 body size = {}", response.body().size());
+
         std::string_view content_type;
         auto it = response.find(http::field::content_type);
         if (it != response.end()) {
             content_type = it->value();
+            SPDLOG_DEBUG("请求成功 body size = {}，content-type {} ", response.body().size(),content_type);
         }
 
         co_return response.body();
@@ -54,7 +134,7 @@ boost::asio::awaitable<std::string> UserService::test_http_client(std::string_vi
 
 }
 
-boost::asio::awaitable<std::string> UserService::connect_to_status_stream(std::string_view body) {
+boost::asio::awaitable<std::string> UserService::connect_to_status_stream(std::string_view body) const {
         try {
             // 1. 创建一个 Handler 实例
             auto handler = UserStatusHandler::create();
@@ -85,4 +165,50 @@ boost::asio::awaitable<std::string> UserService::connect_to_status_stream(std::s
             co_return "请求失败";
         }
 
+}
+
+boost::asio::awaitable<double> UserService::intensiveComputing() {
+
+    // [!!! 这才是正确的卸载方式 !!!]
+    // 我们在 worker_pool_ 上 co_spawn 一个新的协程来执行阻塞任务，
+    // 然后 co_await 它的结果。
+    auto [e, result] = co_await boost::asio::co_spawn(
+        // 1. 目标执行器：工作线程池
+        worker_executor_,
+
+        // 2. 要在 worker 线程上执行的【协程 lambda】
+        [this]() -> boost::asio::awaitable<double> {
+            // 这个协程的【全部】内容都在 worker 线程上运行
+            SPDLOG_INFO("进入工作线程...");
+
+            // 调用阻塞函数
+            double compute_result = heavy_compute();
+
+
+
+            // 使用 co_return 返回结果
+            co_return compute_result;
+        },
+
+        // 3. 完成令牌：告诉 co_spawn 我们希望 co_await 它的结果
+        boost::asio::as_tuple(boost::asio::use_awaitable)
+    );
+
+
+    co_return result;
+}
+
+double UserService::heavy_compute() {
+    SPDLOG_INFO("工作线程：开始 30 秒的阻塞工作...");
+    auto start = std::chrono::steady_clock::now();
+    double result = 0;
+    while (std::chrono::steady_clock::now() - start < 10s) {
+        // 执行一些复杂的数学计算，例如
+
+        for (int i = 0; i < 1000; ++i) {
+            result += std::sin(i) * std::cos(i);
+        }
+    }
+    SPDLOG_INFO("工作线程：工作完成...");
+    return result;
 }

@@ -8,6 +8,13 @@
 #include <unordered_map>
 #include <string>
 #include <optional>
+#include <boost/asio/ip/tcp.hpp>
+#include <string_view> // <<-- 包含 string_view
+#include <boost/asio/awaitable.hpp>
+
+#include "http/string_view_body.hpp"
+
+class RequestContext;
 
 // 1. 定义一个透明的 Hasher
 struct StringHash {
@@ -29,14 +36,28 @@ struct StringEqual {
 
 namespace http = boost::beast::http;
 
+using tcp = boost::asio::ip::tcp;
+
+// 用于发送请求的类型，使用 string_view_body 实现零拷贝
+using HttpRequestView = http::request<string_view_body>;
+
+
 using HttpRequest  = http::request<http::string_body>;
-
-
 using HttpResponse = http::response<http::string_body>;
 
 using Headers = http::fields;
 
-//using PathParams = std::unordered_map<std::string, std::string>;
+/**
+ * @brief 定义了所有请求处理函数的统一函数签名。
+ *
+ * 这是一个 std::function 对象，它可以包装任何可调用对象
+ * （如 lambda、函数指针、成员函数指针），只要其签名匹配：
+ * - 接收一个对 RequestContext 的引用。
+ * - 返回一个 boost::asio::awaitable<void>，表示它是一个协程。
+ */
+using HandlerFunc = std::function<boost::asio::awaitable<void>(RequestContext&)>;
+
+
 using PathParams = std::unordered_map<std::string, std::string, StringHash, StringEqual>;
 
 #endif //UNTITLED1_HTTP_COMMON_TYPES_HPP

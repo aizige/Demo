@@ -2,7 +2,7 @@
 // Created by Aiziboy on 25-8-5.
 //
 
-#include "WebSocketClient.hpp"
+#include "websocket_client.hpp"
 
 #include <ada.h>
 #include <boost/asio/redirect_error.hpp>
@@ -55,7 +55,7 @@ std::string generate_websocket_key() {
     return base64_encode(key, sizeof(key));
 }
 
-boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::connect(std::string_view url, std::shared_ptr<IWebSocketClientHandler> handler, const Headers& headers) {
+boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::connect(std::string_view url, std::shared_ptr<IWebsocketClientHandler> handler, const Headers& headers) {
     auto target = parse_url(url);
     bool use_ssl = (target.scheme == "wss:");
     if (!use_ssl && target.scheme != "ws:") {

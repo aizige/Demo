@@ -76,7 +76,7 @@ void RequestContext::string(http::status status, std::string_view body, std::str
     response_.set(http::field::content_type, content_type);
     response_.body() = body;
     compressIfAcceptable();
-    response_.prepare_payload();
+
 }
 
 /*void RequestContext::json(http::status status, const nlohmann::json& j) {
@@ -84,7 +84,7 @@ void RequestContext::string(http::status status, std::string_view body, std::str
     response_.set(http::field::content_type, "application/json");
     response_.body() = j.dump(); // nlohmann::json::dump() 返回 std::string
     compressIfAcceptable();
-    //response_.prepare_payload();
+
 }*/
 
 void RequestContext::json(http::status status, std::string_view json) {
@@ -92,7 +92,7 @@ void RequestContext::json(http::status status, std::string_view json) {
     response_.set(http::field::content_type, "application/json");
     response_.body() = json;
     compressIfAcceptable();
-    response_.prepare_payload();
+
 }
 
 
@@ -152,7 +152,7 @@ void RequestContext::parseQueryIfNeeded() const {
 }
 
 
-void RequestContext::urlDecode(std::string_view sv, std::string& buffer) const {
+void RequestContext::urlDecode(std::string_view sv, std::string& buffer) {
     for (size_t i = 0; i < sv.size(); ++i) {
         if (sv[i] == '%' && i + 2 < sv.size()) {
             char hex[3] = {sv[i + 1], sv[i + 2], '\0'};

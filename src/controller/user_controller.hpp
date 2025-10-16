@@ -26,8 +26,8 @@ public:
             return this->handle_get_user(ctx);
         });
 
-        router.GET("/search?kw={}&page={}", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
-            return this->handle_search_users(ctx);
+        router.GET("/concurrent?sum={}&url={}", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
+            return this->handle_concurrent_test(ctx);
         });
         
         router.GET("/request?url={}", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
@@ -36,13 +36,17 @@ public:
         router.GET("/ws", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
             return this->handle_test_wss(ctx);
         });
+        router.POST("/intensiveComputing", [this](RequestContext& ctx) -> boost::asio::awaitable<void> {
+            return this->intensive_computing(ctx);
+        });
     }
 
 private:
     boost::asio::awaitable<void> handle_get_user(RequestContext& ctx);
-    boost::asio::awaitable<void> handle_search_users(RequestContext& ctx);
+    boost::asio::awaitable<void> handle_concurrent_test(RequestContext& ctx);
     boost::asio::awaitable<void> handle_http_client(RequestContext& ctx);
     boost::asio::awaitable<void> handle_test_wss(RequestContext& ctx);
+    boost::asio::awaitable<void> intensive_computing(RequestContext& ctx);
     std::shared_ptr<UserService> user_service_;
 };
 

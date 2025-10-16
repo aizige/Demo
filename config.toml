@@ -2,88 +2,55 @@
 # 应用程序核心配置
 # ------------------------------------------------
 
-# 应用本身的一些元数据和全局设置。
-# name: 应用名称。
-# version: 应用版本。
+
 [app]
-name = "myWebFrameworkApp"
+name = "MyWebFrameworkApp"
 version = "1.0.0"
-
-# ------------------------------------------------
-# 应用程序核心配置
-# ------------------------------------------------
-
-# ssl.enabled = true环境下，Https协议优先级 H2 --- > Https1.1
-# host: 服务器绑定的IP地址。
-#      - "127.0.0.1" 表示只允许本机访问
-#      - "0.0.0.0" 表示监听所有网络接口。
-# port: 监听的端口号，如 8080。
-# threads : 指定用于处理请求的工作线程或进程数量。对于 C++ 等高性能语言，合理设置该参数有助于充分利用多核 CPU，提高并发处理能力。
-#          - 设置为 "0" 表示使用当前处理器的全部核心；
-#          - 设置为 "-1" 表示使用核心总数减一，通常用于保留一个核心给系统或其他任务。
-# H2: 是否启用H2协议
-# H2C: 是否启用H2C协议
-# timeout_ms: 请求超时时间（毫秒），防止慢速攻击或有问题的请求耗尽资源。
-# max_request_size_kb: 允许的最大请求体大小（KB），防止恶意的大文件上传。
-#                     - 一般 API 请求：1024 ~ 8192 KB
-#                     - 文件上传：10240 KB 以上
-
+profiles = "dev"
 
 [server]
-host = "0.0.0.0"
 port = 8080
 threads = 8
-H2 = false
-H2C = false
+
 timeout_ms = 5000
 max_request_size_kb = 1024
 
-# HTTPS相关配置，是一个子表 [server.ssl]。
-# enabled: 是否启用HTTPS。
-# tls_versions: 服务端Tls版本。tls_version数组最大size为2。Tls版本范围示例：["TLSv1.3","TLSv1.1"]这将支持TLSv1.1、TLSv1.2、TLSv1.3。["TLSv1.3"]：将只支持TLSv1.3
-# certificate_file: SSL证书文件的路径。（仅server.ssl.enabled为true时有效）
-# certificate_private_key_file: SSL私钥文件的路径。（仅server.ssl.enabled为true时有效）
+
 [server.ssl]
-enabled = false
-tls_versions  = ["TLSv1.3", "TLSv1.2"]
-certificate_file = "/path/to/your/fullchain.pem"
-certificate_private_key_file = "/path/to/your/privkey.pem"
-
-[server.client.h2]
-enabled = true
-request_send_timeout_ms = 300   # 请求发送阶段的超时（如 actor 未唤醒）
-response_recv_timeout_ms = 3000 # 请求响应阶段的超时（如连接挂起）
-connect_timeout_ms = 1500 # 连接建立超时	TCP + TLS 握手阶段的最大等待时间（如 1500ms）
-max_streams_per_connection = 100 # 最大并发流数	控制每个连接允许的最大并发请求数（如 100）
-idle_close_threshold_ms = 30000 # 空闲连接关闭时间 控制连接在无活动时多久关闭（如 30000ms）
-ping_interval_ms = 20000 # PING 保活间隔	定期发送 PING 帧检测连接是否挂起（如 20000ms）
-enable_goaway_handling = true # 是否启用 GOAWAY 处理	 是否在收到 GOAWAY 后主动关闭连接并重建
-
-[server.client.h2c]
-enabled = true
-request_send_timeout_ms = 300   # 请求发送阶段的超时（如 actor 未唤醒）
-response_recv_timeout_ms = 3000 # 请求响应阶段的超时（如连接挂起）
-connect_timeout_ms = 1500 # 连接建立超时	TCP  握手阶段的最大等待时间（如 1500ms）
-max_streams_per_connection = 100 # 最大并发流数	控制每个连接允许的最大并发请求数（如 100）
-idle_close_threshold_ms = 30000 # 空闲连接关闭时间 控制连接在无活动时多久关闭（如 30000ms）
-ping_interval_ms = 20000 # PING 保活间隔	定期发送 PING 帧检测连接是否挂起（如 20000ms）
-enable_goaway_handling = true # 是否启用 GOAWAY 处理	 是否在收到 GOAWAY 后主动关闭连接并重建
+enabled = false                                               # 是否启用HTTPS
+http2_enabled = false                                         # 是否开启HTTP2
+tls_versions  = ["TLSv1.3", "TLSv1.2"]                        # 服务端Tls版本。tls_version数组最大size为2。Tls版本范围示例：["TLSv1.3","TLSv1.1"]这将支持TLSv1.1、TLSv1.2、TLSv1.3。["TLSv1.3"]：将只支持TLSv1.3
+certificate_file = "/path/to/your/fullchain.pem"              # certificate_file: SSL证书文件的路径。
+certificate_key_file = "/path/to/your/privkey.pem"            # certificate_private_key_file: SSL私钥文件的路径。
+required_hosts_list = [ "dev.myubuntu.com", "192.168.1.176" ] # 填写证书所对应的域名及IP列表，就能帮你检查证书文件，并验证其 SAN (Subject Alternative Name) 列表
 
 
-# ------------------------------------------------
-# 数据库配置
-# ------------------------------------------------
-# type: 数据库类型，如 "postgresql", "mysql", "sqlite"。
-# host: 数据库服务器地址。
-# port: 数据库端口。
-# user: 用户名。
-# password: 密码。
-# database : 数据库名称。
-# pool_size: 连接池大小。对于高并发的C++应用，使用数据库连接池是必须的。
+
+[client]
+http2_enabled = true  # 启用HTTP2客户端(启用后对于Https连接，优先使用H2协议发起请求)
+ssl_verify = true     # false 表示跳过证书验证，仅用于测试环境
+max_redirects_ = 3    # 最大重定向次数.默认3，(≤ 0则关闭重定向)
+
+connect_timeout_ms = 1500        # 连接建立超时	TCP + TLS 握手阶段的最大等待时间（如 1500ms）
+idle_close_threshold_ms = 300000 # 空闲连接关闭时间 控制连接在无活动时多久关闭（如5分钟 300000ms ）
+ping_interval_ms = 20000         # PING 保活间隔	定期发送 PING 帧检测连接是否挂起（如 20000ms）
+host_connection_pool_size = 100  # 单个个Host的最大连接池大小
+MAX_CONNECTIONS_PER_HOST = 100   # 每个Host的最大并发连接数
+
+http2_request_send_timeout_ms = 300    # 请求发送阶段的超时（防止actor未唤醒）
+http2_response_recv_timeout_ms = 3000  # 请求响应阶段的超时（防止连接挂起）
+http2_max_streams_per_connection = 100 # 最大并发流数	控制每个连接允许的最大并发请求数（如 100），这个一般是设置服务器 SETTINGS 帧中获取的值
+
+
+
+
+
+
+
+
 [database]
-
-[databases.main_postgres]
-type = "postgresql"
+[database.postgresql]
+name = "default"  # config name
 host = "localhost"
 port = 5432
 user = "app_user"
@@ -91,6 +58,7 @@ password = "db_password"
 database = "app_db"
 
 # SSL 配置
+[database.postgresql.ssl]
 ssl_enabled = false
 sslmode = "require"              # 可选: disable, require, verify-ca, verify-full
 sslcert = "/etc/ssl/pg/client.crt"
@@ -98,18 +66,17 @@ sslkey = "/etc/ssl/pg/client.key"
 sslrootcert = "/etc/ssl/pg/ca.crt"
 
 # 连接池配置
-[database.pool]
+[database.postgresql.pool]
 max_connections = 32             # 最大连接数
 min_connections = 4              # 最小连接数
 idle_timeout_ms = 30000          # 空闲连接超时
 connection_timeout_ms = 5000     # 获取连接超时时间
-validation_query = "SELECT 1"    # 用于连接健康检查
 
 # ------------------------------------------------
 # redis配置
 # ------------------------------------------------
 
-[redis]
+[database.redis]
 host = "192.168.1.1"    # Redis服务器的主机名或IP地址。
 port = 6379 # Redis服务器端口。
 database = 0 # 要使用的数据库编号（0-15）
@@ -118,15 +85,16 @@ timeout_ms = 100 # 连接超时时间（毫秒）。
 keep_alive_ms = 5000 # TCP Keep-Alive 间隔（毫秒），保持连接活跃。
 
 # 连接池设置 (Pooling)
-[redis.pool]
+[database.redis.pool]
 pool_size = 10    # 连接池中维护的最小（和最大）连接数。	10
 max_wait_ms = 3000        # 如果连接池已满，获取连接时等待的最大时间（毫秒）。	2000
 idle_timeout_ms = 300000        # 连接空闲多久后会被连接池自动关闭（释放资源）。	300000
 health_check_interval_ms = 6000        # 连接池自动检查连接健康状态的间隔（毫秒）。	60000
 
 # 安全连接 (TLS/SSL)
+[database.redis.ssl]
 ssl_enabled = false    # 是否使用TLS/SSL加密连接。	false
-ca_cert_fil = ""        # 客户端用于验证服务器证书的CA证书路径。	"/path/to/ca.crt"
+ca_file = ""        # 客户端用于验证服务器证书的CA证书路径。	"/path/to/ca.crt"
 client_cert_file = ""        # 客户端证书路径（如果服务器要求双向认证）。	"/path/to/client.crt"
 client_key_file = ""        # 客户端私钥路径。	"/path/to/client.key"
 
@@ -134,7 +102,7 @@ client_key_file = ""        # 客户端私钥路径。	"/path/to/client.key"
 # ------------------------------------------------
 # Clickhouse配置
 # ------------------------------------------------
-[clickhouse]
+[database.clickhouse]
 host = "127.0.0.1"
 port = 9440                      # TLS端口
 database = "default"
@@ -142,7 +110,8 @@ user = "default"
 password = "your_password"
 
 # SSL 配置
-ssl_enabled = false
+[database.clickhouse.ssl]
+enabled = false
 client_cert_file = "/etc/ssl/ch/client.crt"
 client_key_file = "/etc/ssl/ch/client.key"
 ca_cert_file = "/etc/ssl/ch/ca.crt"
@@ -150,12 +119,11 @@ verify_peer = true               # 是否验证服务端证书
 verify_hostname = true           # 是否验证主机名
 
 # 连接池配置
-[clickhouse.pool]
+[database.clickhouse.pool]
 max_connections = 16
 min_connections = 2
 idle_timeout_ms = 30000
 connection_timeout_ms = 5000
-ping_on_checkout = true          # 每次获取连接时执行 ping
 
 
 
@@ -169,8 +137,8 @@ ping_on_checkout = true          # 每次获取连接时执行 ping
 # max_size_mb: 单个日志文件的最大大小（MB）。
 # max_files: 保留的旧日志文件数量。
 [logging]
-level = "info"
-output = "console" # 开发时输出到控制台，生产时可改为 "file"
+level = "debug"
+output = "console"
 file_path = "/var/log/myapp/"
 max_size_mb = 5
 max_files = 50

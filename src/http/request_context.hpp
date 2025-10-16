@@ -52,7 +52,7 @@ private:
 
     void parseQueryIfNeeded() const;
 
-    void  urlDecode(std::string_view sv, std::string &buffer)const;
+    static void  urlDecode(std::string_view sv, std::string &buffer);
 
     void compressIfAcceptable();
 

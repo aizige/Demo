@@ -14,16 +14,16 @@
 class WebSocketConnection;
 
 /**
- * @class IWebSocketClientHandler
+ * @class IWebsocketClientHandler
  * @brief WebSocket 客户端事件处理程序的接口。
  *
  * 通过实现此接口，你可以为 WebSocket 连接的不同生命周期事件
  * （如连接成功、收到消息、断开连接）定义自定义的业务逻辑。
  * 这是一个纯虚基类，强制实现所有回调。
  */
-class IWebSocketClientHandler {
+class IWebsocketClientHandler {
 public:
-    virtual ~IWebSocketClientHandler() = default;
+    virtual ~IWebsocketClientHandler() = default;
 
     /**
      * @brief 当 WebSocket 握手成功，连接正式建立时调用。

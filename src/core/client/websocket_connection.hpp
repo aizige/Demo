@@ -6,7 +6,7 @@
 #define WEBSOCKET_CONNECTION_HPP
 #include "http/http_common_types.hpp"
 #include "utils/utils.hpp"
-#include "IWebSocketClientHandler.hpp"
+#include "iwebsocket_client_handler.hpp"
 #include <boost/beast/websocket.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <variant>
@@ -29,7 +29,7 @@ public:
 
     WebSocketConnection(WsVariantStream stream,
                             HttpRequest upgrade_request,
-                            std::shared_ptr<IWebSocketClientHandler> handler,
+                            std::shared_ptr<IWebsocketClientHandler> handler,
                             std::string id);
     ~WebSocketConnection();
 
@@ -55,7 +55,7 @@ private:
 
     WsVariantStream stream_;
     HttpRequest initial_upgrade_request_;
-    std::shared_ptr<IWebSocketClientHandler> handler_;
+    std::shared_ptr<IWebsocketClientHandler> handler_;
     std::string id_;
 
     SendChannel send_channel_;

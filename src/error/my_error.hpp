@@ -8,8 +8,8 @@
 #include <boost/system/error_code.hpp>
 #include <string>
 
-namespace my_error {
-namespace h2 {
+
+namespace my_error::h2 {
 
 // 🔹 定义错误枚举（仅用于内部标识）
 enum class code {
@@ -69,13 +69,11 @@ inline const boost::system::error_code connection_unusable{
     static_cast<int>(code::connection_unusable), category()
 };
 
-} // namespace h2
-} // namespace my_error
+} // namespace my_error::h2
+
 
 // 🔹 让枚举支持自动转换为 error_code（可选，便于扩展）
-namespace boost::system {
-    template <>
-    struct is_error_code_enum<my_error::h2::code> : std::true_type {};
-}
+template <>
+struct boost::system::is_error_code_enum<my_error::h2::code> : std::true_type {};
 
 #endif //UNTITLED1_MY_ERROR_HPP

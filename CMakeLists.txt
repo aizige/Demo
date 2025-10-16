@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.0)
-project(untitled1 LANGUAGES CXX)
+project(Aizix LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,14 +22,13 @@ find_package(ada REQUIRED)
 # -fsanitize=address	    启用 AddressSanitizer，检测内存越界、use-after-free 等
 # -fno-omit-frame-pointer	保留帧指针，便于调试器和 ASan 追踪调用栈
 # -g	                    生成调试信息（DWARF），用于 GDB 或 LLDB 调试
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
 #set(CMAKE_BUILD_TYPE Debug)  # 设置构建类型为 Debug
 
-add_executable(untitled1
+add_executable(Aizix
         main.cpp
         src/core/h2_session.cpp
-        src/core/h2c_session.cpp
-        src/core/client/http1_connection.cpp
+        src/core/client/http_connection.cpp
         src/core/client/connection_manager.cpp
         src/core/client/http_client.cpp
         src/controller/user_controller.cpp
@@ -38,23 +37,20 @@ add_executable(untitled1
         src/utils/decompressor.cpp
         src/utils/compression_manager.cpp
         src/utils/compressor.cpp
-        src/core/client/http_ssl_connection.cpp
+        src/core/client/https_connection.cpp
         src/core/client/h2_connection.cpp
-        src/core/client/h2c_connection.cpp
-        src/core/client/WebSocketConnection.cpp
-        src/core/client/WebSocketClient.cpp
+        src/core/client/websocket_connection.cpp
+        src/core/client/websocket_client.cpp
         src/impl/user_service.cpp
-        src/utils/config/config_loader.cpp
-        src/http/parameter_set.hpp
-        src/utils/param_parser.hpp
+        src/utils/config/ConfigLoader.cpp
 )
 
 add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
 
-target_include_directories(untitled1 PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_include_directories(Aizix PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 
-target_link_libraries(untitled1 PRIVATE
+target_link_libraries(Aizix PRIVATE
         Boost::system
         Boost::thread
         Boost::url

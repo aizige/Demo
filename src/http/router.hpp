@@ -5,7 +5,7 @@
 #ifndef UNTITLED1_ROUTER_HPP
 #define UNTITLED1_ROUTER_HPP
 
-#include "handler.hpp"               // 需要 HandlerFunc
+
 #include "http_common_types.hpp"     // 需要 PathParams
 #include <memory>
 #include <optional>                  // 因为 resolve 返回 optional

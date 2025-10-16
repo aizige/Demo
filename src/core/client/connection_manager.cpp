@@ -3,29 +3,37 @@
 //
 
 #include "connection_manager.hpp"
-#include "http1_connection.hpp" // 需要包含具体的连接实现
+
+#include <ranges>
 #include <spdlog/spdlog.h>
-#include "iconnection.hpp"         // << 提供 IConnection 的完整定义
-#include "http_ssl_connection.hpp"
+
+#include "http_connection.hpp"
+#include "https_connection.hpp"
 #include "h2_connection.hpp"
+#include "iconnection.hpp"
 #include "utils/utils.hpp"
-#include "utils/finally.hpp" // 假设你有一个 RAII guard
-#include <boost/beast/ssl.hpp>
-#include <boost/beast/core/tcp_stream.hpp>
-#include <boost/beast/ssl.hpp>
-#include <boost/asio/experimental/channel.hpp>
+
+
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/experimental/channel.hpp>
+#include <boost/beast/ssl.hpp>
 
+// 命名空间和类型别名
 using namespace std::literals::chrono_literals;
 using results_type = boost::asio::ip::tcp::resolver::results_type;
 
+/**
+ * @brief ConnectionManager 的构造函数。
+ *        负责初始化 SSL 上下文、DNS 解析器，并根据配置启动后台维护任务。
+ */
 ConnectionManager::ConnectionManager(boost::asio::io_context& ioc, bool enable_maintenance)
     : ioc_(ioc),
       strand_(ioc.get_executor()),
       ssl_ctx_(boost::asio::ssl::context::tls_client),
       resolver_(ioc),
       maintenance_timer_(ioc) {
+    // 配置 SSL/TLS 上下文，增强安全性。
     // 明确禁用 TLS 1.0 和 1.1，从而只留下 1.2 和 1.3
     ssl_ctx_.set_options(
         boost::asio::ssl::context::default_workarounds |
@@ -35,94 +43,311 @@ ConnectionManager::ConnectionManager(boost::asio::io_context& ioc, bool enable_m
         boost::asio::ssl::context::no_tlsv1_1
     );
 
-    // [可选，但推荐] 设置一个现代化的加密套件列表。
-    // 这个列表是从 Mozilla Intermediate compatibility 推荐中提取的，兼容性很好。
-    const char* modern_ciphers =
-        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
-        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
-        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
-        "DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
-
+    // 设置推荐的现代加密套件列表，以提高安全性。
+    // 这个列表是从 Mozilla Intermediate compatibility 推荐中提取的，https://wiki.mozilla.org/Security/Server_Side_TLS#:~:text=yet%20widely%20supported-,Intermediate%20compatibility%20(recommended),-For%20services%20that
+    const auto modern_ciphers =
+        "TLS_AES_128_GCM_SHA256:"
+        "TLS_AES_256_GCM_SHA384:"
+        "TLS_CHACHA20_POLY1305_SHA256:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-CHACHA20-POLY1305:"
+        "DHE-RSA-AES128-GCM-SHA256:"
+        "DHE-RSA-AES256-GCM-SHA384:"
+        "DHE-RSA-CHACHA20-POLY1305";
     if (SSL_CTX_set_cipher_list(ssl_ctx_.native_handle(), modern_ciphers) != 1) {
-        // 如果设置失败，可以记录一个错误，但不一定要中断程序
-        SPDLOG_ERROR("Could not set SSL cipher list.");
+        // 如果设置失败，可以记录一个日志，但不中断程序
+        SPDLOG_WARN("Could not set SSL cipher list. Using OpenSSL defaults");
     }
 
-    // 显式设置验证回调 (set_verify_callback) 并不是严格必须的
+    // ---配置证书验证 ---
+    // 加载系统默认的根证书
     ssl_ctx_.set_default_verify_paths();
+
+    // 验证对端证书
+    // - verify_none 为不验证证书 TODO: 配置文件加载
+    // 对于客户端：验证服务器证书是否由受信任的 CA 签发
+    // 对于服务器：如果你还调用了 "set_verify_callback()" 并启用了 "verify_peer" ，可以验证客户端证书（用于双向认证）
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
 
-    const unsigned char supported_protos[] = {
+
+    // 设置 ALPN (Application-Layer Protocol Negotiation) 协议列表。TODO: 配置文件加载
+    // "h2" 优先于 "http/1.1"，让服务器在 TLS 握手期间选择最优协议。
+    /*constexpr unsigned char supported_protos[] = {
         2, 'h', '2',
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1'
+    };*/
+    constexpr unsigned char supported_protos[] = {
+
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
     SSL_CTX_set_alpn_protos(ssl_ctx_.native_handle(), supported_protos, sizeof(supported_protos));
 
+    // 启动后台维护任务
     if (enable_maintenance) {
         start_maintenance();
     }
 }
 
+/**
+ * @brief 析构函数。确保后台任务被停止。
+ */
 ConnectionManager::~ConnectionManager() {
     stop_internal();
 }
 
-void ConnectionManager::stop_internal() {
-    // 使用 post 确保在 strand 上安全地修改 stopped_ 标志
-    post(strand_, [self = shared_from_this()] {
-        if (self->stopped_) return;
-        self->stopped_ = true;
-        self->maintenance_timer_.cancel();
-        // 如果需要在析构时也清理连接，可以在这里添加
+/**
+ * @brief 异步地获取一个到指定目标的健康连接，包含完整的连接池管理和背压逻辑。
+ *
+ * 流程：
+ * 1. 切换到 `strand_` 保证线程安全。
+ * 2. 尝试从 H2 或 H1.1 池中复用一个现有连接。
+ * 3. 如果无法复用，检查是否达到主机连接数上限。如果达到，则进入等待队列（背压）。
+ * 4. 如果可以创建，检查是否已有其他协程正在创建。如果是，则等待其完成（惊群效应处理）。
+ * 5. 如果是第一个创建者，则启动一个后台协程来创建新连接。
+ * 6. 异步等待创建结果，并返回 `PooledConnection`。
+ */
+boost::asio::awaitable<PooledConnection>
+ConnectionManager::get_connection(std::string_view scheme,
+                                  std::string_view host,
+                                  uint16_t port) {
+    // 构造用于标识连接池的唯一 Key。
+    const std::string key = std::string(scheme) + "//" + std::string(host) + ":" + std::to_string(port);
+    SPDLOG_DEBUG("获取连接 [{}]", key);
+
+    // --- 进入 strand 以保证对所有共享状态的访问都是线程安全的 ---
+    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+
+    // --- 阶段 1: 尝试从池中复用现有连接 ---
+
+    // 策略 1: 检查 H2 连接列表，寻找负载最低的可用连接。
+    if (auto it = h2_pool_.find(key); it != h2_pool_.end()) {
+        auto& h2_conns = it->second;
+        std::shared_ptr<IConnection> best_conn = nullptr;
+        size_t min_streams = SIZE_MAX;
+
+        for (const auto& conn : h2_conns) {
+            if (conn->is_usable()) {
+                const size_t current_streams = conn->get_active_streams();
+                if (current_streams < conn->get_max_concurrent_streams() && current_streams < min_streams) {
+                    best_conn = conn;
+                    min_streams = current_streams;
+                }
+            }
+        }
+
+        // 清理失效连接
+        std::erase_if(h2_conns, [](const auto& conn) { return !conn->is_usable(); });
+
+        if (best_conn) {
+            SPDLOG_DEBUG("复用H2连接 [{}]-[{}] (活动流 {} 个)", best_conn->id(), best_conn->get_pool_key(), min_streams);
+            co_return PooledConnection{best_conn, true};
+        }
+        SPDLOG_DEBUG("H2连接池里没有可复用连接 [{}]", key);
+    }
+
+    // 策略 2: 检查 H1.1 连接池，取出一个空闲连接。
+    if (auto it = pool_.find(key); it != pool_.end()) {
+        auto& h1_queue = it->second;
+        // 逐个取出，跳过不可用或非空闲的，顺便丢弃失效连接
+        while (!h1_queue.empty()) {
+            auto conn = std::move(h1_queue.front());
+            h1_queue.pop_front();
+            if (!conn || !conn->is_usable()) {
+                continue; // 丢弃失效
+            }
+            if (conn->get_active_streams() == 0) {
+                SPDLOG_DEBUG("复用H1连接 [{}]-[{}]", conn->id(), conn->get_pool_key());
+                co_return PooledConnection{conn, true};
+            }
+            // 非空闲仍然丢弃（按你的策略）；如需保留可改为 push_back
+        }
+        SPDLOG_DEBUG("http/1.1连接池里没有可复用连接 [{}]", key);
+    }
+
+    // --- 阶段 2: 并发创建控制（惊群效应处理） ---
+    auto it = creation_in_progress_.find(key);
+    if (it == creation_in_progress_.end()) {
+        // 没有创建者，当前协程成为“创建者”
+        SPDLOG_DEBUG("连接池里没有连接 '{}'，发起新的创建任务。", key);
+
+        // 注意：将占位的 executor 绑定到 ioc_，避免 channel 等待阻塞 strand_
+        auto new_creation = std::make_shared<CreationInProgress>(ioc_.get_executor());
+        it = creation_in_progress_.emplace(key, new_creation).first;
+
+        // 启动一个分离的任务来执行创建工作
+        boost::asio::co_spawn(
+            ioc_, // 在 ioc_ 的上下文中执行网络操作
+            [self = shared_from_this(),
+                key,
+                state = new_creation,
+                scheme_s = std::string(scheme),
+                host_s = std::string(host),
+                port]() -> boost::asio::awaitable<void> {
+                std::exception_ptr exception = nullptr;
+                std::shared_ptr<IConnection> new_conn = nullptr;
+
+                try {
+                    new_conn = co_await self->create_new_connection(key, scheme_s, host_s, port);
+                } catch (...) {
+                    exception = std::current_exception();
+                }
+
+                // 回到 strand 来“设置结果、关闭信号、移除占位”三件事在同一序列中完成，避免竞态
+                co_await boost::asio::post(self->strand_, boost::asio::use_awaitable);
+                try {
+                    if (exception) {
+                        state->result = exception;
+                    } else {
+                        // add_connection_to_pool 也可能抛异常，必须捕获并写入 result
+                        try {
+                            self->add_connection_to_pool(key, new_conn);
+                            state->result = new_conn;
+                        } catch (...) {
+                            state->result = std::current_exception();
+                        }
+                    }
+                } catch (...) {
+                    // 极端情况下如果设置 result 自身抛异常，至少确保有异常结果
+                    state->result = std::current_exception();
+                }
+
+                // 广播完成信号（先设置 result 再 close）
+                state->signal->close();
+
+                // 最后移除“创建占位”
+                self->creation_in_progress_.erase(key);
+                SPDLOG_DEBUG("创建新连接 '{}' 的创建占位符已被移除。", key);
+
+                co_return;
+            },
+            boost::asio::detached);
+    }
+
+    // --- 阶段 3: 等待结果（创建者和等待者共用） ---
+    auto state_to_wait_on = it->second;
+    SPDLOG_DEBUG("等待host '{}' 的连接创建完成...", key);
+
+    // 明确离开 strand：使用 ioc_ 的 executor（与占位的 channel 一致）
+    co_await boost::asio::dispatch(ioc_, boost::asio::use_awaitable);
+
+    // 等待 channel 关闭（广播信号）。使用 as_tuple 避免异常。
+    co_await state_to_wait_on->signal->async_receive(
+        boost::asio::as_tuple(boost::asio::use_awaitable));
+
+    // 回到 strand，安全读取结果
+    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
+
+    // 检查最终的创建结果。
+    if (auto* conn_ptr = std::get_if<std::shared_ptr<IConnection>>(&state_to_wait_on->result)) {
+        // 成功（这个连接刚创建，非复用）
+        co_return PooledConnection{*conn_ptr, false};
+    } else if (auto* ex_ptr = std::get_if<std::exception_ptr>(&state_to_wait_on->result)) {
+        // 失败：抛出创建中的异常
+        std::rethrow_exception(*ex_ptr);
+    } else {
+        // 逻辑错误，不应该发生（防御性检查）
+        throw std::logic_error("连接创建已完成，但未设置结果。");
+    }
+}
+
+/**
+ * @brief 将一个使用完毕的连接释放回池中，并可能唤醒一个等待者
+ *
+ * 如果连接仍然可用 (`is_usable()`)，它会被放回池中以供后续请求复用。
+ * 如果连接已损坏或被标记为不可用，它将被安全地丢弃。
+ * 此方法是线程安全的。
+ *
+ * @note 这是一个非阻塞操作，它会将实际工作 post 到 `strand_` 上执行。
+ * @param conn 要释放的连接的共享指针。
+ */
+void ConnectionManager::release_connection(const std::shared_ptr<IConnection>& conn) {
+    // 同样，将释放操作调度到 strand 上
+    if (!conn) { return; }
+
+    // 将操作 post 到 strand 上以保证线程安全。
+    post(strand_, [self = shared_from_this(), conn, this]() {
+        const auto& key = conn->get_pool_key();
+        const bool usable = conn->is_usable();
+
+
+        // H2 连接是多路复用的，不“归还”，只检查是否需要因失效而被干掉。
+        if (conn->supports_multiplexing()) {
+            if (!usable) {
+                SPDLOG_DEBUG("丢弃不可用的H2连接｛｝。", conn->id());
+                // 从 H2 列表中移除
+                if (const auto it = self->h2_pool_.find(conn->get_pool_key()); it != self->h2_pool_.end()) {
+                    std::erase(it->second, conn);
+                    // 如果 vector 变为空，选择删除整个 key
+                    if (it->second.empty()) {
+                        h2_pool_.erase(it);
+                    }
+                }
+            }
+            return; // H2 连接不归还，它一直在“池”里
+        } else {
+            // H1.1 连接：可用的归还池中，不可用的丢弃。
+            SPDLOG_DEBUG("我来归还H1连接 [{}] {}",conn->id() ,conn->get_pool_key() );
+            if (usable) {
+                //  H1 的归还池中...
+                self->pool_[key].push_back(conn); // 放回队尾，实现 LIFO/FIFO 策略
+                SPDLOG_DEBUG("将连接 [{}] {}存入连接池,当前连接 [{}] 的连接池大小: {}", conn->id(), key, pool_[key].back()->get_pool_key(), pool_[key].size());
+                return;
+            }
+            SPDLOG_DEBUG("[{}] {} 这个H1连接已经断开了不用归还直接丢弃 ",conn->id() ,conn->get_pool_key() );
+            // 这里丢弃了不可用的H1连接...
+        }
     });
 }
 
-
+/**
+ * @brief 异步地关闭所有连接池中的连接并停止后台任务。
+ *        这是优雅停机流程的核心部分。
+ */
 boost::asio::awaitable<void> ConnectionManager::stop() {
-    // 1. 进入 strand，以保证对 stopped_ 和连接池的访问是线程安全的。
+    // 1. 切换到 strand，以保证对所有内部状态的访问都是线程安全的。
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
 
-    // 2. 使用 std::atomic::exchange 来实现“只执行一次”的逻辑。
-    //    这可以防止多个协程并发调用 stop() 时，清理逻辑被执行多次。
+    // 2. 检查并设置 stopped_ 标志，确保关闭逻辑只执行一次。
     if (stopped_) co_return;
     stopped_ = true;
 
-    // 3. 取消后台维护计时器。
+    // 3. 立即取消后台维护计时器，防止新的维护任务启动。
     maintenance_timer_.cancel();
 
-    SPDLOG_INFO("ConnectionManager: Shutting down all connections...");
+    SPDLOG_INFO("关闭连接池里的所有连接...");
 
-    // 4. 从所有池中收集需要关闭的连接的共享指针。
+    // 4. 收集所有池中的连接到一个列表中，准备并行关闭。
     std::vector<std::shared_ptr<IConnection>> all_conns_to_close;
 
-    for (auto const& [key, queue] : pool_) {
+    for (const auto& queue : pool_ | std::views::values) {
         all_conns_to_close.insert(all_conns_to_close.end(), queue.begin(), queue.end());
     }
     pool_.clear(); // 清空池
 
-    for (auto const& [key, vec] : h2_pool_) {
+    for (const auto& vec : h2_pool_ | std::views::values) {
         all_conns_to_close.insert(all_conns_to_close.end(), vec.begin(), vec.end());
     }
     h2_pool_.clear(); // 清空池
 
     if (all_conns_to_close.empty()) {
-        SPDLOG_DEBUG("ConnectionManager: No active connections to close.");
+        SPDLOG_DEBUG("连接池里没有要关闭的连接");
         co_return;
     }
 
-    SPDLOG_DEBUG("ConnectionManager: Closing {} connections in parallel...", all_conns_to_close.size());
+    SPDLOG_DEBUG("正在并发关闭 {} 个连接...", all_conns_to_close.size());
 
-    // --- 使用 co_spawn + channel 实现健壮的并行等待 ---
+    // 5.使用 co_spawn + channel 实现健壮的并行等待
 
     auto ex = co_await boost::asio::this_coro::executor;
-
-    // 5. 创建一个 channel 的【共享指针】。channel 本身不可拷贝，但它的 shared_ptr 可以。
+    //  创建一个 channel 的【共享指针】。channel 本身不可拷贝，但它的 shared_ptr 可以。
     //    channel 用于从关闭任务中接收“完成”信号。
-    auto completion_channel = std::make_shared<
-        boost::asio::experimental::channel<void(boost::system::error_code, bool)>
-    >(ex, all_conns_to_close.size());
+    auto completion_channel = std::make_shared<boost::asio::experimental::channel<void(boost::system::error_code)>>(ex, all_conns_to_close.size());
 
-    // 6. 并发地为每个连接启动一个独立的关闭协程。
+    // 6. 为每个连接 co_spawn 一个独立的关闭协程。
     for (auto& conn : all_conns_to_close) {
         boost::asio::co_spawn(
             ioc_, // 在 io_context 的通用执行器上运行，以实现真正的并行 I/O。
@@ -134,13 +359,13 @@ boost::asio::awaitable<void> ConnectionManager::stop() {
                     co_await conn->close();
                 } catch (const std::exception& e) {
                     // 忽略关闭时可能发生的任何异常，以确保关机流程不会中断。
-                    SPDLOG_WARN("Exception during connection [{}] close: {}", conn->id(), e.what());
+                    SPDLOG_WARN("[{}]-[{}] 关闭时出现异常：{}", conn->id(), conn->get_pool_key(), e.what());
                 }
 
                 // c. 任务完成，向 channel 发送一个信号。
                 //    我们通过共享指针调用 async_send，这是非 const 操作，但指针本身是 const 的，所以没问题。
                 boost::system::error_code ignored_ec;
-                co_await channel_ptr->async_send(ignored_ec, true, boost::asio::use_awaitable);
+                co_await channel_ptr->async_send(ignored_ec, boost::asio::use_awaitable);
             },
 
             boost::asio::detached // 分离协程，我们在这里不等待它，而是通过 channel 等待。
@@ -148,432 +373,230 @@ boost::asio::awaitable<void> ConnectionManager::stop() {
     }
 
     // 7. 在主 stop() 协程中，循环等待，直到收到所有任务的完成信号。
-    SPDLOG_DEBUG("ConnectionManager: Waiting for {} close tasks to complete...", all_conns_to_close.size());
+    SPDLOG_DEBUG("等待 {} 个关闭任务完成...", all_conns_to_close.size());
     for (size_t i = 0; i < all_conns_to_close.size(); ++i) {
         // 每次 async_receive 都会挂起，直到一个关闭任务完成并发送信号。
         co_await completion_channel->async_receive(boost::asio::use_awaitable);
     }
 
-    SPDLOG_DEBUG("ConnectionManager: All connections have been successfully closed.");
+    SPDLOG_DEBUG("所有连接已成功关闭");
 }
 
+/**
+ * @brief [私有] 将一个新创建的连接添加到相应的池中。
+ */
+void ConnectionManager::add_connection_to_pool(const std::string& key, const std::shared_ptr<IConnection>& conn) {
+    if (conn->supports_multiplexing()) {
+        h2_pool_[key].push_back(conn);
+        SPDLOG_DEBUG("将 {} 添加到h2_pool中，当前连接数量{}", key, h2_pool_[key].size());
+    } else {
+        //pool_[key].push_back(conn);
+        //SPDLOG_DEBUG("将 {} 添加到h1_pool中，当前连接数量{}", key, pool_[key].size());
+    }
+}
+
+/**
+ * @brief [私有] 创建一个新连接的完整协程。内置了总的连接超时
+ *
+ * 这个协程封装了建立一个出站网络连接所需的所有步骤，包括：
+ * 1. 异步 DNS 解析，将主机名转换为 IP 地址列表。
+ * 2. 根据协议 (`http` 或 `https`) 创建相应的连接类型。
+ * 3. 对于 `https`，它会执行 TCP 连接、TLS 握手和 ALPN 协议协商。
+ * 4. 根据 ALPN 的结果，最终决定是创建 HTTP/2 连接还是回退到 HTTP/1.1。
+ *
+ * @note 此协程通常在 ConnectionManager 的 `strand_` 上下文中被启动，所以内部是安全的
+ *       但其内部的耗时网络 I/O 操作是在通用的 `io_context` 执行器上运行的。
+ *
+ * @param key 用于标识连接池的唯一键。
+ * @param scheme 协议类型 ("http:" 或 "https:")。
+ * @param host 目标主机名。
+ * @param port 目标端口号。
+ * @return 一个协程句柄，其结果是成功创建的 `IConnection` 对象的共享指针。
+ * @throws boost::system::system_error 如果在任何网络I/O阶段发生错误。
+ * @throws std::runtime_error 如果协议不被支持。
+ */
+boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_new_connection(const std::string& key, const std::string_view scheme, std::string_view host, const uint16_t port) {
+    // 这个函数总是被 get_connection 在 strand 上调用，所以内部是安全的
+
+
+    try {
+        // 3. 异步 DNS 解析。
+        boost::system::error_code ec;
+        const results_type endpoints = co_await resolver_.async_resolve(tcp::v4(), host, std::to_string(port), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+        if (ec) throw boost::system::system_error(ec, "DNS resolution failed");
+
+        // 4. 创建连接
+        if (scheme == "https:") {
+            // a. 创建 HTTP/1.1 socket连接。
+            tcp::socket socket(ioc_);
+
+            // b. 用 socket 创建 ssl_stream
+            auto stream = std::make_shared<boost::beast::ssl_stream<tcp::socket>>(std::move(socket), ssl_ctx_);
+
+            // c. 建立 TCP 连接，底层 socket 是 stream->next_layer()
+            ec.clear();
+            co_await async_connect(stream->next_layer(), endpoints, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+            if (ec) throw boost::system::system_error(ec, "TCP connect failed for SSL");
+
+            // d. 设置 SNI (Server Name Indication)。
+            //    这在 TLS 握手中至关重要，它告诉服务器我们想要访问哪个主机。
+            //    缺少 SNI 会导致使用多域名证书的服务器返回错误的证书。
+            if (!SSL_set_tlsext_host_name(stream->native_handle(), std::string(host).c_str())) {
+                throw boost::system::system_error(static_cast<int>(::ERR_get_error()), boost::asio::error::get_ssl_category());
+            }
+
+            // e. 执行 TLS 握手。
+            ec.clear();
+            co_await stream->async_handshake(boost::asio::ssl::stream_base::client, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+            if (ec) throw boost::system::system_error(ec, "TLS handshake failed");
+
+            // f. 检查 ALPN 协商结果并返回对应连接。
+            const unsigned char* proto = nullptr;
+            unsigned int len = 0;
+            SSL_get0_alpn_selected(stream->native_handle(), &proto, &len);
+            if (proto && std::string_view(reinterpret_cast<const char*>(proto), len) == "h2") {
+                // 协商成功，创建 H2 连接。
+                SPDLOG_DEBUG("ALPN为 {} 选择了HTTP/2协议", host);
+                auto conn = Http2Connection::create(stream, key);
+
+                // 等待 H2 握手完成。
+                co_await conn->run();
+
+                co_return conn;
+            }
+            // 协商失败或不支持，回退到 HTTPS/1.1。
+            SPDLOG_DEBUG("ALPN selected HTTP/1.1 for {}.", host);
+            co_return std::make_shared<HttpsConnection>(stream, key);
+        }
+        if (scheme == "http:") {
+            // 创建纯文本 HTTP/1.1 连接。
+            ec.clear();
+            tcp::socket socket(ioc_);
+
+            co_await async_connect(socket, endpoints.begin(), endpoints.end(), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+            if (ec) { throw boost::system::system_error(ec, "TCP connect failed"); }
+
+            co_return std::make_shared<HttpConnection>(std::move(socket), key);
+        }
+        throw std::runtime_error("不支持的 scheme: '" + std::string(scheme) + "'. 仅支持 'http:' and 'https:' 协议");
+    } catch (const boost::system::system_error& e) {
+        SPDLOG_ERROR("Failed to create new connection to {}: {}", key, e.what());
+        throw;
+    }
+}
+
+/**
+ * @brief [私有] 启动后台维护任务。
+ */
 void ConnectionManager::start_maintenance() {
     // 启动后台协程，它将独立运行
     boost::asio::co_spawn(ioc_, run_maintenance(), boost::asio::detached);
 }
 
-
+/**
+ * @brief [私有] 后台维护任务的协程实现。
+ */
 boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
+    // 定义维护任务的执行频率
+    constexpr auto maintenance_interval = 20s;
+
+    // 连接最大空闲时间(秒),应该略小于你所连接的目标服务器的 keep-alive 超时时间
+    constexpr auto IDLE_TIMEOUT_FOR_CLOSE = 5500000; //
+
+    // PING保活阈值(秒), idle_timeout_for_close 的 1/3 到 1/2, 它必须显著小于 idle_timeout_for_close，这样才有机会在连接被你自己的客户端关闭之前去保活它
+    constexpr auto IDLE_TIMEOUT_FOR_PING = 10;
+
+
     while (!stopped_) {
-        maintenance_timer_.expires_after(std::chrono::seconds((35s))); // 每 15 秒维护一次
-        // 使用 redirect_error 来忽略 timer 被 cancel 时的异常
+        // 1. 设置下一次维护的定时器
+        maintenance_timer_.expires_after(maintenance_interval);
         boost::system::error_code ec;
+
+        // 2. 挂起协程，等待定时器到期或被取消
         co_await maintenance_timer_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
 
+        // 如果服务器已停止或定时器被取消，则退出维护循环
+        if (stopped_ || ec) { co_return; }
 
-        // 将维护工作 post 到 strand 上
+        // 3. 将后续的维护工作调度到 strand_ 上，以保证对连接池的线程安全访问
         co_await boost::asio::post(strand_, boost::asio::use_awaitable);
 
 
-        // 遍历所有连接池
-        for (auto& [key, queue] : pool_) {
-            H1ConnectionDeque healthy_queue;
-            while (!queue.empty()) {
-                auto conn = std::move(queue.front());
-                queue.pop_front();
+        if (!pool_.empty() || !h2_pool_.empty()) {
+            // SPDLOG_DEBUG("开始维护连接池...");
+            const auto now = time_utils::steady_clock_seconds_since_epoch();
+            // 4. 维护所有的 HTTP/1.1 连接池
+            //    使用 C++20 的 ranges::views::values 可以优雅地只遍历 map 中的值（即 deque）。
+            for (auto& queue : pool_ | std::views::values) {
+                HttpConnectionDeque healthy_queue;
+                while (!queue.empty()) {
+                    auto conn = std::move(queue.front());
+                    queue.pop_front();
 
-                // 规则1：如果连接已经不可用，直接丢弃
-                if (!conn->is_usable()) {
-                    SPDLOG_DEBUG("Pruning dead connection {}.", conn->id());
-                    continue;
-                }
-
-                // 我们通过 active_streams() 来判断连接是否空闲
-                if (conn->get_active_streams() > 0) {
-                    // 连接正在处理一个或多个请求，绝对是活的，直接保留
-                    healthy_queue.push_back(std::move(conn));
-                    continue;
-                }
-
-                // 规则2：如果连接空闲时间太长（例如超过60秒），主动关闭它
-                const auto now = time_utils::steady_clock_seconds_since_epoch();
-                if (now - conn->get_last_used_timestamp_seconds() > 60) {
-                    SPDLOG_INFO("关闭闲置时间过长的连接 {}", conn->id());
-                    boost::asio::co_spawn(
-                        strand_,
-                        // 这个 lambda 会捕获 conn 的拷贝，延长其生命周期
-                        [conn_to_close = std::move(conn)]() -> boost::asio::awaitable<void> {
-                            co_return co_await conn_to_close->close();
-                        },
-                        boost::asio::detached
-                    );
-                    continue;
-                }
-
-                // 规则3：如果连接空闲超过一个阈值（例如10秒），发送 PING 保活
-                if (now - conn->get_last_used_timestamp_seconds() > 30) {
-                    SPDLOG_INFO("ping {} ", conn->id());
-                    co_await conn->ping();
-                }
-                healthy_queue.push_back(std::move(conn));
-            }
-            // 用维护过的健康连接队列替换旧的
-            queue = std::move(healthy_queue);
-        }
-    }
-}
-
-
-/* 旧版本能用get_connection
- *
- *boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::string_view scheme, std::string_view host, uint16_t port) {
-    std::string key = std::string(scheme) + "//" + std::string(host) + ":" + std::to_string(port);
-
-    // 使用一个 for 循环来实现“轮询等待”的逻辑，避免无限等待。
-    // 100次 * 100ms = 最多等待 10 秒。
-    for (int attempts = 0; attempts < 100; ++attempts) {
-        // 1. 进入 strand 以安全地访问共享状态
-        co_await boost::asio::post(strand_, boost::asio::use_awaitable);
-
-        // --- 策略 1: 检查 H2 连接池 ---
-        if (auto it = h2_pool_.find(key); it != h2_pool_.end()) {
-            auto& h2_conns = it->second;
-            std::shared_ptr<IConnection> best_conn = nullptr;
-            size_t min_streams = SIZE_MAX;
-
-            for (const auto& conn : h2_conns) {
-                if (conn->is_usable()) {
-                    size_t current_streams = conn->get_active_streams();
-                    if (current_streams < conn->get_max_concurrent_streams() && current_streams < min_streams) {
-                        best_conn = conn;
-                        min_streams = current_streams;
+                    // 规则1：如果连接已经不可用，直接丢弃
+                    if (!conn->is_usable()) {
+                        SPDLOG_DEBUG("抛弃死连接 {}.", conn->id());
+                        continue;
                     }
-                }
-            }
 
-            // 清理所有不可用的连接 (使用 C++20 的 std::erase_if)
-            std::erase_if(h2_conns, [](const auto& conn) {
-                return !conn->is_usable();
-            });
-
-            if (best_conn) {
-                SPDLOG_DEBUG("Multiplexing on H2 connection {} ({} active streams)", best_conn->id(), min_streams);
-                co_return PooledConnection{best_conn, true};
-            }
-        }
-
-        // --- 策略 2: 检查 H1.1 连接池 ---
-        if (auto it = pool_.find(key); it != pool_.end()) {
-            auto& h1_queue = it->second;
-            while (!h1_queue.empty()) {
-                auto conn = std::move(h1_queue.front());
-                h1_queue.pop_front();
-                if (conn->is_usable() && conn->get_active_streams() == 0) {
-                    SPDLOG_DEBUG("Reusing H1 connection [{}] from pool.", conn->id());
-                    co_return PooledConnection{conn, true};
-                }
-            }
-        }
-
-        // --- 策略 3: 处理连接创建 ---
-
-        // 检查是否已有其他协程正在为这个 key 创建连接
-        if (creation_in_progress_.contains(key)) {
-            // 别人正在创建，离开 strand，异步等待一小段时间，然后重新尝试（下次循环）
-            SPDLOG_DEBUG("Connection for '{}' is being created by another task, waiting for 10ms...", key);
-
-            // 允许其他协程在 ioc 线程上运行
-            co_await boost::asio::post(ioc_, boost::asio::use_awaitable);
-
-            boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
-            timer.expires_after(std::chrono::milliseconds(10ms));
-            co_await timer.async_wait(boost::asio::use_awaitable);
-
-            // 等待结束后，继续下一次 for 循环，重新检查所有池
-            continue;
-        }
-
-        // --- 如果代码执行到这里，说明我是第一个创建者 ---
-
-        // a. 在 strand 上“占坑”，标记我正在创建
-        SPDLOG_DEBUG("'{}' 没有可用的连接，创建新的连接", key);
-        creation_in_progress_.insert(key);
-
-        // b. 使用 RAII guard 确保“坑”一定会被释放，即使发生异常
-        auto guard = Finally([self = shared_from_this(), key] {
-            // 清理操作也必须 post 到 strand
-            post(self->strand_, [self, key] {
-                self->creation_in_progress_.erase(key);
-                SPDLOG_DEBUG("Creation placeholder for '{}' removed.", key);
-            });
-        });
-        boost::asio::experimental::channel<void(boost::system::error_code)> notify_channel{ioc_, 1};
-        std::unordered_map<std::string, std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code)>>> wait_channels_;
-
-
-        try {
-            // c. 离开 strand 去执行耗时的网络 I/O
-            co_await boost::asio::post(ioc_, boost::asio::use_awaitable);
-            auto new_conn = co_await create_new_connection(key, std::string(scheme), std::string(host), port);
-
-            // d. 成功了，回到 strand 将新连接放入池中
-            co_await boost::asio::post(strand_, boost::asio::use_awaitable);
-
-            if (new_conn->supports_multiplexing()) {
-                h2_pool_[key].push_back(new_conn);
-            } else {
-                //pool_[key].push_back(new_conn);
-            }
-
-            co_return PooledConnection{new_conn, false};
-        } catch (const boost::system::system_error& e) {
-            // e. 失败了，`Finally` guard 会自动清理标记。
-            //    我们只需重新抛出异常，让调用者 (HttpClient) 知道失败了。
-            SPDLOG_ERROR("Failed to create new connection for '{}'.", key);
-            std::rethrow_exception(std::current_exception());
-            //throw boost::system::system_error(e);
-        }
-    }
-
-    // 如果循环了 100 次还没拿到连接，说明可能有问题，抛出超时错误
-    throw std::runtime_error("Failed to get connection for " + key + " after multiple retries (timeout).");
-}*/
-
-
-boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(std::string_view scheme, std::string_view host, uint16_t port) {
-    std::string key = std::string(scheme) + "//" + std::string(host) + ":" + std::to_string(port);
-    auto ex = co_await boost::asio::this_coro::executor;
-
-    // --- 进入 strand 以安全地访问共享状态 ---
-    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
-
-    // 1. 检查连接池
-    // --- 策略 1: 检查 H2 连接池 ---
-    if (auto it = h2_pool_.find(key); it != h2_pool_.end()) {
-        auto& h2_conns = it->second;
-        std::shared_ptr<IConnection> best_conn = nullptr;
-        size_t min_streams = SIZE_MAX;
-
-        for (const auto& conn : h2_conns) {
-            if (conn->is_usable()) {
-                size_t current_streams = conn->get_active_streams();
-                if (current_streams < conn->get_max_concurrent_streams() && current_streams < min_streams) {
-                    best_conn = conn;
-                    min_streams = current_streams;
-                }
-            }
-        }
-
-        // 清理所有不可用的连接 (使用 C++20 的 std::erase_if)
-        std::erase_if(h2_conns, [](const auto& conn) {
-            return !conn->is_usable();
-        });
-
-        if (best_conn) {
-            SPDLOG_DEBUG("Multiplexing on H2 connection {} ({} active streams)", best_conn->id(), min_streams);
-            co_return PooledConnection{best_conn, true};
-        }
-    }
-
-    // --- 策略 2: 检查 H1.1 连接池 ---
-    if (auto it = pool_.find(key); it != pool_.end()) {
-        auto& h1_queue = it->second;
-        while (!h1_queue.empty()) {
-            auto conn = std::move(h1_queue.front());
-            h1_queue.pop_front();
-            if (conn->is_usable() && conn->get_active_streams() == 0) {
-                SPDLOG_DEBUG("Reusing H1 connection [{}] from pool.", conn->id());
-                co_return PooledConnection{conn, true};
-            }
-        }
-    }
-
-
-    // 2. 检查是否已经有协程在创建
-    auto it = creation_in_progress_.find(key);
-    if (it == creation_in_progress_.end()) {
-        // --- A. 如果没有，当前协程成为“创建者” ---
-        SPDLOG_DEBUG("连接池里没有连接 '{}'，发起新的创建任务。", key);
-
-        // a. 创建共享状态并放入 map
-        auto new_creation = std::make_shared<CreationInProgress>(ex);
-        it = creation_in_progress_.emplace(key, new_creation).first;
-
-        // b. 启动一个分离的任务来执行创建工作
-        boost::asio::co_spawn(
-            ioc_, // 在 ioc_ 的上下文中执行网络操作
-            [self = shared_from_this(), key, state = new_creation, scheme_s = std::string(scheme), host_s = std::string(host), port]() -> boost::asio::awaitable<void> {
-                // 定义一个局部变量来捕获异常
-                std::exception_ptr exception = nullptr;
-                std::shared_ptr<IConnection> new_conn = nullptr;
-
-                auto guard = Finally([self, key] {
-                    // 任务结束后，回到 strand 清理 map
-                    boost::asio::post(self->strand_, [self, key] {
-                        self->creation_in_progress_.erase(key);
-                        SPDLOG_DEBUG("创建新连接 '{}' 的创建占位符已被移除。", key);
-                    });
-                });
-
-                try {
-                    new_conn = co_await self->create_new_connection(key, scheme_s, host_s, port);
-                } catch (...) {
-                    // 3. 在 catch 块中，只捕获异常指针，不做任何协程操作
-                    exception = std::current_exception();
-                }
-
-                // 回到 strand 来处理（无论是成功还是失败
-                co_await boost::asio::post(self->strand_, boost::asio::use_awaitable);
-                if (exception) {
-                    // 如果捕获到了异常，设置异常结果
-                    state->result = exception;
-                } else {
-                    self->add_connection_to_pool(key, new_conn);
-                    state->result = new_conn;
-                }
-                // c. 工作完成，关闭 channel 作为广播信号，唤醒所有等待者
-                state->signal->close();
-            },
-            boost::asio::detached
-        );
-    }
-
-    // --- B. 无论是创建者还是等待者，都在这里等待结果 ---
-    auto state_to_wait_on = it->second;
-    SPDLOG_DEBUG("等待连接 '{}' 创建完成...", key);
-
-    // 离开 strand 去等待 channel 信号
-    co_await boost::asio::post(ioc_, boost::asio::use_awaitable);
-
-    // 等待 channel 被关闭。我们忽略接收到的错误码(通常是 eof)。
-    // as_tuple 确保即使 channel 关闭，协程也能正常恢复而不是抛异常。
-    co_await state_to_wait_on->signal->async_receive(boost::asio::as_tuple(boost::asio::use_awaitable));
-
-    // 信号已收到，回到 strand 上安全地读取结果
-    co_await boost::asio::post(strand_, boost::asio::use_awaitable);
-
-    // 检查结果
-    if (auto* conn_ptr = std::get_if<std::shared_ptr<IConnection>>(&state_to_wait_on->result)) {
-        // 成功
-        co_return PooledConnection{*conn_ptr, false};
-    } else if (auto* ex_ptr = std::get_if<std::exception_ptr>(&state_to_wait_on->result)) {
-        // 失败
-        std::rethrow_exception(*ex_ptr);
-    } else {
-        // 逻辑错误，不应该发生
-        throw std::logic_error("Connection creation finished but no result was set.");
-    }
-}
-
-void ConnectionManager::add_connection_to_pool(const std::string& key, std::shared_ptr<IConnection> conn) {
-    if (conn->supports_multiplexing()) {
-        h2_pool_[key].push_back(conn);
-    } else {
-        // pool_[key].push_back(conn);
-    }
-}
-
-void ConnectionManager::release_connection(const std::shared_ptr<IConnection>& conn) {
-    // 同样，将释放操作调度到 strand 上
-    if (!conn) { return; }
-    post(strand_, [self = shared_from_this(), conn, this]() {
-        // 对于 H2 连接，release 实际上是空操作，因为它的状态由内部计数器管理
-        // 我们只需要处理丢弃逻辑
-        if (conn->supports_multiplexing()) {
-            if (!conn->is_usable()) {
-                SPDLOG_DEBUG("Discarding H2 connection {}.", conn->id());
-                // 从 H2 列表中移除
-                auto it = h2_pool_.find(conn->get_pool_key());
-                if (it != h2_pool_.end()) {
-                    auto& h2_conns = it->second;
-                    std::erase(h2_conns, conn);
-
-                    // 如果 vector 变为空，选择删除整个 key
-                    if (h2_conns.empty()) {
-                        h2_pool_.erase(it);
+                    // 我们通过 active_streams() 来判断连接是否空闲
+                    if (conn->get_active_streams() > 0) {
+                        // 连接正在处理一个或多个请求，绝对是活的，直接保留
+                        healthy_queue.push_back(std::move(conn));
+                        continue;
                     }
+
+                    // 规则2：如果连接空闲时间太长（例如超过60秒），主动关闭它
+                    if (now - conn->get_last_used_timestamp_seconds() > IDLE_TIMEOUT_FOR_CLOSE) {
+                        SPDLOG_INFO("关闭闲置时间过长的连接 {}", conn->id());
+                        boost::asio::co_spawn(
+                            strand_,
+                            // 这个 lambda 会捕获 conn 的拷贝，延长其生命周期
+                            [conn_to_close = std::move(conn)]() -> boost::asio::awaitable<void> {
+                                co_return co_await conn_to_close->close();
+                            },
+                            boost::asio::detached
+                        );
+                        continue;
+                    }
+
+                    // 规则3：如果连接空闲超过一个阈值（例如10秒），发送 PING 保活
+                    if (now - conn->get_ping_used_timestamp_seconds() > IDLE_TIMEOUT_FOR_PING) {
+                        SPDLOG_INFO("666666666 {}", conn->id());
+                        if (!co_await conn->ping()) {
+                            SPDLOG_INFO("////////// {}", conn->id());
+                            continue;
+                        }
+                        healthy_queue.push_back(std::move(conn));
+                    }
+
                 }
+                // 用维护过的健康连接队列替换旧的
+                queue = std::move(healthy_queue);
             }
-            return; // H2 连接不归还，它一直在“池”里
-        }
 
-        // 对于 H1.1 连接
-        if (!conn->is_usable()) {
-            SPDLOG_DEBUG("丢弃连接 {}", conn->id());
-            // conn 的 shared_ptr 在 lambda 结束时被销毁，自动触发关闭
-            return;
-        }
-        const auto& key = conn->get_pool_key();
 
-        pool_[key].push_back(conn); // 放回队尾，实现 LIFO/FIFO 策略
-        SPDLOG_DEBUG("将连接 {} 存入连接池 [{}],当前连接池状况Key = {}， {}", conn->id(), key, pool_[key].size(), pool_[key].back()->get_pool_key());
+            // 5. 维护所有的 HTTP/2 连接池
+            // for (auto& vec : h2_pool_ | std::views::values) {
+            //     co_await maintain_pool_container(vec);
+            // }
+
+            // SPDLOG_DEBUG("连接池维护完成");
+        }
+    }
+}
+
+
+/**
+ * @brief [私有] 触发后台任务的停止。
+ *        这是一个非阻塞操作，通过 post 到 strand 来安全地修改状态。
+ */
+void ConnectionManager::stop_internal() {
+    // 使用 post 确保在 strand 上安全地修改 stopped_ 标志
+    post(strand_, [self = shared_from_this()] {
+        if (self->stopped_) return;
+        self->stopped_ = true;
+        self->maintenance_timer_.cancel();
+        // 如果需要在析构时也清理连接，可以在这里添加
     });
-}
-
-
-boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_new_connection(const std::string& key, std::string_view scheme, std::string_view host, uint16_t port) {
-    // 这个函数总是被 get_connection 在 strand 上调用，所以内部是安全的
-
-    try {
-        // 1. DNS 解析
-        //auto endpoints = co_await resolver_.async_resolve(tcp::v4(), host, std::to_string(port), boost::asio::use_awaitable);
-        boost::system::error_code ec;
-        results_type endpoints = co_await resolver_.async_resolve(tcp::v4(), host, std::to_string(port), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-        if (ec) throw boost::system::system_error(ec, "DNS resolution failed");
-
-        if (scheme == "http:") {
-            // 2) TCP 连接（迭代器重载 + redirect_error）
-            ec.clear();
-            tcp::socket socket(ioc_);
-
-            co_await async_connect(socket, endpoints.begin(), endpoints.end(), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-            if (ec) { throw boost::system::system_error(ec, "async_connect failed"); }
-
-            co_return std::make_shared<Http1Connection>(std::move(socket), key);
-        } else if (scheme == "https:") {
-            // 2. 创建 stream
-            auto stream = std::make_shared<boost::beast::ssl_stream<tcp::socket>>(ioc_, ssl_ctx_);
-
-            // 3. 建立 TCP 连接
-            ec.clear();
-            co_await async_connect(get_lowest_layer(*stream), endpoints.begin(), endpoints.end(), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-            if (ec) throw boost::system::system_error(ec, "tcp async_connect failed");
-
-            std::string host_str(host);
-            if (!SSL_set_tlsext_host_name(stream->native_handle(), host_str.c_str())) {
-                throw boost::system::system_error(static_cast<int>(::ERR_get_error()), boost::asio::error::get_ssl_category());
-            }
-
-            // TLS 握手（redirect_error）
-            ec.clear();
-            co_await stream->async_handshake(boost::asio::ssl::stream_base::client, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-            if (ec) throw boost::system::system_error(ec, "tls async_handshake failed");
-
-            const unsigned char* proto = nullptr;
-            unsigned int len = 0;
-            SSL_get0_alpn_selected(stream->native_handle(), &proto, &len);
-
-            if (proto && std::string_view((const char*)proto, len) == "h2") {
-                SPDLOG_INFO("ALPN为 {} 选择了H2协议创建连接.", host);
-                // a. 创建 Actor 对象
-                auto conn = Http2Connection::create(stream, key);
-
-                // b. 调用同步的 run() 方法来启动后台 actor_loop
-               co_await  conn->run();
-
-                // c. **立即返回**。我们不再等待 H2 握手完成。
-                //    H2 握手现在是 actor_loop 内部的第一阶段。
-                //    第一个 `execute` 请求会被 channel 自动“缓冲”，
-                //    直到 actor_loop 完成握手并开始处理请求消息。
-                co_return conn;
-            } else {
-                SPDLOG_INFO("ALPN selected http/1.1 for {}. Creating HttpSslConnection.", host);
-                co_return std::make_shared<HttpSslConnection>(stream, key);
-            }
-        }
-        throw std::runtime_error("Unsupported scheme: " + std::string(scheme));
-    } catch (const boost::system::system_error& e) {
-        SPDLOG_ERROR("Failed to create new connection to {}: {}", key, e.what());
-        throw;
-    }
 }
