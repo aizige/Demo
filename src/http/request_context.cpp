@@ -5,6 +5,10 @@
 #include <boost/url.hpp>
 #include <cctype>
 #include <cstdlib>
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/co_spawn.hpp>
+
+#include "version.hpp"
 #include "utils/compression_manager.hpp"
 #include "utils/param_parser.hpp"
 
@@ -16,8 +20,7 @@ RequestContext::RequestContext(HttpRequest req, PathParams params)
     // 在构造时，可以为 response 对象设置一些通用的默认值
     // response_.version(request_.version());
     response_.keep_alive(request_.keep_alive());
-    response_.set(http::field::server, "AiziboyFramework/1.0");
-
+    response_.set(http::field::server, aizix::framework::name + "/" + aizix::framework::version);
 }
 
 // --- 请求数据访问实现 ---
@@ -26,7 +29,7 @@ const HttpRequest& RequestContext::request() const {
     return request_;
 }
 
-std::optional<std::string_view> RequestContext::pathParam( std::string_view key) const {
+std::optional<std::string_view> RequestContext::pathParam(std::string_view key) const {
     if (auto it = path_params_.find(key); it != path_params_.end()) {
         return it->second;
     }
@@ -34,9 +37,7 @@ std::optional<std::string_view> RequestContext::pathParam( std::string_view key)
 }
 
 
-
-
-std::optional<std::string_view> RequestContext::queryParam( std::string_view key) const {
+std::optional<std::string_view> RequestContext::queryParam(std::string_view key) const {
     parseQueryIfNeeded(); // 确保已解析
     auto it = queryParams_.find(key);
     if (it != queryParams_.end() && !it->second.empty()) {
@@ -46,9 +47,7 @@ std::optional<std::string_view> RequestContext::queryParam( std::string_view key
 }
 
 
-
-
-std::vector<std::string_view> RequestContext::queryParamList( std::string_view key) const {
+std::vector<std::string_view> RequestContext::queryParamList(std::string_view key) const {
     parseQueryIfNeeded(); // 确保已解析
 
     auto it = queryParams_.find(key);
@@ -75,8 +74,6 @@ void RequestContext::string(http::status status, std::string_view body, std::str
     response_.result(status);
     response_.set(http::field::content_type, content_type);
     response_.body() = body;
-    compressIfAcceptable();
-
 }
 
 /*void RequestContext::json(http::status status, const nlohmann::json& j) {
@@ -89,12 +86,9 @@ void RequestContext::string(http::status status, std::string_view body, std::str
 
 void RequestContext::json(http::status status, std::string_view json) {
     response_.result(status);
-    response_.set(http::field::content_type, "application/json");
+    response_.set(http::field::content_type, "application/json;charset=UTF-8");
     response_.body() = json;
-    compressIfAcceptable();
-
 }
-
 
 
 // --- 私有辅助函数实现 ---
@@ -135,12 +129,12 @@ void RequestContext::parseQueryIfNeeded() const {
         // 我们需要将它们的内容拷贝到我们自己的稳定 buffer 中
 
         // 1. 将解码后的 Key 存入 buffer
-        size_t key_start_pos = decodeBuffer_.length();
+        const size_t key_start_pos = decodeBuffer_.length();
         decodeBuffer_.append(param.key); // 直接追加已解码的 key
         std::string_view key_sv(decodeBuffer_.data() + key_start_pos, param.key.length());
 
         // 2. 将解码后的 Value 存入 buffer
-        size_t value_start_pos = decodeBuffer_.length();
+        const size_t value_start_pos = decodeBuffer_.length();
         if (param.has_value) {
             decodeBuffer_.append(param.value); // 直接追加已解码的 value
         }
@@ -155,7 +149,7 @@ void RequestContext::parseQueryIfNeeded() const {
 void RequestContext::urlDecode(std::string_view sv, std::string& buffer) {
     for (size_t i = 0; i < sv.size(); ++i) {
         if (sv[i] == '%' && i + 2 < sv.size()) {
-            char hex[3] = {sv[i + 1], sv[i + 2], '\0'};
+            const char hex[3] = {sv[i + 1], sv[i + 2], '\0'};
             if (isxdigit(hex[0]) && isxdigit(hex[1])) {
                 buffer += static_cast<char>(std::strtol(hex, nullptr, 16));
                 i += 2;
@@ -171,13 +165,10 @@ void RequestContext::urlDecode(std::string_view sv, std::string& buffer) {
 }
 
 bool contains_ci(std::string_view haystack, std::string_view needle) {
-    return std::search(
-        haystack.begin(), haystack.end(),
-        needle.begin(), needle.end(),
-        [](char a, char b) {
-            return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
-        }
-    ) != haystack.end();
+    return std::ranges::search(haystack, needle, [](const char a, const char b) {
+                                   return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+                               }
+    ).begin() != haystack.end();
 }
 
 bool is_compressible_content_type(std::string_view content_type) {
@@ -220,49 +211,74 @@ bool is_compressible_content_type(std::string_view content_type) {
  * 视频/音频: MP4, MP3, AAC。同理，这些也是压缩格式。
  * 二进制文件: .zip, .gz, .pdf, .docx 等。这些文件格式内部已经包含了压缩。
  */
-void RequestContext::compressIfAcceptable() {
+boost::asio::awaitable<void> RequestContext::compressIfAcceptable(const boost::asio::any_io_executor& work_executor) {
     // 1. 检查客户端是否支持压缩
-    std::string client_accepts_gzip;
+    std::string client_accepts_encoding;
     if (request_.count(http::field::accept_encoding)) {
         std::string_view value = request_.at(http::field::accept_encoding);
         if (value.find("gzip") != std::string_view::npos) {
-            client_accepts_gzip = "gzip";
+            client_accepts_encoding = "gzip";
         } else if (value.find("deflate") != std::string_view::npos) {
-            client_accepts_gzip = "deflate";
+            client_accepts_encoding = "deflate";
         } else {
-            return; // 客户端不支持，直接返回
+            co_return; // 客户端不支持，直接返回
         }
+    } else {
+        co_return;
     }
-
-    // [新] 检查 Content-Type
+    //  检查 Content-Type
     if (response_.count(http::field::content_type)) {
-        std::string_view content_type = response_.at(http::field::content_type);
+        const std::string_view content_type = response_.at(http::field::content_type);
         // 只压缩已知的文本类型
         if (!is_compressible_content_type(content_type)) {
-            return; // 不是可压缩的类型，直接返回
+            co_return; // 不是可压缩的类型，直接返回
         }
     }
 
-    // 2. 检查响应体是否值得压缩
-    constexpr size_t min_compress_size = 1024 * 5; // 最小压缩大小 5KB
-    constexpr size_t min_async_compression_size  = 1024 * 10; // 最小异步压缩大小 10KB
-    if (response_.body().size() < min_compress_size) {
-        return; // body 太小，不值得压缩
-    }
 
-    // todo:判断body的大小再决定是再io线程上压缩还是在worker_pool_线程上压缩
-    // 3. 检查响应是否已经被压缩过了（防止重复压缩）
+    // 2. 检查响应是否已经被压缩过了（防止重复压缩）
     if (response_.count(http::field::content_encoding)) {
-        return;
+        co_return;
     }
 
+    // 3. 检查响应体大小是否值得压缩
+    constexpr size_t min_compress_size = 1024 * 5; // 最小压缩大小 5KB
+    constexpr size_t min_async_compression_size = 1024 * 10; // 最小异步压缩大小 10KB
+    if (response_.body().size() < min_compress_size) {
+        co_return; // body 太小，不值得压缩
+    }
 
     // 4. 执行压缩
     // 注意：这里我们直接修改内部的 response_ 对象
-    std::string compressed_body = client_accepts_gzip == "gzip" ? utils::compression::compression_manager::gzip_compress(response_.body()) : utils::compression::compression_manager::deflate_compress(response_.body());
-
-    // 5. 更新响应对象
-    response_.body() = std::move(compressed_body);
-    response_.set(http::field::content_encoding, client_accepts_gzip);
-
+    try {
+        std::string compressed_body;
+        if (response_.body().size() >= min_async_compression_size) {
+            auto [ex_ptr, result] = co_await boost::asio::co_spawn(work_executor,
+                                                                   [body = response_.body(), encoding = client_accepts_encoding]() -> boost::asio::awaitable<std::string> {
+                                                                       co_return (encoding == "gzip") ? utils::compression::compression_manager::gzip_compress(body) : utils::compression::compression_manager::deflate_compress(body);
+                                                                   },
+                                                                   boost::asio::as_tuple(boost::asio::use_awaitable)
+            );
+            if (ex_ptr) {
+                try {
+                    std::rethrow_exception(ex_ptr); // 重新抛出异常
+                } catch (const std::exception& e) {
+                    SPDLOG_WARN("异步压缩失败: {}", e.what());
+                    co_return; // 失败则直接返回，不修改 response
+                }
+            }
+            compressed_body = result;
+        } else {
+            compressed_body = client_accepts_encoding == "gzip" ? utils::compression::compression_manager::gzip_compress(response_.body()) : utils::compression::compression_manager::deflate_compress(response_.body());
+        }
+        // 5. 更新响应对象
+        // 只有在压缩成功且有效时才更新
+        if (compressed_body.size() < response_.body().size()) {
+            response_.body() = std::move(compressed_body);
+            response_.set(http::field::content_encoding, client_accepts_encoding);
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("压缩失败: {}", e.what());
+        co_return;
+    }
 }

@@ -46,8 +46,8 @@ private:
     std::shared_ptr<ConnectionManager> manager_;
 
 
-    /// @brief 允许的最大重定向次数，防止无限循环。TODO：应来自配置文件
+    /// @brief 允许的最大重定向次数，防止无限循环。
     /// @note  值小于等于0则关闭自动处理 HTTP 重定向 (3xx 状态码)
-    int max_redirects_ = 3;
+    uint8_t max_redirects_ = 3;
 };
 #endif // HTTP_CLIENT_HPP

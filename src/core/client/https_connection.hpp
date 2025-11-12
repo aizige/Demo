@@ -65,8 +65,8 @@ public:
 
 
     size_t get_active_streams() const override{ return active_streams_.load(); }
-    int64_t get_last_used_timestamp_seconds() const override{return last_used_timestamp_seconds_;}
-    int64_t get_ping_used_timestamp_seconds() const override{return last_ping_timestamp_seconds_;}
+    int64_t get_last_used_timestamp_ms() const override{return last_used_timestamp_ms_;}
+    int64_t get_ping_used_timestamp_ms() const override{return last_ping_timestamp_ms_;}
 
 private:
     /**
@@ -96,13 +96,13 @@ private:
     /// 用于 `is_usable()` 和 `ping()` 判断连接是否繁忙。
     std::atomic<size_t> active_streams_{0};
 
-    /// @brief 连接最后一次被使用的时间戳（秒）。
+    /// @brief 连接最后一次被使用的时间戳（ms）。
     /// 由 ConnectionManager 的后台维护任务使用，以判断连接是否空闲。
-    int64_t last_used_timestamp_seconds_;
+    int64_t last_used_timestamp_ms_;
 
-    /// @brief 上次PING的时间戳秒数（秒）。
+    /// @brief 上次PING的时间戳（ms）。
     /// 由 ConnectionManager 的后台维护任务使用，以判断连接多久没ping过了
-    int64_t last_ping_timestamp_seconds_;
+    int64_t last_ping_timestamp_ms_;
 };
 
 

@@ -23,7 +23,7 @@
 #include <ranges>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/asio/experimental/channel.hpp>
-#include "error/my_error.hpp"
+#include "error/aizix_error.hpp"
 #include "utils/finally.hpp"
 #include "utils/utils.hpp"
 #include <functional>
@@ -38,19 +38,20 @@ using namespace std::literals::chrono_literals;
 using namespace boost::asio::experimental::awaitable_operators;
 
 
-
-Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key)
-: stream_(std::move(stream)),
-     pool_key_(std::move(pool_key)),
-     id_(generate_connection_id()),
-     // 初始化 Actor 的邮箱，设置一个缓冲区大小
-     request_channel_(stream_->get_executor(), 256),
-     // 初始化握手信号 channel，缓冲区为1即可
-     handshake_signal_(stream_->get_executor(), 1),
-     last_used_timestamp_seconds_(time_utils::steady_clock_seconds_since_epoch()),
-     // 所有异步对象都使用同一个 executor，确保它们在同一个上下文中执行
-     idle_timer_(stream_->get_executor()) {
-
+Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key, size_t max_concurrent_streams, size_t max_idle_ms)
+    : stream_(std::move(stream)),
+      pool_key_(std::move(pool_key)),
+      id_(generate_connection_id()),
+      // 初始化 Actor 的邮箱，设置一个缓冲区大小
+      request_channel_(stream_->get_executor(), 256),
+      // 初始化握手信号 channel，缓冲区为1即可
+      handshake_signal_(stream_->get_executor(), 1),
+      max_concurrent_streams_(max_concurrent_streams),
+      last_used_timestamp_ms_(time_utils::steady_clock_ms_since_epoch()),
+      last_ping_timestamp_ms_(time_utils::steady_clock_ms_since_epoch()),
+      // 所有异步对象都使用同一个 executor，确保它们在同一个上下文中执行
+      idle_timer_(stream_->get_executor()),
+      max_idle_ms_(max_idle_ms) {
     // 初始化定时器为永不超时，避免在没有活动时立即触发
     idle_timer_.expires_at(std::chrono::steady_clock::time_point::max());
     SPDLOG_DEBUG("Create a connection [{}]-[{}] ", id_, pool_key);
@@ -69,10 +70,10 @@ Http2Connection::~Http2Connection() {
 /// 生成一个易于识别的唯一ID，包含进程前缀和递增计数器
 std::string Http2Connection::generate_connection_id() {
     static std::atomic<uint64_t> counter = 0;
+    if (counter >= 1000000) counter = 0;
     // 最终ID: "conn-h2-12345-1"...
     return "conn-h2-" + ProcessInfo::get_prefix() + std::to_string(++counter);
 }
-
 
 
 /**
@@ -113,7 +114,6 @@ asio::awaitable<void> Http2Connection::run() {
 }
 
 
-
 /**
  * @brief 外部接口：发送一个 HTTP 请求
  */
@@ -148,12 +148,12 @@ asio::awaitable<HttpResponse> Http2Connection::execute(const HttpRequest& reques
             throw boost::system::system_error(ec, "Response failed or was cancelled");
         }
 
-        SPDLOG_DEBUG("H2 [{}] execute: 收到响应，状态码 {}, 当前活动的steam = {}", id_, response.result_int(), active_streams_.load());
+        SPDLOG_DEBUG("[{}] execute: 收到响应，状态码 {}, 当前活动的steam = {}", id_, response.result_int(), active_streams_.load());
         co_return response;
     } catch (const boost::system::system_error& e) {
         // 特殊处理超时错误，提供更明确的错误信息
         if (e.code() == asio::error::operation_aborted) {
-            throw boost::system::system_error(my_error::h2::receive_timeout, "接收响应超时（连接空闲）");
+            throw boost::system::system_error(aizix_error::h2::receive_timeout, "接收响应超时（连接空闲）");
         }
         throw;
     }
@@ -228,14 +228,14 @@ asio::awaitable<bool> Http2Connection::ping() {
 }
 
 void Http2Connection::update_last_used_time() {
-    last_used_timestamp_seconds_ = time_utils::steady_clock_seconds_since_epoch();
+    last_used_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
 }
 
 /**
  * @brief 更新连接的最后一次ping动作的时间戳为当前时间。
  */
 void Http2Connection::update_ping_used_time() {
-    last_ping_timestamp_seconds_ = time_utils::steady_clock_seconds_since_epoch();
+    last_ping_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
 }
 
 size_t Http2Connection::get_active_streams() const {
@@ -339,7 +339,8 @@ asio::awaitable<void> Http2Connection::actor_loop() {
             handshake_timer.async_wait(asio::as_tuple(asio::use_awaitable))
         );
 
-        if (result.index() == 1) { // 定时器先完成
+        if (result.index() == 1) {
+            // 定时器先完成
             throw std::runtime_error("HTTP/2 握手超时");
         }
 
@@ -378,8 +379,7 @@ asio::awaitable<void> Http2Connection::actor_loop() {
     handshake_signal_.close();
 
     // --- 阶段二: 主事件循环 (融合模型) ---
-    constexpr auto IDLE_TIMEOUT = 15s;
-    idle_timer_.expires_after(IDLE_TIMEOUT); // 启动空闲超时
+    idle_timer_.expires_after(std::chrono::milliseconds(max_idle_ms_)); // 启动空闲超时
 
     while (!is_closing_ && session_) {
         // 这是 Actor 模型的核心：使用 `operator||` 并发地等待三个事件源中的任何一个：
@@ -396,8 +396,9 @@ asio::awaitable<void> Http2Connection::actor_loop() {
 
         SPDLOG_TRACE("Actor 循环 [{}]-[{}]: result.index() = {}", id_, pool_key_, result.index());
 
-        if (result.index() == 0) { // 网络可读
-            idle_timer_.expires_after(IDLE_TIMEOUT); // 收到数据，重置空闲定时器
+        if (result.index() == 0) {
+            // 网络可读
+            idle_timer_.expires_after(std::chrono::milliseconds(max_idle_ms_)); // 收到数据，重置空闲定时器
 
             auto [ec, n] = std::get<0>(result);
 
@@ -415,12 +416,13 @@ asio::awaitable<void> Http2Connection::actor_loop() {
                 is_closing_ = true;
                 break;
             }
-        }
-        else if (result.index() == 1) { // 收到新请求
-            idle_timer_.expires_after(IDLE_TIMEOUT); // 处理新请求也是活动，重置定时器
+        } else if (result.index() == 1) {
+            // 收到新请求
+            idle_timer_.expires_after(std::chrono::milliseconds(max_idle_ms_)); // 处理新请求也是活动，重置定时器
 
             auto [ec, msg] = std::get<1>(result);
-            if (ec) { // channel 关闭或出错
+            if (ec) {
+                // channel 关闭或出错
                 SPDLOG_DEBUG("[{}]-[{}]  请求通道关闭或错误: {}", id_, pool_key_, ec.message());
                 is_closing_ = true;
                 break;
@@ -428,7 +430,8 @@ asio::awaitable<void> Http2Connection::actor_loop() {
 
             SPDLOG_DEBUG("[{}]-[{}] 请求通道收到新请求: {}", id_, pool_key_, msg.request.target());
 
-            if (is_closing_ || remote_goaway_received_) { // 如果正在关闭，则拒绝请求
+            if (is_closing_ || remote_goaway_received_) {
+                // 如果正在关闭，则拒绝请求
                 SPDLOG_DEBUG("[{}]-[{}]  已收到 GOAWAY 或正在关闭，拒绝新请求.", id_, pool_key_);
                 msg.response_channel->try_send(asio::error::operation_aborted, HttpResponse{});
                 continue;
@@ -450,8 +453,7 @@ asio::awaitable<void> Http2Connection::actor_loop() {
             }
 
             // 向 nghttp2 提交请求，nghttp2 会在内部创建新流
-            int32_t stream_id = nghttp2_submit_request(session_, nullptr, nva.data(), nva.size(), provider.source.ptr ? &provider : nullptr, stream_ctx.get());
-            if (stream_id < 0) {
+            if (int32_t stream_id = nghttp2_submit_request(session_, nullptr, nva.data(), nva.size(), provider.source.ptr ? &provider : nullptr, stream_ctx.get()); stream_id < 0) {
                 SPDLOG_ERROR("[{}]-[{}] 提交请求失败: stream_id = {}", id_, pool_key_, stream_id);
                 stream_ctx->response_channel->try_send(boost::system::error_code(NGHTTP2_ERR_INVALID_ARGUMENT, boost::system::generic_category()), HttpResponse{});
             } else {
@@ -460,8 +462,9 @@ asio::awaitable<void> Http2Connection::actor_loop() {
                 ++active_streams_;
                 SPDLOG_DEBUG("[{}]-[{}] 当前活跃streams数量 = {}", id_, pool_key_, active_streams_.load());
             }
-        } else { // result.index() == 2, 空闲超时
-            SPDLOG_WARN("H2 Connection [{}]: Idle timeout ({}s). Closing connection.", id_, IDLE_TIMEOUT.count());
+        } else {
+            // result.index() == 2, 空闲超时
+            SPDLOG_WARN("H2 Connection [{}]: Idle timeout ({}ms). Closing connection.", id_, max_idle_ms_);
             is_closing_ = true;
             break; // 退出循环，触发关闭流程
         }
@@ -469,8 +472,8 @@ asio::awaitable<void> Http2Connection::actor_loop() {
         // 在每次循环的末尾，统一处理所有待发送的数据（新请求、响应ACK等）
         co_await do_write();
     }
-     SPDLOG_TRACE("[{}]-[{}] actor_loop 结束: active_streams = {}, is_closing = {}, remote_goaway_received = {}",
-                     id_, pool_key_, active_streams_.load(), is_closing_.load(), remote_goaway_received_.load());
+    SPDLOG_TRACE("[{}]-[{}] actor_loop 结束: active_streams = {}, is_closing = {}, remote_goaway_received = {}",
+                 id_, pool_key_, active_streams_.load(), is_closing_.load(), remote_goaway_received_.load());
 }
 
 
@@ -567,8 +570,11 @@ int Http2Connection::on_header_callback(nghttp2_session* session, const nghttp2_
     if (key == ":status") {
         try {
             stream_ctx->response_in_progress.result(std::stoi(std::string(reinterpret_cast<const char*>(value), value_len)));
-        } catch (...) { /* 忽略转换失败 */ }
-    } else if (!key.empty() && key[0] != ':') { // 忽略其他伪头部，只添加普通头部
+        } catch (...) {
+            /* 忽略转换失败 */
+        }
+    } else if (!key.empty() && key[0] != ':') {
+        // 忽略其他伪头部，只添加普通头部
         stream_ctx->response_in_progress.set(key, std::string_view(reinterpret_cast<const char*>(value), value_len));
     }
     return 0;

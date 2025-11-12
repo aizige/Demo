@@ -25,8 +25,28 @@ HttpsConnection::HttpsConnection(StreamPtr stream, std::string pool_key)
     : stream_(std::move(stream)), // 直接移动传入的 stream
       id_(generate_connection_id()),
       pool_key_(std::move(pool_key)),
-      last_used_timestamp_seconds_(time_utils::steady_clock_seconds_since_epoch()), last_ping_timestamp_seconds_(time_utils::steady_clock_seconds_since_epoch()) {
+      last_used_timestamp_ms_(time_utils::steady_clock_seconds_since_epoch()), last_ping_timestamp_ms_(time_utils::steady_clock_seconds_since_epoch()) {
     SPDLOG_DEBUG("HttpsConnection [{}] for pool [{}] created.", id_, pool_key_);
+    auto& socket = stream_->next_layer(); // 获取底层 socket
+    boost::system::error_code ec;
+
+    // 启用 SO_KEEPALIVE
+    socket.set_option(boost::asio::socket_base::keep_alive(true), ec);
+    if (ec) {
+        std::cerr << "SO_KEEPALIVE 设置失败: " << ec.message() << "\n";
+        return;
+    }
+
+    // Linux-specific 参数设置
+    int native = socket.native_handle();
+    // 设置为 60 秒空闲后开始探测，每 10 秒探测一次，最多失败 3 次
+    int idle = 60, interval = 10, count = 3;
+
+    setsockopt(native, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(native, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    setsockopt(native, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+
+
 }
 
 
@@ -36,8 +56,6 @@ HttpsConnection::HttpsConnection(StreamPtr stream, std::string pool_key)
  * 通过发送一个轻量级的 HTTP HEAD 请求，并等待一个合法的响应头，
  * 来端到端-地验证 TCP -> TLS -> HTTP 整个链路的健康状况。
  *
- * @note 此实现不使用独立的超时定时器，而是依赖于底层的 TCP/IP 协议栈
- *       的超时机制来处理网络无响应的情况。
  * @return boost::asio::awaitable<bool> 如果 PING 成功则 co_return true，否则 co_return false。
  */
 boost::asio::awaitable<bool> HttpsConnection::ping() {
@@ -69,14 +87,10 @@ boost::asio::awaitable<bool> HttpsConnection::ping() {
         req.set(http::field::accept, "*/*");
         req.set(http::field::connection, "keep-alive");
         req.set(http::field::accept_language, "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,zh-HK;q=0.6");
-        SPDLOG_DEBUG("host [{}]...",url->get_host());
-        SPDLOG_DEBUG("host name [{}]...",url->get_hostname());
 
-        SPDLOG_DEBUG("[{}]-[{}] PING ...", id(), pool_key_);
 
         // 2. 异步发送请求
         co_await http::async_write(*stream_, req, boost::asio::use_awaitable);
-        SPDLOG_DEBUG("请求发送成功 ...");
 
         // 3.  使用 parser
         boost::beast::flat_buffer ping_buffer;
@@ -86,7 +100,7 @@ boost::asio::awaitable<bool> HttpsConnection::ping() {
         // 4. 异步读取响应头。这个函数在解析完头部后就会立即返回。
         co_await http::async_read_header(*stream_, ping_buffer, header_parser, boost::asio::use_awaitable);
 
-        SPDLOG_DEBUG("接收响应 ...");
+
 
         // 5. 验证响应。从 parser 中获取解析出的头部信息
         auto const& header = header_parser.get();
@@ -178,6 +192,10 @@ boost::asio::awaitable<HttpResponse> HttpsConnection::execute(const HttpRequest&
  */
 bool HttpsConnection::is_usable() const {
     // 一个可用的连接必须同时满足：SSL流有效，底层TCP套接字打开，且协议层允许保持连接。
+    if (stream_) {SPDLOG_DEBUG("stream_ = true");} else { SPDLOG_DEBUG("stream_ = true"); }
+    SPDLOG_DEBUG("stream_->.is_open() = {}",stream_->next_layer().is_open());
+    SPDLOG_DEBUG("keep_alive = {}",keep_alive_);
+
     return stream_ && stream_->next_layer().is_open() && keep_alive_;
 }
 
@@ -215,14 +233,14 @@ boost::asio::awaitable<void> HttpsConnection::close() {
  * @brief 更新连接的最后一次活动时间戳为当前时间。
  */
 void HttpsConnection::update_last_used_time() {
-    last_used_timestamp_seconds_ = time_utils::steady_clock_seconds_since_epoch();
+    last_used_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
 }
 
 /**
  * @brief 更新连接的最后一次ping动作的时间戳为当前时间。
  */
 void HttpsConnection::update_ping_used_time() {
-    last_ping_timestamp_seconds_ = time_utils::steady_clock_seconds_since_epoch();
+    last_ping_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
 }
 
 /**
@@ -252,6 +270,7 @@ const std::string& HttpsConnection::get_pool_key() const { return pool_key_; }
  */
 std::string HttpsConnection::generate_connection_id() {
     static std::atomic<uint64_t> counter = 0;
+    if (counter >= 1000000) counter = 0;
     // 最终ID: "conn-h1s-12345-1"
     return "conn-h1s-" + ProcessInfo::get_prefix() + std::to_string(++counter);
 }

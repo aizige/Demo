@@ -48,13 +48,15 @@ public:
     //void json(http::status status, const nlohmann::json& j);
     void json(http::status status, std::string_view body);
 
+    // --- 压缩响应body ---
+    boost::asio::awaitable<void> compressIfAcceptable(const boost::asio::any_io_executor& work_executor);
+
 private:
 
     void parseQueryIfNeeded() const;
 
     static void  urlDecode(std::string_view sv, std::string &buffer);
 
-    void compressIfAcceptable();
 
     // --- 成员变量 ---
 

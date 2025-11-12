@@ -8,7 +8,7 @@
 
 #include "h2_connection.hpp"
 #include "iconnection.hpp"
-#include "error/my_error.hpp"
+#include "error/aizix_error.hpp"
 #include "utils/compression_manager.hpp"
 #include "utils/finally.hpp"
 
@@ -18,24 +18,22 @@
  * @param manager 一个 ConnectionManager 的共享指针，HttpClient 将依赖它来获取和管理连接。
  */
 HttpClient::HttpClient(std::shared_ptr<ConnectionManager> manager)
-    : manager_(std::move(manager))
-// manager_(std::make_shared<ConnectionManager>(ioc_))
-
-{
-}
+    : manager_(std::move(manager)),
+      max_redirects_(manager_->max_redirects)
+{}
 
 // 实现接口中的 get 方法
-boost::asio::awaitable<HttpResponse> HttpClient::get(std::string_view url, const Headers& headers) {
+boost::asio::awaitable<HttpResponse> HttpClient::get(const std::string_view url, const Headers& headers) {
     auto response = co_await execute(http::verb::get, url, "", headers);
     co_return response;
 }
 
 // 实现接口中的 post 方法
 // 注意：它不处理 content-type，这被认为是 header 的一部分
-boost::asio::awaitable<HttpResponse> HttpClient::post(std::string_view url, const std::string& body, const Headers& headers) {
+boost::asio::awaitable<HttpResponse> HttpClient::post(const std::string_view url, const std::string& body, const Headers& headers) {
     // 调用者应该在 headers 中设置 Content-Type
     // 如果没有，beast 可能会有一个默认值，或者服务器可能会拒绝
-    auto response = co_await execute(http::verb::post, url, std::move(body), headers);
+    auto response = co_await execute(http::verb::post, url, body, headers);
     co_return response;
 }
 
@@ -47,8 +45,8 @@ std::string HttpClient::resolve_url(const std::string& base_url, const std::stri
     }
 
     // Location 是一个相对 URL
-    // (一个完整的实现需要正确处理 ../ 等情况，这里简化)
-    auto parsed_base = parse_url(base_url);
+    // todo：一个完整的实现需要正确处理 ../ 等情况？？
+    const auto parsed_base = parse_url(base_url);
     if (location.starts_with('/')) {
         // 根相对路径
         return parsed_base.scheme + "//" + parsed_base.host + ":" + std::to_string(parsed_base.port) + location;
@@ -414,7 +412,7 @@ bool is_retryable_network_error(const boost::system::error_code& ec) {
         ec == boost::asio::error::connection_reset || //对一个已关闭的端口发送数据
         ec == boost::asio::error::connection_aborted || // 连接已关闭或已收到 GOAWAY的连接
         ec == boost::asio::error::broken_pipe || // 当尝试写入一个对方已关闭接收的连接时
-        ec == my_error::h2::receive_timeout; // 等待H2响应超时，网络不好的时候好像会出现这种问题
+        ec == aizix_error::h2::receive_timeout; // 等待H2响应超时，网络不好的时候好像会出现这种问题
 }
 
 
@@ -426,21 +424,20 @@ bool is_retryable_network_error(const boost::system::error_code& ec) {
  * @return a pair containing the HttpResponse and the IConnection used.
  */
 boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_internal(const HttpRequest& request, const ParsedUrl& target) const {
-    // 初始化重试计数器（最多尝试两次）
+    // 初始化重试计数器（最多尝试3次）
     int attempt = 1;
 
     // 使用 while 循环代替 for，显式递增 attempt，避免编译器警告
     while (true) {
-        if (attempt > 2) {
+        if (attempt > 3) {
             throw std::runtime_error("HttpClient: All retry attempts failed after stale connection.");
         }
 
-        PooledConnection pooled_conn;
         std::shared_ptr<IConnection> conn;
 
         try {
             // 🔹 第一步：从连接池获取连接（可能是复用连接）
-            pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
+            const PooledConnection pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
             conn = pooled_conn.connection;
 
             // 🔹 如果连接获取失败，抛出异常
@@ -453,6 +450,7 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
                 // 这个 H1.1 连接正在被别人使用！
                 SPDLOG_WARN("[{}] 正在被他人使用，重新获取", conn->id());
                 manager_->release_connection(conn);
+                // todo: 这里感觉不合理
                 // 立即重试，获取另一个连接
                 //++attempt;
                 continue; // 跳到下一次循环
@@ -477,15 +475,8 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
             }
 
 
-            // 🔹 判断是否满足重试条件：
-            //   - 错误码属于可重试的网络错误
-            bool should_retry = (
-                attempt < 2 && //   - 还有重试次数
-                pooled_conn.is_reused); // 必须是复用连接才重试（新连接失败通常是配置问题）
-              // is_retryable_network_error(e.code()) // 对于复用的连接不再检查错误码
-
             // ❌ 不满足重试条件，记录日志并向上抛出异常
-            if (!should_retry) {
+            if (const bool should_retry = (attempt < 3 ); !should_retry) {
                 SPDLOG_ERROR("Request failed and is not retryable (attempt {}): {}", attempt, e.what());
                 throw;
                 // 注意：如果 conn 在这里被获取了，但因为异常没有被返回，它的 shared_ptr

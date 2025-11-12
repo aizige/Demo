@@ -1,16 +1,18 @@
 [requires]
-openssl/3.5.1
-spdlog/1.15.3
-boost/1.88.0
+openssl/3.6.0
+spdlog/1.16.0
+boost/1.89.0
 zlib/1.3.1
-ada/3.2.4
+ada/3.3.0
 nlohmann_json/3.12.0
 libnghttp2/1.66.0
-stduuid/1.2.3
+libnuma/2.0.19
 [options]
-boost*:without_url=False
 
 
 [generators]
 CMakeDeps
 CMakeToolchain
+
+[layout]
+cmake_layout

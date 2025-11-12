@@ -1,50 +1,48 @@
+
+# 激活的配置文件。程序会根据这个值加载 'config-prod.toml' 文件。
+# 可选值: "dev", "prod", "test"
+# active_profile = "prod"
+
 # ------------------------------------------------
 # 应用程序核心配置
 # ------------------------------------------------
 
-
 [app]
-name = "MyWebFrameworkApp"
-version = "1.0.0"
-profiles = "dev"
+name = "MyWebFrameworkApp"  # server名称
+
 
 [server]
 port = 8080
-threads = 8
-
-timeout_ms = 5000
+ip_v4 = "0.0.0.0"
+http2_enabled = true                                         # 是否开启HTTP2
+io_thread_ratio = 0.4
+io_threads = 2
+worker_threads = 8
+keep_alive_ms = 180000
 max_request_size_kb = 1024
 
 
 [server.ssl]
-enabled = false                                               # 是否启用HTTPS
-http2_enabled = false                                         # 是否开启HTTP2
+enabled = true                                               # 是否启用HTTPS
+cert = "../dev-cert/server.crt"              # certificate_file: SSL证书文件的路径。
+cert_private_key = "../dev-cert/server.key"            # certificate_private_key_file: SSL私钥文件的路径。
 tls_versions  = ["TLSv1.3", "TLSv1.2"]                        # 服务端Tls版本。tls_version数组最大size为2。Tls版本范围示例：["TLSv1.3","TLSv1.1"]这将支持TLSv1.1、TLSv1.2、TLSv1.3。["TLSv1.3"]：将只支持TLSv1.3
-certificate_file = "/path/to/your/fullchain.pem"              # certificate_file: SSL证书文件的路径。
-certificate_key_file = "/path/to/your/privkey.pem"            # certificate_private_key_file: SSL私钥文件的路径。
-required_hosts_list = [ "dev.myubuntu.com", "192.168.1.176" ] # 填写证书所对应的域名及IP列表，就能帮你检查证书文件，并验证其 SAN (Subject Alternative Name) 列表
+
+
 
 
 
 [client]
-http2_enabled = true  # 启用HTTP2客户端(启用后对于Https连接，优先使用H2协议发起请求)
-ssl_verify = true     # false 表示跳过证书验证，仅用于测试环境
+http2_enabled = false  # 启用HTTP2客户端(启用后对于Https连接，优先使用H2协议发起请求)
+ssl_verify = false     # false 表示跳过证书验证，仅用于测试环境
 max_redirects_ = 3    # 最大重定向次数.默认3，(≤ 0则关闭重定向)
-
-connect_timeout_ms = 1500        # 连接建立超时	TCP + TLS 握手阶段的最大等待时间（如 1500ms）
-idle_close_threshold_ms = 300000 # 空闲连接关闭时间 控制连接在无活动时多久关闭（如5分钟 300000ms ）
-ping_interval_ms = 20000         # PING 保活间隔	定期发送 PING 帧检测连接是否挂起（如 20000ms）
+connect_timeout_ms = 60000        # 连接建立超时	TCP + TLS 握手阶段的最大等待时间（如 1500ms）
+idle_timeout_for_close_ms = 300000 # 空闲连接关闭时间 控制连接在无活动时多久关闭（如5分钟 300000ms ）
+idle_timeout_for_ping_ms = 20000         # PING 保活间隔	定期发送 PING 帧检测连接是否挂起（如 20000ms）
 host_connection_pool_size = 100  # 单个个Host的最大连接池大小
-MAX_CONNECTIONS_PER_HOST = 100   # 每个Host的最大并发连接数
+max_connections_per_host = 100   # 每个Host的最大并发连接数
 
-http2_request_send_timeout_ms = 300    # 请求发送阶段的超时（防止actor未唤醒）
-http2_response_recv_timeout_ms = 3000  # 请求响应阶段的超时（防止连接挂起）
-http2_max_streams_per_connection = 100 # 最大并发流数	控制每个连接允许的最大并发请求数（如 100），这个一般是设置服务器 SETTINGS 帧中获取的值
-
-
-
-
-
+http2_max_concurrent_streams = 100 # 最大并发流数	控制每个连接允许的最大并发请求数（如 100），这个一般是设置服务器 SETTINGS 帧中获取的值
 
 
 
@@ -56,21 +54,22 @@ port = 5432
 user = "app_user"
 password = "db_password"
 database = "app_db"
+connection_timeout_ms = 5000     # 获取连接超时时间
 
 # SSL 配置
 [database.postgresql.ssl]
-ssl_enabled = false
-sslmode = "require"              # 可选: disable, require, verify-ca, verify-full
-sslcert = "/etc/ssl/pg/client.crt"
-sslkey = "/etc/ssl/pg/client.key"
-sslrootcert = "/etc/ssl/pg/ca.crt"
+ssl_enabled = false                           # 是否使用TLS/SSL加密连接。	false
+cert = "/etc/ssl/pg/client.crt"               # 客户端证书路径（如果服务器要求双向认证）。	"/path/to/client.crt"
+cert_private_key = "/etc/ssl/pg/client.key"   # 客户端私钥路径。	"/path/to/client.key"
+sslmode = "disable"              # 可选: disable, require, verify-ca, verify-full
+
 
 # 连接池配置
 [database.postgresql.pool]
 max_connections = 32             # 最大连接数
 min_connections = 4              # 最小连接数
 idle_timeout_ms = 30000          # 空闲连接超时
-connection_timeout_ms = 5000     # 获取连接超时时间
+
 
 # ------------------------------------------------
 # redis配置
@@ -81,49 +80,48 @@ host = "192.168.1.1"    # Redis服务器的主机名或IP地址。
 port = 6379 # Redis服务器端口。
 database = 0 # 要使用的数据库编号（0-15）
 password = "password" # Redis连接密码
-timeout_ms = 100 # 连接超时时间（毫秒）。
-keep_alive_ms = 5000 # TCP Keep-Alive 间隔（毫秒），保持连接活跃。
+connection_timeout_ms = 100 # 连接超时时间（毫秒）。
+
 
 # 连接池设置 (Pooling)
 [database.redis.pool]
-pool_size = 10    # 连接池中维护的最小（和最大）连接数。	10
-max_wait_ms = 3000        # 如果连接池已满，获取连接时等待的最大时间（毫秒）。	2000
-idle_timeout_ms = 300000        # 连接空闲多久后会被连接池自动关闭（释放资源）。	300000
-health_check_interval_ms = 6000        # 连接池自动检查连接健康状态的间隔（毫秒）。	60000
+max_connections = 32             # 最大连接数
+min_connections = 4              # 最小连接数
+idle_timeout_ms = 30000          # 空闲连接超时
+
 
 # 安全连接 (TLS/SSL)
 [database.redis.ssl]
-ssl_enabled = false    # 是否使用TLS/SSL加密连接。	false
-ca_file = ""        # 客户端用于验证服务器证书的CA证书路径。	"/path/to/ca.crt"
-client_cert_file = ""        # 客户端证书路径（如果服务器要求双向认证）。	"/path/to/client.crt"
-client_key_file = ""        # 客户端私钥路径。	"/path/to/client.key"
+ssl_enabled = false                           # 是否使用TLS/SSL加密连接。	false
+cert = "/etc/ssl/pg/client.crt"               # 客户端证书路径（如果服务器要求双向认证）。	"/path/to/client.crt"
+cert_private_key = "/etc/ssl/pg/client.key"   # 客户端私钥路径。	"/path/to/client.key"
 
 
 # ------------------------------------------------
 # Clickhouse配置
 # ------------------------------------------------
 [database.clickhouse]
+name = "name"
 host = "127.0.0.1"
 port = 9440                      # TLS端口
 database = "default"
-user = "default"
+user = "app_user"
 password = "your_password"
+connection_timeout_ms = 5000
 
 # SSL 配置
 [database.clickhouse.ssl]
-enabled = false
-client_cert_file = "/etc/ssl/ch/client.crt"
-client_key_file = "/etc/ssl/ch/client.key"
-ca_cert_file = "/etc/ssl/ch/ca.crt"
-verify_peer = true               # 是否验证服务端证书
-verify_hostname = true           # 是否验证主机名
+ssl_enabled = false                           # 是否使用TLS/SSL加密连接。	false
+cert = "/etc/ssl/pg/client.crt"               # 客户端证书路径（如果服务器要求双向认证）。	"/path/to/client.crt"
+cert_private_key = "/etc/ssl/pg/client.key"   # 客户端私钥路径。	"/path/to/client.key"
+
 
 # 连接池配置
 [database.clickhouse.pool]
 max_connections = 16
 min_connections = 2
 idle_timeout_ms = 30000
-connection_timeout_ms = 5000
+
 
 
 
@@ -131,14 +129,14 @@ connection_timeout_ms = 5000
 # 日志配置
 # ------------------------------------------------
 # level: 日志级别，如 "debug", "info", "warn", "error"。
-# output: 日志输出位置，如 "console", "file", "all"
+# output_type: 日志类型，如 "console", "file", "all"
 # file_path: 如果输出到文件，指定文件路径。
 # rotation: 日志轮转配置，防止日志文件无限增大。
 # max_size_mb: 单个日志文件的最大大小（MB）。
 # max_files: 保留的旧日志文件数量。
 [logging]
 level = "debug"
-output = "console"
-file_path = "/var/log/myapp/"
+output_type = "console"
+file_path = "./logs/aizix.log"
 max_size_mb = 5
 max_files = 50

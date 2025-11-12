@@ -54,7 +54,7 @@ void Router::add_route(http::verb method, std::string_view path, HandlerFunc han
             }
             current->param_name = part.substr(1);
             current = current->param_child.get();
-            SPDLOG_DEBUG("注册路由：{}",current->param_name);
+
         } else { // 静态路由
             auto it = current->children.find(std::string(part));
             if (it == current->children.end()) {

@@ -24,6 +24,8 @@
 #include <boost/beast/http/basic_parser.hpp>
 #include <spdlog/spdlog.h>
 
+#include "utils/config/AizixConfig.hpp"
+
 // 向前声明，以减少头文件依赖
 class IConnection;
 
@@ -86,10 +88,9 @@ public:
     /**
      * @brief 构造函数。
      * @param ioc 对主 `io_context` 的引用。
-     * @param enable_maintenance 如果为 true，则会自动启动一个后台协程，
-     *        负责定期清理陈旧连接和对空闲连接进行 PING 保活。
+     * @param config 配置文件
      */
-    explicit ConnectionManager(boost::asio::io_context& ioc, bool enable_maintenance = true);
+    explicit ConnectionManager(boost::asio::io_context& ioc, const AizixConfig& config);
 
     /**
      * @brief 析构函数。会触发后台任务的停止。
@@ -141,6 +142,8 @@ public:
 */
     boost::asio::awaitable<std::shared_ptr<IConnection>> create_new_connection(const std::string& key, std::string_view scheme, std::string_view host, uint16_t port);
 
+    uint8_t max_redirects;
+
 private:
     /**
      * @brief [私有] 将一个新创建的连接添加到相应的池中。
@@ -152,16 +155,22 @@ private:
     void add_connection_to_pool(const std::string& key, const std::shared_ptr<IConnection>& conn);
 
 
-
     /**
     * @brief [私有] 启动后台维护任务。
     */
     void start_maintenance();
 
-    /**
-     * @brief [私有] 后台维护任务的协程实现。
-     *        在一个循环中定期检查和维护所有连接池。
-     */
+/**
+ * @brief 连接客户端连接池维护协程。
+ * 在一个循环中定期检查和维护所有连接池。
+ * 它负责遍历容器中的所有连接，并执行以下维护操作：
+ * 1. 移除已失效 (`is_usable() == false`) 的连接。
+ * 2. 保留正在活动的连接。
+ * 3. 关闭并移除空闲时间过长的连接。
+ * 4. 对需要保活的空闲连接执行 PING 操作。
+ *
+ * @note 此协程必须在 `strand_` 的上下文中被调用，以保证线程安全。
+ */
     boost::asio::awaitable<void> run_maintenance();
 
     /**
@@ -169,23 +178,6 @@ private:
      */
     void stop_internal();
 
-
-    /**
-     * @brief [私有] 通用的连接容器维护协程。
-     *
-     * 这是一个模板函数，可以处理任何类型的连接容器（如 std::deque, std::vector）。
-     * 它负责遍历容器中的所有连接，并执行以下维护操作：
-     * 1. 移除已失效 (`is_usable() == false`) 的连接。
-     * 2. 保留正在活动的连接。
-     * 3. 关闭并移除空闲时间过长的连接。
-     * 4. 对需要保活的空闲连接执行 PING 操作。
-     *
-     * @note 此协程必须在 `strand_` 的上下文中被调用，以保证线程安全。
-     * @tparam Container T 容器类型，其 value_type 必须是 std::shared_ptr<IConnection>。
-     * @param container 要进行维护的连接容器的引用。
-     */
-    template <typename Container>
-    boost::asio::awaitable<void> maintain_pool_container(Container& container);
 
     // --- 核心数据成员 ---
 
@@ -220,18 +212,25 @@ private:
     std::unordered_map<std::string, std::shared_ptr<CreationInProgress>> creation_in_progress_;
 
 
+    /// 连接建立超时TCP + TLS 握手阶段的最大等待时间，
+    size_t connect_timeout_ms_;
 
-
+    /// HTTP2初始最大并发流数	控制每个连接允许的最大并发请求数
+    size_t http2_max_concurrent_streams_;
 
     // --- 后台维护任务相关 ---
-
-    /// @brief 用于触发周期性维护任务的定时器。
+    /// 用于触发周期性维护任务的定时器。
     boost::asio::steady_timer maintenance_timer_;
+    /// 连接池维护间隔
+    size_t maintenance_interval_ms_;
+    /// 连接闲置关闭时间
+    size_t idle_timeout_for_close_ms_;
+    /// 主动发送PING帧或者head请求间隔
+    size_t idle_timeout_for_ping_ms_;
 
     /// @brief 标志位，用于在关闭时安全地停止后台循环。
     std::atomic<bool> stopped_ = false;
 };
-
 
 
 #endif //UNTITLED1_CONNECTION_MANAGER_HPP

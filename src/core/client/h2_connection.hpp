@@ -72,7 +72,7 @@ public:
     using StreamType = boost::beast::ssl_stream<tcp::socket>;
     using StreamPtr = std::shared_ptr<StreamType>;
 
-    Http2Connection(StreamPtr stream, std::string pool_key);
+    Http2Connection(StreamPtr stream, std::string pool_key,size_t max_concurrent_streams,size_t max_idle_ms);
     ~Http2Connection() override;
 
 
@@ -81,8 +81,8 @@ public:
     Http2Connection& operator=(const Http2Connection&) = delete;
 
     // 工厂方法，用于安全地创建被 std::shared_ptr 管理的对象。
-    static std::shared_ptr<Http2Connection> create(StreamPtr stream, std::string key) {
-        return std::make_shared<Http2Connection>(std::move(stream), std::move(key));
+    static std::shared_ptr<Http2Connection> create(StreamPtr stream, std::string key,size_t max_concurrent_streams, size_t max_idle_ms) {
+        return std::make_shared<Http2Connection>(std::move(stream), std::move(key),max_concurrent_streams,max_idle_ms);
     }
 
     /**
@@ -130,10 +130,10 @@ public:
     // 更新最后ping操作的时间戳，用于连接保活
     void update_last_used_time() override;
     void update_ping_used_time() override;
-    // 获取最后使用时间戳（秒）。
-    int64_t get_last_used_timestamp_seconds() const override { return last_used_timestamp_seconds_.load(); }
+    // 获取最后使用时间戳（ms）。
+    int64_t get_last_used_timestamp_ms() const override { return last_used_timestamp_ms_.load(); }
     // 更新最后一次进行ping操作的时间戳
-    int64_t get_ping_used_timestamp_seconds() const override{return last_ping_timestamp_seconds_.load();}
+    int64_t get_ping_used_timestamp_ms() const override{return last_ping_timestamp_ms_.load();}
     // 发送 PING 帧以检查连接的活性。
     boost::asio::awaitable<bool> ping() override;
     // 返回 true，因为 HTTP/2 支持多路复用。
@@ -199,13 +199,14 @@ private:
     std::atomic<bool> is_closing_{false}; // 标记连接是否正在关闭。
     std::atomic<bool> close_called_{false}; // 防止 close() 被多次调用。
     std::atomic<bool> handshake_completed_{false}; // 标记 HTTP/2 握手是否已完成。
-    std::atomic<size_t> max_concurrent_streams_{100}; // 服务器允许的最大并发流数。
-    std::atomic<int64_t> last_used_timestamp_seconds_; // 连接最后一次被使用的时间戳（秒）
-     std::atomic<int64_t>  last_ping_timestamp_seconds_; // 上次PING的时间戳秒数（秒）。
+    std::atomic<size_t> max_concurrent_streams_; // 服务器允许的最大并发流数。
+    std::atomic<int64_t> last_used_timestamp_ms_; // 连接最后一次被使用的时间戳（ms）。
+    std::atomic<int64_t>  last_ping_timestamp_ms_; // 上次PING的时间戳（ms）。
     std::atomic<size_t> active_streams_{0}; // 当前活跃的流数量。
     std::atomic<bool> remote_goaway_received_{false}; // 标记是否已收到服务器的 GOAWAY 帧。
 
     boost::asio::steady_timer idle_timer_; // 用于在连接空闲时触发超时的计时器。
+    size_t max_idle_ms_; // 连接最大空闲时间
 
     /**
      * @brief 生成一个简单的、用于调试的唯一ID。

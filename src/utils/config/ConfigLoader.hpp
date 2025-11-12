@@ -5,7 +5,7 @@
 #ifndef UNTITLED1_CONFIGLOADER_HPP
 #define UNTITLED1_CONFIGLOADER_HPP
 
-#include "config.hpp" // 包含所有结构体定义
+#include "AizixConfig.hpp" // 包含所有结构体定义
 #include <string>
 
 #include "utils/toml.hpp"
@@ -20,15 +20,15 @@ public:
      * @return Config 填充了配置数据的结构体。
      * @throws std::runtime_error 如果文件不存在或解析失败。
      */
-    static Config load(const std::string& filepath);
+    static AizixConfig load(const std::string& filepath);
 
 private:
     // 为了保持接口干净，所有解析函数都作为私有帮助函数
-    static AppConfig parse_app(const toml::table& root_tb);
-    static ServerConfig parse_server(const toml::table& root_tb);
-    static ClientConfig parse_client(const toml::table& root_tb);
-    static DatabaseConfig parse_database(const toml::table& root_tb);
-    static LoggingConfig parse_logging(const toml::table& root_tb);
+    static AppConfig parse_app(const toml::table& app_tb);
+    static ServerConfig parse_server(const toml::table& server_tb);
+    static ClientConfig parse_client(const toml::table& client_tb);
+    static DatabaseConfig parse_database(const toml::table& db_tb);
+    static LoggingConfig parse_logging(const toml::table& log_tb);
 
     // 数据库子解析器
     static PostgresConfig parse_postgres_from_table(const toml::table& pg_tb);
