@@ -29,24 +29,23 @@ HttpsConnection::HttpsConnection(StreamPtr stream, std::string pool_key)
     SPDLOG_DEBUG("HttpsConnection [{}] for pool [{}] created.", id_, pool_key_);
     auto& socket = stream_->next_layer(); // 获取底层 socket
     boost::system::error_code ec;
-
+    stream_->next_layer().set_option(boost::asio::socket_base::keep_alive(true), ec);
     // 启用 SO_KEEPALIVE
-    socket.set_option(boost::asio::socket_base::keep_alive(true), ec);
     if (ec) {
         std::cerr << "SO_KEEPALIVE 设置失败: " << ec.message() << "\n";
         return;
     }
 
     // Linux-specific 参数设置
-    int native = socket.native_handle();
+    const int native = socket.native_handle();
+    constexpr int idle = 60;
     // 设置为 60 秒空闲后开始探测，每 10 秒探测一次，最多失败 3 次
-    int idle = 60, interval = 10, count = 3;
+    constexpr int interval = 10;
+    constexpr int count = 3;
 
     setsockopt(native, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     setsockopt(native, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
     setsockopt(native, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
-
-
 }
 
 
@@ -80,8 +79,12 @@ boost::asio::awaitable<bool> HttpsConnection::ping() {
             co_return false;
         }
 
+        auto verb = http::verb::head;
+        if (pool_key_ == "https://www.okx.com:443") {
+            verb = http::verb::options;
+        }
         // 1. 构造一个轻量级的 HTTP head 请求
-        http::request<http::empty_body> req{http::verb::head, "/", 11};
+        http::request<http::empty_body> req{verb, "/", 11};
         req.set(http::field::host, url->get_hostname());
         req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         req.set(http::field::accept, "*/*");
@@ -177,10 +180,8 @@ boost::asio::awaitable<HttpResponse> HttpsConnection::execute(const HttpRequest&
         co_return response;
     } catch (const boost::system::system_error& e) {
         SPDLOG_ERROR("HttpsConnection [{}] I/O error during execute: {}", id_, e.what());
-
         // 发生网络错误，此连接不再可信，必须标记为不可复用。
         keep_alive_ = false;
-
         // 重新抛出异常，以便上层（如 HttpClient）的重试逻辑能够捕获。
         // 在 throw 之前，guard 会被析构，保证计数器被正确递减。
         throw;
@@ -192,9 +193,9 @@ boost::asio::awaitable<HttpResponse> HttpsConnection::execute(const HttpRequest&
  */
 bool HttpsConnection::is_usable() const {
     // 一个可用的连接必须同时满足：SSL流有效，底层TCP套接字打开，且协议层允许保持连接。
-    if (stream_) {SPDLOG_DEBUG("stream_ = true");} else { SPDLOG_DEBUG("stream_ = true"); }
-    SPDLOG_DEBUG("stream_->.is_open() = {}",stream_->next_layer().is_open());
-    SPDLOG_DEBUG("keep_alive = {}",keep_alive_);
+    //if (stream_) {SPDLOG_DEBUG("stream_ = true");} else { SPDLOG_DEBUG("stream_ = true"); }
+    //SPDLOG_DEBUG("stream_->.is_open() = {}",stream_->next_layer().is_open());
+    //SPDLOG_DEBUG("keep_alive = {}",keep_alive_);
 
     return stream_ && stream_->next_layer().is_open() && keep_alive_;
 }
@@ -219,8 +220,14 @@ boost::asio::awaitable<void> HttpsConnection::close() {
             // 2. 最终，无论如何都确保底层 TCP socket 被物理关闭
             //    我们只关心尽力关闭，所以忽略这里的错误码。
             if (stream_->next_layer().is_open()) {
-                stream_->next_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-                stream_->next_layer().close(ec);
+                const auto error_code = stream_->next_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+                const auto code = stream_->next_layer().close(ec);
+                if (error_code) {
+                    throw boost::system::system_error(error_code);
+                }
+                if (code) {
+                    throw boost::system::system_error(code);
+                }
             }
         }
     } catch (const std::exception& e) {

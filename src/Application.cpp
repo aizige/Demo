@@ -175,10 +175,11 @@ std::vector<std::vector<int>> Application::get_numa_topology() {
  * 6. 保留最后一个核心给系统使用，避免所有核心都被占用导致系统调度压力。
  *
  * 设计目的：
+ * - “尽力而为”的核心绑定：允许用户配置的线程数多于物理核心数。只有当可用核心充足时，线程才会被绑定。
  * - I/O 线程数量少，固定在前几个核心，保证网络事件响应的低延迟。
  * - Worker 线程数量多，均匀分布在所有剩余核心上，充分利用 CPU 并行能力。
  * - 保留一个核心给系统，避免后台任务与应用线程争抢资源。
- *
+ * - NUMA 亲和性：所有被绑定的线程都会同时设置其 NUMA 节点亲和性，以优化内存访问。
  * @note 主线程作为第一个 I/O 线程（io_worker_main），在 run() 中绑定并运行 io_context。
  */
 void Application::setup_threading() {
@@ -201,7 +202,7 @@ void Application::setup_threading() {
             all_cpu_cores_.insert(all_cpu_cores_.end(), node_cpus.begin(), node_cpus.end());
         }
     }
-    // 如果最终没有探测到任何 CPU 核心，发出警告，todo: 禁用线程亲和性绑定
+    // 如果最终没有探测到任何 CPU 核心，发出警告，
     if (all_cpu_cores_.empty()) {
         SPDLOG_WARN("Could not detect CPU topology. Thread affinity will be disabled.");
         // 如果没有核心信息，则无法进行绑定，直接启动线程即可。
@@ -217,11 +218,11 @@ void Application::setup_threading() {
     // 主线程将作为第一个 IO 线程，因此我们只需要创建 (总数 - 1) 个额外的线程。
     // 如果总数只有1，则不创建任何额外线程。
     // IO 线程优先使用低编号的核心
-    const size_t num_extra_io_threads  = (io_threads_count > 1) ? (io_threads_count - 1) : 0;
-    io_threads_.reserve(num_extra_io_threads ); // 预分配 vector 容量，避免循环中发生内存重分配
+    const size_t num_extra_io_threads = (io_threads_count > 1) ? (io_threads_count - 1) : 0;
+    io_threads_.reserve(num_extra_io_threads); // 预分配 vector 容量，避免循环中发生内存重分配
 
     // 循环创建每一个额外的 IO 线程
-    for (size_t i = 0; i < num_extra_io_threads ; ++i) {
+    for (size_t i = 0; i < num_extra_io_threads; ++i) {
         // 计算当前线程的全局索引。主线程索引为0，额外线程从1开始。
         size_t thread_index = i + 1;
 
@@ -229,7 +230,7 @@ void Application::setup_threading() {
         io_threads_.emplace_back([this, thread_index]() {
             // 这部分代码将在新创建的线程中执行
             // 设置线程名称
-            const std::string thread_name = "io-worker-" + std::to_string(thread_index);
+            const std::string thread_name = "io-" + std::to_string(thread_index);
             ThreadUtils::set_current_thread_name(thread_name);
 
             // 如果探测到 CPU 核心列表不为空，并且当前线程索引没有超出核心列表的范围，则绑定该 I/O 线程到指定 CPU
@@ -246,7 +247,7 @@ void Application::setup_threading() {
                     numa_run_on_node(node_id);
                 }
                 SPDLOG_INFO("IO thread '{}' bound to CPU {}, Node {}.", thread_name, cpu_id, node_id);
-            }else {
+            } else {
                 // 如果没有足够的核心，则不进行绑定，让操作系统自由调度
                 SPDLOG_INFO("IO thread '{}' started without core affinity.", thread_name);
             }
@@ -269,29 +270,27 @@ void Application::setup_threading() {
             size_t cpu_index = io_threads_count + i;
 
             // 检查是否有可用core，并且计算出的索引没有超出core列表范围
-            if ( !all_cpu_cores_.empty() && cpu_index < all_cpu_cores_.size()) {
+            if (!all_cpu_cores_.empty() && cpu_index < all_cpu_cores_.size()) {
                 // 分配 CPU 核心
-                               int cpu_id = all_cpu_cores_[cpu_index];
-                               // 查询该核心所属的 NUMA 节点
-                               int node_id = numa_node_of_cpu(cpu_id);
+                int cpu_id = all_cpu_cores_[cpu_index];
+                // 查询该核心所属的 NUMA 节点
+                int node_id = numa_node_of_cpu(cpu_id);
 
                 // 调用 bind_thread_to_core 将线程绑定到具体 CPU
                 bind_thread_to_core(cpu_id);
 
                 if (node_id != -1) {
-                   numa_run_on_node(node_id); // 【确认使用】
-               }
+                    numa_run_on_node(node_id); // 【确认使用】
+                }
 
                 SPDLOG_INFO("Worker thread '{}' bound to CPU {}, Node {}.", thread_name, cpu_id, node_id);
             } else {
                 // 如果没有足够的核心，则不进行绑定
-                 SPDLOG_INFO("Worker thread '{}' started without core affinity.", thread_name);
+                SPDLOG_INFO("Worker thread '{}' started without core affinity.", thread_name);
             }
         });
     }
 }
-
-
 
 
 /**
@@ -375,7 +374,7 @@ int Application::run() {
                     config_.server.port, config_.server.io_threads, config_.server.worker_threads);
 
         // 主线程作为第一个 IO 线程
-        ThreadUtils::set_current_thread_name("io-worker-0");
+        ThreadUtils::set_current_thread_name("io-0");
         if (!all_cpu_cores_.empty()) {
             // 主线程使用第一个核心 (index 0)
             const int cpu_id = all_cpu_cores_[0];

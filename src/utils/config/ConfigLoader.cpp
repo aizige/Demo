@@ -266,8 +266,8 @@ ClientConfig ConfigLoader::parse_client(const toml::table& client_tb) {
         cfg.connect_timeout_ms = (*client_tbl)["connect_timeout_ms"].value_or(cfg.connect_timeout_ms);
         cfg.idle_timeout_for_close_ms = (*client_tbl)["idle_timeout_for_close_ms"].value_or(cfg.idle_timeout_for_close_ms);
         cfg.idle_timeout_for_ping_ms = (*client_tbl)["idle_timeout_for_ping_ms"].value_or(cfg.idle_timeout_for_ping_ms);
-        cfg.host_connection_pool_size = (*client_tbl)["host_connection_pool_size"].value_or(cfg.host_connection_pool_size);
-        cfg.max_connections_per_host = (*client_tbl)["max_connections_per_host"].value_or(cfg.max_connections_per_host);
+        cfg.max_h1_connections_per_host = (*client_tbl)["max_h1_connections_per_host"].value_or(cfg.max_h1_connections_per_host);
+        cfg.max_h2_connections_per_host = (*client_tbl)["max_h2_connections_per_host"].value_or(cfg.max_h2_connections_per_host);
         cfg.http2_max_concurrent_streams = (*client_tbl)["http2_max_concurrent_streams"].value_or(cfg.http2_max_concurrent_streams);
     }
     return cfg;

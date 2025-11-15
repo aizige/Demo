@@ -45,7 +45,6 @@ struct [[nodiscard]] Finally {
         active = false;
     }
 
-    // --- 新增的 disarm() 方法 ---
     // disarm() 是一个更通用的、表达“解除武装”意图的词
     // 我们让它直接调用 release()
     void disarm() noexcept {

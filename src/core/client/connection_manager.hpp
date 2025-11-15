@@ -63,10 +63,14 @@ struct CreationInProgress {
         std::shared_ptr<IConnection>, // 成功状态：存储创建的连接
         std::exception_ptr // 失败状态：存储捕获到的异常
     > result;
+
+    // 原子标志位，用于“一次性认领”，防止 H1.1 连接被多个协程获取。
+    std::atomic<bool> has_been_claimed_{false};
+
     /**
-        * @brief 构造函数。
-        * @param ex 用于构造内部 channel 的执行器。
-        */
+     * @brief 构造函数。
+     * @param ex 用于构造内部 channel 的执行器。
+     */
     explicit CreationInProgress(const boost::asio::any_io_executor& ex)
         : signal(std::make_shared<SignalChannel>(ex, 1)) {
     }
@@ -145,6 +149,14 @@ public:
     uint8_t max_redirects;
 
 private:
+    /// @brief 缓存与每个主机的协议协商历史结果。
+    enum class ProtocolKnowledge {
+        Unknown, // 初始状态，尚未知晓
+        SupportsH2, // 已知该主机支持并协商成功过 H2
+        RequiresH1 // 已知该主机仅支持 H1.1（或协商降级）
+    };
+
+
     /**
      * @brief [私有] 将一个新创建的连接添加到相应的池中。
      *
@@ -152,7 +164,7 @@ private:
      * @param key 连接池的键。
      * @param conn 要添加的连接。
      */
-    void add_connection_to_pool(const std::string& key, const std::shared_ptr<IConnection>& conn);
+    void add_connection_to_pool_h2(const std::string& key, const std::shared_ptr<IConnection>& conn);
 
 
     /**
@@ -160,17 +172,17 @@ private:
     */
     void start_maintenance();
 
-/**
- * @brief 连接客户端连接池维护协程。
- * 在一个循环中定期检查和维护所有连接池。
- * 它负责遍历容器中的所有连接，并执行以下维护操作：
- * 1. 移除已失效 (`is_usable() == false`) 的连接。
- * 2. 保留正在活动的连接。
- * 3. 关闭并移除空闲时间过长的连接。
- * 4. 对需要保活的空闲连接执行 PING 操作。
- *
- * @note 此协程必须在 `strand_` 的上下文中被调用，以保证线程安全。
- */
+    /**
+     * @brief 连接客户端连接池维护协程。
+     * 在一个循环中定期检查和维护所有连接池。
+     * 它负责遍历容器中的所有连接，并执行以下维护操作：
+     * 1. 移除已失效 (`is_usable() == false`) 的连接。
+     * 2. 保留正在活动的连接。
+     * 3. 关闭并移除空闲时间过长的连接。
+     * 4. 对需要保活的空闲连接执行 PING 操作。
+     *
+     * @note 此协程必须在 `strand_` 的上下文中被调用，以保证线程安全。
+     */
     boost::asio::awaitable<void> run_maintenance();
 
     /**
@@ -194,6 +206,7 @@ private:
     /// @brief 全局共享的 DNS 解析器。
     boost::asio::ip::tcp::resolver resolver_;
 
+
     /// @brief HTTP/1.1 连接池。
     /// 使用 `std::deque` 是因为它能高效地在队头移除 (`pop_front`) 和队尾添加 (`push_back`)，
     /// 完美匹配 H1.1 连接“取用-归还”的模式。
@@ -215,6 +228,9 @@ private:
     /// 连接建立超时TCP + TLS 握手阶段的最大等待时间，
     size_t connect_timeout_ms_;
 
+    /// 客户端是否启用Http2
+    bool http2_enabled_ = false;
+
     /// HTTP2初始最大并发流数	控制每个连接允许的最大并发请求数
     size_t http2_max_concurrent_streams_;
 
@@ -230,6 +246,14 @@ private:
 
     /// @brief 标志位，用于在关闭时安全地停止后台循环。
     std::atomic<bool> stopped_ = false;
+
+
+    /// 单个个HTTP1.1 Host的最大连接池大小
+    size_t max_h1_connections_per_host_;
+    /// 单个个HTTP2 Host的最大连接池大小
+    size_t max_h2_connections_per_host_;
+
+    std::unordered_map<std::string, ProtocolKnowledge> hosts_protocol_;
 };
 
 

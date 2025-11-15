@@ -31,7 +31,7 @@ HttpConnection::HttpConnection(tcp::socket socket, std::string pool_key)
     SPDLOG_TRACE("[{}]-[{}] 创建", id_, pool_key_);
     boost::system::error_code ec;
     // 启用 SO_KEEPALIVE
-    socket.set_option(boost::asio::socket_base::keep_alive(true), ec);
+    socket_.socket().set_option(boost::asio::socket_base::keep_alive(true), ec);
     if (ec) {
         std::cerr << "SO_KEEPALIVE 设置失败: " << ec.message() << "\n";
         return;
@@ -143,10 +143,10 @@ boost::asio::awaitable<bool> HttpConnection::ping() {
         req.set(http::field::accept, "*/*");
         req.set(http::field::connection, "keep-alive");
         req.set(http::field::accept_language, "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,zh-HK;q=0.6");
-        SPDLOG_DEBUG("host [{}]...", url->get_host());
-        SPDLOG_DEBUG("host name [{}]...", url->get_hostname());
+        //SPDLOG_DEBUG("host [{}]...", url->get_host());
+        //SPDLOG_DEBUG("host name [{}]...", url->get_hostname());
 
-        SPDLOG_DEBUG("[{}]-[{}] PING ...", id(), pool_key_);
+        //SPDLOG_DEBUG("[{}]-[{}] PING ...", id(), pool_key_);
 
         // 2. 异步发送请求
         co_await http::async_write(socket_, req, boost::asio::use_awaitable);

@@ -100,10 +100,10 @@ struct ClientConfig {
     /// @note 必须远小于 idle_timeout_for_close_ms_ 。PING 的目的是为了“保活”和“探测”，它必须在连接被判定为“太老该关闭”之前发生。15秒远小于45秒，逻辑上是正确的。<br>
     ///       可以对抗网络中间设备（NAT/防火墙）。很多网络设备会对空闲的TCP连接进行超时清理，这个超时时间通常在30-300秒之间。每15秒发送一次 PING，对于绝大多数网络环境来说，都足以刷新这些设备的超时计时器，让连接“看起来”一直很活跃，从而避免被意外断开。
     uint32_t idle_timeout_for_ping_ms = 15000;
-    /// 单个个Host的最大连接池大小，默认值：100
-    uint32_t host_connection_pool_size = 100;
-    /// 每个Host的最大并发连接数，默认值：100
-    uint32_t max_connections_per_host = 100;
+    /// 单个个HTTP1.1 Host的最大连接池大小 ，默认值：100
+    uint32_t max_h1_connections_per_host = 100;
+    //// 单个个HTTP2 Host的最大连接池大小，默认值：100
+    uint32_t max_h2_connections_per_host = 100;
     /// HTTP2初始最大并发流数	控制每个连接允许的最大并发请求数（默认值 100）
     /// @note 当自定义最大并发流数大于服务器支持的最大并发流时，重置为服务器的最大并发流数
     uint32_t http2_max_concurrent_streams = 100;

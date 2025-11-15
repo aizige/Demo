@@ -29,11 +29,17 @@ struct H2RequestMessage {
     // actor_loop() 完成请求处理后，会通过这个 channel 将最终的 HttpResponse 发回给等待的 execute() 协程。
     std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>> response_channel;
 };
+struct H2PingMessage {
+    std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, bool)>> result_channel;
+};
+
+struct H2CloseMessage {};
+
+using H2ActorMessage = std::variant<H2RequestMessage, H2PingMessage, H2CloseMessage>;
 
 // 定义 Actor 的“邮箱”（Mailbox）类型。这是一个协程安全的消息队列。
 // `execute()` 方法是生产者，`actor_loop()` 是消费者。
-using RequestChannel = boost::asio::experimental::channel<void(boost::system::error_code, H2RequestMessage)>;
-
+using RequestChannel = boost::asio::experimental::channel<void(boost::system::error_code, H2ActorMessage)> ;
 
 
 /**
@@ -65,7 +71,8 @@ public:
         // **关键的内存管理**：由于 nghttp2_nv 结构体只存储原始指针，
         // 我们必须将所有 header 的 key-value 字符串存储在这里，以确保在 nghttp2 使用它们时，
         // 这些字符串的内存是有效的，避免悬空指针。
-        std::vector<std::string> header_storage;
+        //std::vector<std::string> header_storage;
+        std::vector<char> header_arena;
     };
 
     // 定义底层流的类型，这里是 SSL 加密的 TCP 流。
@@ -187,7 +194,7 @@ private:
     std::string pool_key_;
     std::string id_;
 
-    RequestChannel request_channel_; // Actor 的“邮箱”，用于接收新请求。
+    RequestChannel actor_channel_; // Actor 的“邮箱”，用于接收新请求。
     boost::asio::experimental::channel<void(boost::system::error_code)> handshake_signal_; // 用于在 run() 和 actor_loop() 之间同步握手状态的信号。
     std::array<char, 8192> read_buffer_{}; // 网络读取缓冲区。
 

@@ -27,10 +27,8 @@ boost::asio::awaitable<void> UserService::simulate_high_concurrency(int num_requ
     if (num_requests <= 0) {
         co_return;
     }
-
-
-
-    // 1. [!!! 关键 !!!] 创建一个 channel 作为“完成计数器”。
+    
+    // 1. 创建一个 channel 作为“完成计数器”。
     //    它的容量等于请求数量。
     auto completion_channel = std::make_shared<
         boost::asio::experimental::channel<void(boost::system::error_code)>
@@ -50,19 +48,19 @@ boost::asio::awaitable<void> UserService::simulate_high_concurrency(int num_requ
                     SPDLOG_ERROR("A request in high concurrency test failed: {}", e.what());
                 }
 
-                // c. [!!! 关键 !!!] 任务完成（无论成功或失败），向 channel 发送一个信号
-                boost::system::error_code ignored_ec;
+                // c.  任务完成（无论成功或失败），向 channel 发送一个信号
+                constexpr boost::system::error_code ignored_ec;
                 co_await channel_ptr->async_send(ignored_ec, boost::asio::use_awaitable);
             },
             boost::asio::detached
         );
     }
 
-    // 3. [!!! 关键 !!!] 在主协程中，等待接收到所有 N 个完成信号
+    // 3. 在主协程中，等待接收到所有 N 个完成信号
     SPDLOG_INFO("Waiting for all {} requests to complete...", num_requests);
     for (int i = 0; i < num_requests; ++i) {
         try {
-            // 这个 co_await 能在您的环境中工作，我们在 stop() 中已经验证过
+
             co_await completion_channel->async_receive(boost::asio::use_awaitable);
         } catch (const std::exception& e) {
             SPDLOG_ERROR("Error waiting on completion channel: {}", e.what());

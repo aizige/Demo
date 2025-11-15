@@ -5,6 +5,9 @@
 #include <spdlog/spdlog.h>
 #include <ada.h>
 #include <boost/asio/detail/impl/scheduler.ipp>
+#include <boost/system/result.hpp>
+#include <boost/url/parse.hpp>
+#include <boost/url/url.hpp>
 
 #include "h2_connection.hpp"
 #include "iconnection.hpp"
@@ -19,8 +22,8 @@
  */
 HttpClient::HttpClient(std::shared_ptr<ConnectionManager> manager)
     : manager_(std::move(manager)),
-      max_redirects_(manager_->max_redirects)
-{}
+      max_redirects_(manager_->max_redirects) {
+}
 
 // 实现接口中的 get 方法
 boost::asio::awaitable<HttpResponse> HttpClient::get(const std::string_view url, const Headers& headers) {
@@ -39,192 +42,55 @@ boost::asio::awaitable<HttpResponse> HttpClient::post(const std::string_view url
 
 //  一个辅助函数来解析和组合 URL
 std::string HttpClient::resolve_url(const std::string& base_url, const std::string& location) {
-    if (location.find("://") != std::string::npos) {
-        // Location 是一个绝对 URL，直接使用
-        return location;
+    // 1. 将字符串解析为 boost::url_view 对象。
+    // url_view 是非拥有式的视图，它不分配内存，效率很高。
+    boost::system::result<boost::urls::url_view> base_view_res = boost::urls::parse_uri(base_url);
+    if (!base_view_res) {
+        SPDLOG_WARN("Failed to parse base_url '{}': {}", base_url, base_view_res.error().message());
+        return location; // base_url 无效，无法解析
     }
 
-    // Location 是一个相对 URL
-    // todo：一个完整的实现需要正确处理 ../ 等情况？？
-    const auto parsed_base = parse_url(base_url);
-    if (location.starts_with('/')) {
-        // 根相对路径
-        return parsed_base.scheme + "//" + parsed_base.host + ":" + std::to_string(parsed_base.port) + location;
-    } else {
-        // 相对路径
-        auto last_slash = parsed_base.target.rfind('/');
-        std::string base_path = (last_slash == std::string::npos) ? "/" : parsed_base.target.substr(0, last_slash + 1);
-        return parsed_base.scheme + "//" + parsed_base.host + ":" + std::to_string(parsed_base.port) + base_path + location;
+    // 同样，将 location 也解析为 url_view
+    boost::system::result<boost::urls::url_view> ref_view_res = boost::urls::parse_uri_reference(location);
+    if (!ref_view_res) {
+        SPDLOG_WARN("Failed to parse location '{}': {}", location, ref_view_res.error().message());
+        return location; // location 本身格式就有问题
     }
+
+    // 2. 创建一个用于接收结果的 `url` 对象。
+    // 这个对象将作为第三个参数（输出参数）传递。
+    boost::urls::url resolved_url;
+
+    // 3. 调用你找到的三参数 `resolve` 函数。
+    // 它会将 `base_view` 和 `ref_view` 解析的结果写入到 `resolved_url` 中。
+    const boost::system::result<void> resolve_result = boost::urls::resolve(*base_view_res, *ref_view_res, resolved_url);
+
+    // 4. 检查操作是否成功。
+    if (!resolve_result) {
+        SPDLOG_WARN("Failed to resolve location '{}' against base '{}': {}",
+                    location, base_url, resolve_result.error().message());
+        return location; // 解析失败，返回原始 location
+    }
+
+    // 5. 如果成功，结果就在 `resolved_url` 对象中。将其转换为字符串返回。
+    return resolved_url.c_str();
 }
 
-/**
- * @brief 所有HTTP请求的统一入口点。
- *
- * 这个协程负责编排整个HTTP请求的生命周期，包括：
- * - 构建HTTP请求对象。
- * - 自动处理多达 `max_redirects_` 次的HTTP重定向。
- * - 在请求结束后自动解压缩响应体。
- * - 通过RAII guard确保连接在使用后被安全地释放回连接池。
- *
- * @return 最终的 HttpResponse 对象。
- * @throws std::runtime_error 如果重定向次数过多或发生其他严重错误。
- * @throws boost::system::system_error 如果发生不可重试的网络错误。
- */
-/*boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std::string_view url, std::string body, const Headers &headers) {
-    int redirects_left = follow_redirects_ ? max_redirects_ : 0;
 
-    // 将请求参数保存起来，以便在循环中修改
-    std::string current_url(url);
-    http::verb current_method = method;
-    std::string current_body = std::move(body);
-    Headers current_headers = headers;
-
-    // 创建一个 optional<pair> 来持有结果和连接
-    // 这样可以确保连接和响应的生命周期被绑定在一起
-    std::optional<InternalResponse> result_pair;
-
-    // 使用 Finally guard 确保只要 result_pair 有值，连接就会被释放
-    auto connection_guard = Finally([&] {
-        if (result_pair && result_pair->second) { // result_pair->second 就是连接
-            manager_->release_connection(result_pair->second);
-        }
-    });
-
-    try {
-        while (redirects_left-- >= 0) {
-            ParsedUrl target = parse_url(current_url);
-            SPDLOG_DEBUG("正在对 {} 发起请求", current_url);
-
-            // 1. 创建 Request 对象
-            HttpRequest req{current_method, target.target, 11};
-            req.set(http::field::host, target.host);
-            req.set(http::field::user_agent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-
-            // 设置通用头 (Accept, etc.)
-            if (current_headers.find(http::field::accept) == current_headers.end()) {
-                req.set(http::field::accept, "#1#*");
-            }
-            if (current_headers.find(http::field::accept_encoding) == current_headers.end()) {
-                req.set(http::field::accept_encoding, "gzip, deflate");
-            }
-            if (current_headers.find(http::field::accept_language) == current_headers.end()) {
-                req.set(http::field::accept_language, "en-US,en;q=0.9");
-            }
-            if (current_headers.find(http::field::connection) == current_headers.end()) {
-                req.set(http::field::connection, "keep-alive");
-            }
-
-            // 合并用户头
-            for (const auto &field: current_headers) {
-                req.set(field.name(), field.value());
-            }
-
-            // 设置 body
-            if (!current_body.empty()) {
-                if (req.find(http::field::content_type) == req.end()) {
-                    req.set(http::field::content_type, "application/octet-stream");
-                }
-                req.body() = current_body;
-                req.prepare_payload();
-            }
-
-            // 2. 执行一次请求
-            // connection_guard 会在函数最终退出时处理一切。
-            // 如果有上一次循环的连接，它的 shared_ptr 在 result_pair 被重新赋值时会自动析构。
-            result_pair.emplace(co_await execute_internal(req, target));
-
-
-            HttpResponse& res = result_pair->first;
-
-            // 3. 检查是否是重定向状态码
-            auto status_code = res.result_int();
-            if (status_code >= 300 && status_code < 400) {
-                auto loc_it = res.find(http::field::location);
-                if (loc_it == res.end()) {
-                    // 重定向响应没有 Location 头，这是一个服务器错误，我们直接返回
-                    co_return std::move(res);
-                }
-                std::string new_location(loc_it->value());
-
-                // 检查是否还有重试次数
-                if (redirects_left < 0) {
-                    throw std::runtime_error("Too many redirects");
-                }
-
-                SPDLOG_DEBUG("Redirecting from {} to {}", current_url, new_location);
-                current_url = resolve_url(current_url, new_location);
-
-                // --- **[关键]** 根据不同的重定向码，更新请求参数 ---
-                if (status_code == 301 || status_code == 302 || status_code == 303) {
-                    // 对于这些状态码，非 GET/HEAD 请求通常会变成 GET
-                    if (current_method != http::verb::get && current_method != http::verb::head) {
-                        current_method = http::verb::get;
-                        current_body.clear();
-                        // 清除与 body 相关的头部
-                        current_headers.erase(http::field::content_length);
-                        current_headers.erase(http::field::content_type);
-                        current_headers.erase(http::field::transfer_encoding);
-                    }
-                }
-                // 对于 307 和 308 (以及其他未明确处理的)，我们保持方法和 body 不变
-
-                // 继续下一次循环
-                continue;
-            }
-
-
-            // 4. 如果不是重定向，则返回最终的响应
-            // 解压Body数据
-            auto it = res.find(http::field::content_encoding);
-            if (it != res.end()) {
-                SPDLOG_DEBUG("正在解压Body");
-                std::string decompressed_body;
-                if (boost::beast::iequals(it->value(), "gzip")) {
-                    // **直接调用线程安全的静态方法**
-                    decompressed_body = utils::compression::compression_manager::gzip_decompress(res.body());
-                    res.body() = std::move(decompressed_body);
-
-                    // 4. **非常重要**：移除或更新头部
-                    //    因为 body 已经变了，原始的 Content-Length 不再有效
-                    //    同时，内容也不再是 gzip 编码了
-                    res.erase(http::field::content_encoding);
-                    res.prepare_payload();
-                } else if (boost::beast::iequals(it->value(), "deflate")) {
-                    // 切换解压器到 DEFLATE 模式
-                    decompressed_body = utils::compression::compression_manager::deflate_decompress(res.body());
-                    res.body() = std::move(decompressed_body);
-                    res.erase(http::field::content_encoding);
-                    res.prepare_payload();
-                }
-                SPDLOG_DEBUG("正在解压Body 完毕");
-            }
-            // 我们需要返回 HttpResponse，但要确保连接在之后被释放。
-            // 因为 co_return 会销毁局部变量，connection_guard 会被触发。
-            co_return std::move(res);
-        }
-    } catch (const std::exception &e) {
-
-        throw;
-    }
-    // 不可达，但为了编译器满意
-    throw std::runtime_error("Too many redirects.");
-}*/
 
 /**
  * @brief 所有HTTP请求的统一入口点，实现了重定向处理和零拷贝优化。
  *
- * 该协程采用“写时复制”(Copy-on-Write)策略：
- * - 在不需要重定向的“快乐路径”上，它通过 string_view 和 const 指针
- *   零拷贝地使用传入的 body 和 headers。
- * - 只有在发生重定向且需要修改请求参数（如方法、body、headers）时，
- *   它才会创建这些参数的本地副本。
- *
- * 这种设计在保证API对调用者安全（使用 const&）的同时，实现了极致的性能。
+ * 该协程负责编排整个HTTP请求的生命周期，包括：
+ * - 构建HTTP请求对象。
+ * - 采用“写时复制”(Copy-on-Write)策略在重定向时高效地修改请求参数。
+ * - 自动处理多达 `max_redirects_` 次的HTTP重定向。
+ * - 在请求结束后自动解压缩响应体。
+ * - 确保在重定向的每一步中，获取到的连接都被正确释放，防止资源泄漏。
  *
  * @param method HTTP 方法。
  * @param url 请求的 URL。
- * @param body 请求体 (const 引用，函数不会修改调用者的数据)。
+ * @param body 请求体 (const 引用)。
  * @param headers 自定义的 HTTP 头部 (const 引用)。
  * @return 最终的 HttpResponse 对象。
  * @throws std::runtime_error 如果重定向次数过多或发生其他严重错误。
@@ -276,7 +142,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
             // 拷贝只在 body 非空时发生在这里。
             HttpRequest req{current_method, target.target, 11};
             req.set(http::field::host, target.host);
-            req.set(http::field::user_agent, "MyFramework/1.0");
+            req.set(http::field::user_agent, aizix::framework::name + "/" += aizix::framework::version);
 
             // 设置通用头 (Accept, etc.)(如果用户没有提供)
             if (current_headers_ptr->find(http::field::accept) == current_headers_ptr->end()) {
@@ -307,26 +173,30 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
             }
 
             // 2. 执行一次请求
-            // connection_guard 会在函数最终退出时处理一切。
-            // 如果有上一次循环的连接，它的 shared_ptr 在 result_pair 被重新赋值时会自动析构。
+            // 在重定向循环中，我们需要手动管理上一个连接的释放
+            if (result_pair) {
+                // 如果这不是第一次循环，说明我们有一个来自上一次重定向的连接需要释放
+                manager_->release_connection(result_pair->second);
+                result_pair.reset(); // 清空 optional
+            }
+
             result_pair.emplace(co_await execute_internal(req, target));
 
             HttpResponse& res = result_pair->first;
 
             // --- 3. 处理重定向 ---
-            auto status_code = res.result_int();
-            if (status_code >= 301 && status_code <= 308) {
+            if (auto status_code = res.result_int(); status_code >= 301 && status_code <= 308) {
                 auto loc_it = res.find(http::field::location);
                 if (loc_it == res.end()) {
                     // 重定向响应没有 Location 头，这是一个服务器错误，我们直接返回
-                    co_return std::move(res);
+                    co_return std::move(res); // 无 Location 头，无法重定向
                 }
 
 
                 // 检查是否还有重试次数
                 if (redirects_left < 0) {
                     SPDLOG_WARN("Too many redirects");
-                    co_return std::move(res);
+                    co_return std::move(res); // 顶层 guard 会释放最后一个连接
                 }
 
                 std::string new_location(loc_it->value());
@@ -366,8 +236,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
             // 4. 如果不是重定向，则返回最终的响应
             // 解压Body数据
-            auto it = res.find(http::field::content_encoding);
-            if (it != res.end()) {
+            if (auto it = res.find(http::field::content_encoding); it != res.end()) {
                 SPDLOG_DEBUG("正在解压Body");
                 std::string decompressed_body;
                 if (boost::beast::iequals(it->value(), "gzip")) {
@@ -407,95 +276,88 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
  * 导致的。对于新创建的连接，这些错误通常表示更严重的问题。
  */
 bool is_retryable_network_error(const boost::system::error_code& ec) {
-    return ec == boost::beast::http::error::end_of_stream || // 当尝试写入一个对方已关闭接收的连接时
+    return ec == http::error::end_of_stream || // 在 keep-alive 连接上读取，但对方已关闭。
         ec == boost::asio::error::eof || // 当你尝试读取一个对方已关闭发送的连接时
-        ec == boost::asio::error::connection_reset || //对一个已关闭的端口发送数据
-        ec == boost::asio::error::connection_aborted || // 连接已关闭或已收到 GOAWAY的连接
-        ec == boost::asio::error::broken_pipe || // 当尝试写入一个对方已关闭接收的连接时
-        ec == aizix_error::h2::receive_timeout; // 等待H2响应超时，网络不好的时候好像会出现这种问题
+        ec == boost::asio::error::connection_reset || // 连接被对端强制重置 (RST包)。
+        ec == boost::asio::error::connection_aborted || // 连接在本机中止（通常也是因为对端问题）。
+        ec == boost::asio::error::broken_pipe || // 尝试写入一个已关闭读端的socket。
+        ec == aizix_error::h2::receive_timeout || // 等待H2响应超时，网络不好的时候好像会出现这种问题
+        ec == aizix_error::network::connection_timeout || // 连接超时
+        ec == aizix_error::network::connection_error || // 连接超时
+        ec == boost::asio::error::timed_out; // Asio 标准超时错误
 }
 
 
 /**
- * @brief [私有] 负责单次请求的执行，并包含对陈旧连接的自动重试逻辑。
+ * @brief [私有] 负责单次请求的执行，并包含对“陈旧连接”的自动重试逻辑。
+ *
+ * 此协程的核心职责是：获取一个连接，用它执行请求，并在遇到特定的、
+ * 可恢复的网络错误时，自动进行有限次数的重试。
  *
  * @param request 要发送的 const HttpRequest 引用。
  * @param target 已解析的目标URL信息。
  * @return a pair containing the HttpResponse and the IConnection used.
+ * @throws boost::system::system_error 如果发生不可重试的网络错误，或重试耗尽。
+ * @throws std::runtime_error 如果无法获取连接。
  */
 boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_internal(const HttpRequest& request, const ParsedUrl& target) const {
     // 初始化重试计数器（最多尝试3次）
-    int attempt = 1;
+    constexpr int MAX_ATTEMPTS = 3;
 
-    // 使用 while 循环代替 for，显式递增 attempt，避免编译器警告
+    int attempt = 1; // 尝试次数从 1 开始
+
+    // 使用 while 循环代替 for，将逻辑控制全部移入循环体
     while (true) {
-        if (attempt > 3) {
-            throw std::runtime_error("HttpClient: All retry attempts failed after stale connection.");
-        }
-
         std::shared_ptr<IConnection> conn;
 
         try {
-            // 🔹 第一步：从连接池获取连接（可能是复用连接）
-            const PooledConnection pooled_conn = co_await manager_->get_connection(target.scheme, target.host, target.port);
-            conn = pooled_conn.connection;
+            // --- 成功路径 ---
+            const auto [connection, is_reused] = co_await manager_->get_connection(target.scheme, target.host, target.port);
+            conn = connection;
 
-            // 🔹 如果连接获取失败，抛出异常
             if (!conn) {
-                throw std::runtime_error("Failed to acquire a connection.");
+                const std::string key = std::string(target.scheme) + "//" + std::string(target.host) + ":" + std::to_string(target.port);
+                conn = co_await manager_->create_new_connection(key, target.scheme, target.host, target.port);
+                if (!conn) { continue; }
             }
 
-
-            if (!conn->supports_multiplexing() && conn->get_active_streams() > 0) {
-                // 这个 H1.1 连接正在被别人使用！
-                SPDLOG_WARN("[{}] 正在被他人使用，重新获取", conn->id());
+            auto conn_guard = Finally([this, conn = conn]() {
                 manager_->release_connection(conn);
-                // todo: 这里感觉不合理
-                // 立即重试，获取另一个连接
-                //++attempt;
-                continue; // 跳到下一次循环
-            }
+            });
 
-            // 🔹 第三步：执行请求（可能抛出 system_error）
             HttpResponse response = co_await conn->execute(request);
 
-            // ✅ 请求成功，立即返回响应和连接
+            conn_guard.disarm();
             co_return std::make_pair(std::move(response), conn);
         } catch (const boost::system::system_error& e) {
-            // --- 错误处理与重试逻辑 ---
+            // --- 失败/重试路径 ---
 
-            // [!!! 在决定重试前，先释放坏连接 !!!]
-            // 如果 conn 是有效的（即我们成功获取了连接但执行失败），
-            // 我们需要通知 ConnectionManager 这个连接可能已经失效了。
-            if (conn) {
-                // 我们不需要手动调用 close()，只需要 release_connection。
-                // ConnectionManager 的 release_connection 会检查 is_usable()，
-                // 发现它（可能）已经被 execute() 内部标记为 false，然后丢弃它。
-                manager_->release_connection(conn);
+            // 1. 判断是否还有重试机会
+            if (attempt >= MAX_ATTEMPTS) {
+                // 达到最大尝试次数，抛出最终错误
+                SPDLOG_ERROR("HttpClient: 所有重试尝试失败。最终错误: {}", e.code().message());
+                throw std::runtime_error("HttpClient: All retry attempts failed. Final error: " + e.code().message());
             }
 
+            // 2. 判断错误是否可重试
+            if (is_retryable_network_error(e.code())) {
+                // 情况A: 可重试错误 (例如复用连接陈旧)
+                SPDLOG_WARN("对重用连接 [{}] 的请求失败，出现可重试错误 ({})。正在重试...（尝试 {}/{}）",
+                            conn ? conn->id() : "N/A", e.code().message(), attempt + 1, MAX_ATTEMPTS);
 
-            // ❌ 不满足重试条件，记录日志并向上抛出异常
-            if (const bool should_retry = (attempt < 3 ); !should_retry) {
-                SPDLOG_ERROR("Request failed and is not retryable (attempt {}): {}", attempt, e.what());
-                throw;
-                // 注意：如果 conn 在这里被获取了，但因为异常没有被返回，它的 shared_ptr
-                // 会在这里被销毁，引用计数减一。如果这是唯一的引用，对象会被析构。
-                // 这一切都是自动且正确的。
+                // 显式递增尝试次数，继续循环
+                attempt++;
+            } else {
+                // 情况B: 不可重试错误（例如权限错误、逻辑错误），直接抛出
+                SPDLOG_ERROR("HttpClient: 出现不可重试错误，立即终止。错误: {}", e.code().message());
+                throw; // 重新抛出当前的异常
             }
-
-            // ✅ 满足重试条件，记录日志，继续下一轮尝试
-            SPDLOG_WARN("已过期的连接 [{}] 正在重试 (尝试次数 {}/2)...",
-                        conn ? conn->id() : "N/A",
-                        attempt + 1);
+        } catch (const std::exception& e) {
+            // 捕获其他运行时异常（例如 acquire null connection）
+            SPDLOG_ERROR("HttpClient: 出现非系统错误异常，终止。错误: {}", e.what());
+            throw;
         }
-
-        // 🔹 显式递增重试计数器，进入下一轮尝试
-        ++attempt;
-    } // end while
-
-    // 如果循环结束还没有成功返回，说明所有尝试都失败了。
-    throw std::runtime_error("HttpClient: All retry attempts failed.");
+    }
 }
 
 
@@ -544,9 +406,8 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
     result.host = url->get_hostname();
 
 
-    // 4. [关键] 获取端口，并处理默认值
-    std::string port(url->get_port());
-    if (port.empty()) {
+    // 4. 获取端口，并处理默认值
+    if (const std::string port(url->get_port()); port.empty()) {
         // 如果端口为空字符串，说明是默认端口
         // **直接调用 scheme_default_port() 获取默认端口**
         result.port = url->scheme_default_port();
@@ -555,7 +416,7 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
         try {
             result.port = std::stoi(port);
         } catch (const std::exception& e) {
-            throw std::runtime_error("Invalid port in URL: " + port);
+            throw std::runtime_error("Invalid port in URL: '" + port + "' " + e.what());
         }
     }
     // 5. 获取路径和查询字符串
