@@ -25,7 +25,6 @@
 #include <boost/asio/experimental/channel.hpp>
 #include "error/aizix_error.hpp"
 #include "utils/finally.hpp"
-#include "utils/utils.hpp"
 #include <functional>
 
 #include "utils/pocess_info.hpp"
@@ -48,7 +47,7 @@ namespace {
     constexpr auto H2_PATH_SV = ":path"sv;
 }
 
-Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key, size_t max_concurrent_streams, size_t max_idle_ms)
+Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key, size_t max_concurrent_streams,  std::chrono::milliseconds max_idle_ms)
     : stream_(std::move(stream)),
       pool_key_(std::move(pool_key)),
       id_(generate_connection_id()),
@@ -57,14 +56,16 @@ Http2Connection::Http2Connection(StreamPtr stream, std::string pool_key, size_t 
       // 初始化握手信号 channel，缓冲区为1即可
       handshake_signal_(stream_->get_executor(), 1),
       max_concurrent_streams_(max_concurrent_streams),
-      last_used_timestamp_ms_(time_utils::steady_clock_ms_since_epoch()),
-      last_ping_timestamp_ms_(time_utils::steady_clock_ms_since_epoch()),
+      last_used_timestamp_ms_(std::chrono::steady_clock::now()),
+      last_ping_timestamp_ms_(std::chrono::steady_clock::now()),
       // 所有异步对象都使用同一个 executor，确保它们在同一个上下文中执行
       idle_timer_(stream_->get_executor()),
-      max_idle_ms_(max_idle_ms) {
+      max_idle_time_(max_idle_ms) {
     // 初始化定时器为永不超时，避免在没有活动时立即触发
     idle_timer_.expires_at(std::chrono::steady_clock::time_point::max());
     SPDLOG_DEBUG("Create a connection [{}]-[{}] ", id_, pool_key);
+    //SPDLOG_DEBUG("初始化上次使用时间点:{} ", Http2Connection::get_last_used_timestamp_ms().time_since_epoch().count());
+    //SPDLOG_DEBUG("初始化ping用时间点:{} ", Http2Connection::get_ping_used_timestamp_ms().time_since_epoch().count());
 }
 
 
@@ -227,14 +228,17 @@ asio::awaitable<bool> Http2Connection::ping() {
 }
 
 void Http2Connection::update_last_used_time() {
-    last_used_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
+    last_used_timestamp_ms_.store(std::chrono::steady_clock::now());
+//    SPDLOG_DEBUG("更新上次使用时间点{}", get_last_used_timestamp_ms().time_since_epoch().count());
+
 }
 
 /**
  * @brief 更新连接的最后一次ping动作的时间戳为当前时间。
  */
 void Http2Connection::update_ping_used_time() {
-    last_ping_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
+    last_ping_timestamp_ms_.store(std::chrono::steady_clock::now());
+   // SPDLOG_DEBUG("更新上次ping时间点{}", get_ping_used_timestamp_ms().time_since_epoch().count());
 }
 
 size_t Http2Connection::get_active_streams() const {
@@ -259,7 +263,7 @@ boost::asio::awaitable<void> Http2Connection::do_write() {
         while (session_ && nghttp2_session_want_write(session_)) {
             const uint8_t* data = nullptr;
             // 从 nghttp2 获取待发送数据块的指针和长度（零拷贝）。
-            ssize_t len = nghttp2_session_mem_send(session_, &data);
+            const ssize_t len = nghttp2_session_mem_send(session_, &data);
             if (len <= 0) break;
 
             // 异步写入网络。co_await 提供了天然的背压机制：如果网络拥塞，
@@ -315,7 +319,7 @@ asio::awaitable<void> Http2Connection::actor_loop() {
     nghttp2_session_client_new(&session_, callbacks, this); // 创建客户端会话
 
     // 准备并提交客户端的 SETTINGS 帧
-    nghttp2_settings_entry iv[] = {
+    constexpr nghttp2_settings_entry iv[] = {
         {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
         {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535}
     };
@@ -369,7 +373,7 @@ asio::awaitable<void> Http2Connection::actor_loop() {
     handshake_signal_.close();
 
     // --- 阶段二: 主事件循环 (融合模型) ---
-    idle_timer_.expires_after(std::chrono::milliseconds(max_idle_ms_)); // 启动空闲超时
+    idle_timer_.expires_after(max_idle_time_); // 启动空闲超时
     while (!is_closing_ && stream_->lowest_layer().is_open()) {
         // 这是 Actor 模型的核心：使用 `operator||` 并发地等待三个事件源中的任何一个：
         // 1. 网络套接字可读。
@@ -381,12 +385,10 @@ asio::awaitable<void> Http2Connection::actor_loop() {
             idle_timer_.async_wait(asio::as_tuple(asio::use_awaitable))
         );
 
-        update_last_used_time();
+
 
         if (result.index() == 0) {
             // 网络可读
-            idle_timer_.expires_after(std::chrono::milliseconds(max_idle_ms_)); // 收到数据，重置空闲定时器
-
             auto [ec, n] = std::get<0>(result);
 
             if (ec) {
@@ -395,7 +397,9 @@ asio::awaitable<void> Http2Connection::actor_loop() {
                 break;
             }
 
-            SPDLOG_TRACE("[{}]-[{}] 读取数据 {} byte", id_, pool_key_, n);
+            idle_timer_.expires_after(max_idle_time_); // 处理新请求也是活动，重置定时器
+
+            SPDLOG_DEBUG("[{}]-[{}] 读取数据 {} byte", id_, pool_key_, n);
 
             // 将数据喂给 nghttp2
             if (nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t*>(read_buffer_.data()), n) < 0) {
@@ -405,7 +409,6 @@ asio::awaitable<void> Http2Connection::actor_loop() {
             }
         } else if (result.index() == 1) {
             // 收到 Actor 消息
-            idle_timer_.expires_after(std::chrono::milliseconds(max_idle_ms_)); // 处理新请求也是活动，重置定时器
 
             auto [ec, msg_variant] = std::get<1>(result);
             if (ec) {
@@ -415,16 +418,20 @@ asio::awaitable<void> Http2Connection::actor_loop() {
                 break;
             }
 
+            idle_timer_.expires_after(max_idle_time_); // 处理新请求也是活动，重置定时器
 
             // 使用 std::visit 处理 variant 消息
             std::visit([&]<typename T0>(T0&& msg) {
                 using T = std::decay_t<T0>;
 
+                // 判断消息类型
                 if constexpr (std::is_same_v<T, H2RequestMessage>) {
                     if (is_closing_ || remote_goaway_received_) {
                         msg.response_channel->try_send(asio::error::operation_aborted, HttpResponse{});
                         return;
                     }
+
+                    update_last_used_time();
 
                     auto stream_ctx = std::make_unique<StreamContext>();
                     stream_ctx->response_channel = msg.response_channel;
@@ -466,9 +473,9 @@ asio::awaitable<void> Http2Connection::actor_loop() {
                     }
                 }
             }, msg_variant);
-        } else {
-            // result.index() == 2, 空闲超时
-            SPDLOG_DEBUG("[{}]-[{}]: 空闲超时 ({}ms).", id_, pool_key_, max_idle_ms_);
+        } else { // result.index() == 2, 空闲超时
+
+            SPDLOG_DEBUG("[{}]-[{}]: 空闲超时 ({}ms).", id_, pool_key_, max_idle_time_.count());
             is_closing_ = true;
         }
 
@@ -484,7 +491,7 @@ asio::awaitable<void> Http2Connection::actor_loop() {
     is_closing_ = true;
     actor_channel_.close();
 
-    for (auto& [id, stream_ctx_ptr] : streams_) {
+    for (const auto& stream_ctx_ptr : streams_ | std::views::values) {
         if (stream_ctx_ptr && stream_ctx_ptr->response_channel) {
             stream_ctx_ptr->response_channel->try_send(asio::error::operation_aborted, HttpResponse{});
         }
@@ -500,122 +507,6 @@ asio::awaitable<void> Http2Connection::actor_loop() {
 
 
 // --- 回调函数 & 私有辅助函数 ---
-
-void Http2Connection::handle_stream_close(int32_t stream_id, const uint32_t error_code) {
-    auto it = streams_.find(stream_id);
-    if (it == streams_.end()) return;
-
-    // 移动上下文的所有权，然后从 map 中删除
-    auto stream_ctx_ptr = std::move(it->second);
-    streams_.erase(it);
-
-    --active_streams_; // 减少活跃流计数
-
-    if (!stream_ctx_ptr->response_channel) return;
-
-    if (error_code == NGHTTP2_NO_ERROR) {
-        // 流正常关闭，发送最终构建好的响应
-        stream_ctx_ptr->response_in_progress.prepare_payload();
-        stream_ctx_ptr->response_channel->try_send(boost::system::error_code{}, std::move(stream_ctx_ptr->response_in_progress));
-    } else {
-        // 流因错误关闭，发送一个错误码
-        SPDLOG_WARN("stream {} 因错误码关闭: {}", stream_id, nghttp2_strerror(error_code));
-        stream_ctx_ptr->response_channel->try_send(boost::system::error_code(error_code, boost::system::generic_category()), HttpResponse{});
-    }
-}
-
-int Http2Connection::on_stream_close_callback(nghttp2_session*, const int32_t stream_id, const uint32_t error_code, void* user_data) {
-    const auto self = static_cast<Http2Connection*>(user_data);
-    // 在单协程 Actor 模型下，回调函数总是被 actor_loop 间接调用，所以可以直接调用成员函数，无需 post 到 strand。
-    self->handle_stream_close(stream_id, error_code);
-    return 0; // 返回0表示成功
-}
-
-int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
-    auto self = static_cast<Http2Connection*>(user_data);
-
-    // 检查 PING 响应帧，用于连接活性检查
-    if (frame->hd.type == NGHTTP2_PING && (frame->hd.flags & NGHTTP2_FLAG_ACK)) {
-        SPDLOG_DEBUG("[{}]-[{}] 收到PING帧.", self->id_, self->pool_key_);
-    }
-
-    // 处理服务器主动关闭连接的 GOAWAY 帧
-    if (frame->hd.type == NGHTTP2_GOAWAY) {
-        SPDLOG_WARN("[{}]-[{}] 收到 GOAWAY 帧, 错误码: {}", self->id_, self->pool_key_, frame->goaway.error_code);
-        self->remote_goaway_received_ = true;
-        self->is_closing_ = true; // 标记连接为关闭状态
-    }
-
-    // 处理服务器发送的 SETTINGS 帧，更新本地的认知
-    if (frame->hd.type == NGHTTP2_SETTINGS && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
-        uint32_t max_streams = nghttp2_session_get_remote_settings(
-            self->session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
-        );
-        // 如果服务器通告的最大并发流数小于我们的配置，则以服务器为准
-        if (max_streams != NGHTTP2_INITIAL_MAX_CONCURRENT_STREAMS && self->max_concurrent_streams_ > max_streams) {
-            self->max_concurrent_streams_ = max_streams;
-            SPDLOG_DEBUG("[{}]-[{}]: 服务器更新 max concurrent streams 为 {}", self->id_, self->pool_key_, max_streams);
-        }
-    }
-    return 0;
-}
-
-int Http2Connection::on_begin_headers_callback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data) {
-    (void)user_data;
-    if (frame->hd.type != NGHTTP2_HEADERS) return 0; // 只关心 HEADERS 帧
-    // 获取此流的上下文
-    const auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
-    if (!stream_ctx) return 0;
-    // 开始接收头部，初始化响应对象版本
-    stream_ctx->response_in_progress.version(20);
-    return 0;
-}
-
-int Http2Connection::on_header_callback(nghttp2_session* session, const nghttp2_frame* frame, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len, uint8_t, void* user_data) {
-    (void)user_data;
-    auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
-
-    if (!stream_ctx) return 0;
-    std::string_view key(reinterpret_cast<const char*>(name), name_len);
-    // 特殊处理 `:status` 伪头部
-    if (key == ":status") {
-        try {
-            stream_ctx->response_in_progress.result(std::stoi(std::string(reinterpret_cast<const char*>(value), value_len)));
-        } catch (...) {
-            /* 忽略转换失败 */
-        }
-    } else if (!key.empty() && key[0] != ':') {
-        // 忽略其他伪头部，只添加普通头部
-        stream_ctx->response_in_progress.set(key, std::string_view(reinterpret_cast<const char*>(value), value_len));
-    }
-    return 0;
-}
-
-int Http2Connection::on_data_chunk_recv_callback(nghttp2_session* session, uint8_t, const int32_t stream_id, const uint8_t* data, const size_t len, void* user_data) {
-    (void)user_data;
-    const auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, stream_id));
-    if (!stream_ctx) return 0;
-    // 将接收到的数据块追加到响应体中
-    stream_ctx->response_in_progress.body().append(reinterpret_cast<const char*>(data), len);
-    return 0;
-}
-
-ssize_t Http2Connection::read_request_body_callback(nghttp2_session* session, const int32_t stream_id, uint8_t* buf, const size_t length, uint32_t* data_flags, nghttp2_data_source* source, void*) {
-    // 当 nghttp2 准备发送请求体时，会调用此回调来“拉取”数据
-    const auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, stream_id));
-    if (!stream_ctx) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-    const size_t remaining = stream_ctx->request_body.size() - stream_ctx->request_body_offset;
-    const size_t n = std::min(length, remaining); // 计算本次可以复制的数据量
-    if (n > 0) {
-        memcpy(buf, stream_ctx->request_body.data() + stream_ctx->request_body_offset, n);
-        stream_ctx->request_body_offset += n;
-    }
-    // 如果所有数据都已读取，设置 EOF 标志
-    if (stream_ctx->request_body_offset == stream_ctx->request_body.size()) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    }
-    return n;
-}
 
 void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRequest& req, StreamContext& stream_ctx) {
     // --- 阶段一: 计算总大小和 header 数量 ---
@@ -652,7 +543,7 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
     nva.reserve(header_count); //  使用计算出的 header_count ***
 
     // --- 阶段三: 填充 Arena 并构造 nghttp2_nv ---
-    auto fill_nv = [&](std::string_view name_sv, std::string_view value_sv) {
+    auto fill_nv = [&](const std::string_view name_sv, const std::string_view value_sv) {
         char* name_start = current_ptr;
         memcpy(name_start, name_sv.data(), name_sv.length());
         current_ptr += name_sv.length();
@@ -679,8 +570,8 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
 
     // 填充常规头部
     for (const auto& field : req) {
-        http::field name_enum = field.name();
-        if (name_enum == http::field::host || name_enum == http::field::connection ||
+        if (const http::field name_enum = field.name();
+            name_enum == http::field::host || name_enum == http::field::connection ||
             name_enum == http::field::upgrade || name_enum == http::field::proxy_connection ||
             name_enum == http::field::transfer_encoding || name_enum == http::field::keep_alive) {
             continue;
@@ -688,4 +579,119 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
         std::string lower_name = boost::algorithm::to_lower_copy(std::string(field.name_string()));
         fill_nv(lower_name, field.value());
     }
+}
+
+void Http2Connection::handle_stream_close(int32_t stream_id, const uint32_t error_code) {
+    const auto it = streams_.find(stream_id);
+    if (it == streams_.end()) return;
+
+    // 移动上下文的所有权，然后从 map 中删除
+    const auto stream_ctx_ptr = std::move(it->second);
+    streams_.erase(it);
+
+    --active_streams_; // 减少活跃流计数
+
+    if (!stream_ctx_ptr->response_channel) return;
+
+    if (error_code == NGHTTP2_NO_ERROR) {
+        // 流正常关闭，发送最终构建好的响应
+        stream_ctx_ptr->response_in_progress.prepare_payload();
+        stream_ctx_ptr->response_channel->try_send(boost::system::error_code{}, std::move(stream_ctx_ptr->response_in_progress));
+    } else {
+        // 流因错误关闭，发送一个错误码
+        SPDLOG_WARN("stream {} 因错误码关闭: {}", stream_id, nghttp2_strerror(error_code));
+        stream_ctx_ptr->response_channel->try_send(boost::system::error_code(static_cast<int>(error_code), boost::system::generic_category()), HttpResponse{});
+    }
+}
+
+int Http2Connection::on_begin_headers_callback(nghttp2_session* session, const nghttp2_frame* frame,  void* user_data) {
+    (void)user_data;
+    if (frame->hd.type != NGHTTP2_HEADERS) return 0; // 只关心 HEADERS 帧
+    // 获取此流的上下文
+    const auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
+    if (!stream_ctx) return 0;
+    // 开始接收头部，初始化响应对象版本
+    stream_ctx->response_in_progress.version(20);
+    return 0;
+}
+
+int Http2Connection::on_header_callback(nghttp2_session* session, const nghttp2_frame* frame, const uint8_t* name, const size_t name_len, const uint8_t* value, const size_t value_len, uint8_t,  void* user_data) {
+    (void)user_data;
+    const auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
+
+    if (!stream_ctx) return 0;
+    // 特殊处理 `:status` 伪头部
+    if (const std::string_view key(reinterpret_cast<const char*>(name), name_len); key == ":status") {
+        try {
+            stream_ctx->response_in_progress.result(std::stoi(std::string(reinterpret_cast<const char*>(value), value_len)));
+        } catch (...) {
+            /* 忽略转换失败 */
+        }
+    } else if (!key.empty() && key[0] != ':') {
+        // 忽略其他伪头部，只添加普通头部
+        stream_ctx->response_in_progress.set(key, std::string_view(reinterpret_cast<const char*>(value), value_len));
+    }
+    return 0;
+}
+
+int Http2Connection::on_data_chunk_recv_callback(nghttp2_session* session, uint8_t flags, const int32_t stream_id, const uint8_t* data, const size_t len, void* user_data) {
+    (void)user_data;
+    const auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, stream_id));
+    if (!stream_ctx) return 0;
+    // 将接收到的数据块追加到响应体中
+    stream_ctx->response_in_progress.body().append(reinterpret_cast<const char*>(data), len);
+    return 0;
+}
+
+int Http2Connection::on_stream_close_callback(nghttp2_session*, const int32_t stream_id, const uint32_t error_code, void* user_data) {
+    const auto self = static_cast<Http2Connection*>(user_data);
+    // 在单协程 Actor 模型下，回调函数总是被 actor_loop 间接调用，所以可以直接调用成员函数，无需 post 到 strand。
+    self->handle_stream_close(stream_id, error_code);
+    return 0; // 返回0表示成功
+}
+
+int Http2Connection::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
+    const auto self = static_cast<Http2Connection*>(user_data);
+
+    // 检查 PING 响应帧，用于连接活性检查
+    if (frame->hd.type == NGHTTP2_PING && (frame->hd.flags & NGHTTP2_FLAG_ACK)) {
+        SPDLOG_DEBUG("[{}]-[{}] 收到PING帧.", self->id_, self->pool_key_);
+    }
+
+    // 处理服务器主动关闭连接的 GOAWAY 帧
+    if (frame->hd.type == NGHTTP2_GOAWAY) {
+        SPDLOG_WARN("[{}]-[{}] 收到 GOAWAY 帧, 错误码: {}", self->id_, self->pool_key_, frame->goaway.error_code);
+        self->remote_goaway_received_ = true;
+        self->is_closing_ = true; // 标记连接为关闭状态
+    }
+
+    // 处理服务器发送的 SETTINGS 帧，更新本地的认知
+    if (frame->hd.type == NGHTTP2_SETTINGS && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
+        uint32_t max_streams = nghttp2_session_get_remote_settings(
+            self->session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
+        );
+        // 如果服务器通告的最大并发流数小于我们的配置，则以服务器为准
+        if (max_streams != NGHTTP2_INITIAL_MAX_CONCURRENT_STREAMS && self->max_concurrent_streams_ > max_streams) {
+            self->max_concurrent_streams_ = max_streams;
+            SPDLOG_DEBUG("[{}]-[{}]: 服务器更新 max concurrent streams 为 {}", self->id_, self->pool_key_, max_streams);
+        }
+    }
+    return 0;
+}
+
+ssize_t Http2Connection::read_request_body_callback(nghttp2_session* session, const int32_t stream_id, uint8_t* buf, const size_t length, uint32_t* data_flags, nghttp2_data_source* source, void*) {
+    // 当 nghttp2 准备发送请求体时，会调用此回调来“拉取”数据
+    const auto stream_ctx = static_cast<StreamContext*>(nghttp2_session_get_stream_user_data(session, stream_id));
+    if (!stream_ctx) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    const size_t remaining = stream_ctx->request_body.size() - stream_ctx->request_body_offset;
+    const size_t n = std::min(length, remaining); // 计算本次可以复制的数据量
+    if (n > 0) {
+        memcpy(buf, stream_ctx->request_body.data() + stream_ctx->request_body_offset, n);
+        stream_ctx->request_body_offset += n;
+    }
+    // 如果所有数据都已读取，设置 EOF 标志
+    if (stream_ctx->request_body_offset == stream_ctx->request_body.size()) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
+    return n;
 }

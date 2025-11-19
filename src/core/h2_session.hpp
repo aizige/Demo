@@ -36,11 +36,12 @@ public:
     /**
     @brief 构造函数。
     @param stream 已经完成 TLS 握手的 SSL/TLS 流的共享指针。
+    @param work_executor work executor
     @param router 对服务器主路由器的引用，用于分发请求。
     @param max_request_body_size_bytes 最大允许的 HTTP 请求体大小 （bytes）
-    @param keep_alive_ms keep alive超时时间.
+    @param keep_alive_timeout keep alive超时时间.
     */
-    Http2Session(StreamPtr stream,boost::asio::any_io_executor work_executor, Router& router, size_t max_request_body_size_bytes, size_t keep_alive_ms);
+    Http2Session(StreamPtr stream,boost::asio::any_io_executor work_executor, Router& router, size_t max_request_body_size_bytes, std::chrono::milliseconds keep_alive_timeout);
     /**
     @brief 析构函数。
     负责释放 nghttp2 会话资源。
@@ -58,11 +59,11 @@ public:
    * @param work_executor work executor
     *@param r 对路由器的引用。
     *@param max_request_body_size_bytes 最大允许的 HTTP 请求体大小 （bytes）
-   * @param keep_alive_ms keep alive超时时间.
+   * @param keep_alive_timeout keep alive超时时间.
     *@return Http2Session 的 std::shared_ptr 实例。
     */
-    static std::shared_ptr<Http2Session> create(StreamPtr stream, boost::asio::any_io_executor work_executor,Router& r, size_t max_request_body_size_bytes, size_t keep_alive_ms) {
-        return std::make_shared<Http2Session>(std::move(stream),  std::move(work_executor),r, max_request_body_size_bytes, keep_alive_ms);
+    static std::shared_ptr<Http2Session> create(StreamPtr stream, boost::asio::any_io_executor work_executor,Router& r, size_t max_request_body_size_bytes, std::chrono::milliseconds keep_alive_timeout) {
+        return std::make_shared<Http2Session>(std::move(stream),  std::move(work_executor),r, max_request_body_size_bytes, keep_alive_timeout);
     }
 
     /**
@@ -186,7 +187,7 @@ private:
     size_t active_streams_ = 0; // 当前活跃的流数量。
 
     size_t max_request_body_size_bytes_;
-    size_t keep_alive_ms_;
+    std::chrono::milliseconds keep_alive_ms_;
 
     // 用于唤醒 writer_loop 的机制
     boost::asio::steady_timer write_trigger_; // 一个定时器，通过取消它来立即触发一次写操作，比使用 channel 更轻量。

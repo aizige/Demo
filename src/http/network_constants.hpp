@@ -25,6 +25,13 @@ namespace network {
             8, 'h', 't', 't', 'p', '/', '1', '.', '1'
         };
 
+        inline std::span<const unsigned char> get_alpn_protos(bool http2_enabled) {
+            if (http2_enabled) {
+                return PROTOS_H2_PREFERRED; // 数组隐式转换为 span
+            }
+            return PROTOS_H1_ONLY;
+        }
+
     } // namespace alpn
 
     // --- TLS/SSL 相关常量 ---

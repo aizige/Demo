@@ -26,7 +26,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-point
 set(CMAKE_BUILD_TYPE Debug)  # 设置构建类型为 Debug
 
 add_executable(Aizix
-        main.cpp
+        src/main.cpp
         src/core/h2_session.cpp
         src/core/client/http_connection.cpp
         src/core/client/connection_manager.cpp
@@ -45,6 +45,7 @@ add_executable(Aizix
         src/utils/config/ConfigLoader.cpp
         src/Application.cpp
         src/Application.hpp
+        src/core/Server.cpp
 
 )
 

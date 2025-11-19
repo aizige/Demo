@@ -11,7 +11,7 @@
 
 
 /// @brief Http2Session 构造函数
-Http2Session::Http2Session(StreamPtr stream, boost::asio::any_io_executor work_executor, Router& router, size_t max_request_body_size_bytes, size_t keep_alive_ms)
+Http2Session::Http2Session(StreamPtr stream, boost::asio::any_io_executor work_executor, Router& router, size_t max_request_body_size_bytes, const std::chrono::milliseconds keep_alive_timeout)
     : stream_(std::move(stream)), // 移动语义，接管 SSL 流的所有权
       work_executor_(std::move(work_executor)),
       router_(router), // 保存对路由器的引用
@@ -19,7 +19,7 @@ Http2Session::Http2Session(StreamPtr stream, boost::asio::any_io_executor work_e
       session_(nullptr), // 初始化 nghttp2 会话指针为空，将在 init_session() 中创建
       idle_timer_(strand_),
       max_request_body_size_bytes_(max_request_body_size_bytes), // 在同一个 strand 上构造空闲计时器
-      keep_alive_ms_(keep_alive_ms),
+      keep_alive_ms_(keep_alive_timeout),
       write_trigger_(strand_), // 在同一个 strand 上构造写触发器
       dispatch_channel_(strand_) // 在同一个 strand 上构造分发通道
 {
@@ -507,7 +507,7 @@ boost::asio::awaitable<void> Http2Session::idle_timer_loop() {
                 idle_timer_.expires_at(std::chrono::steady_clock::time_point::max());
             } else {
                 // 如果没有活跃请求，设置空闲超时
-                idle_timer_.expires_after(std::chrono::milliseconds(keep_alive_ms_));
+                idle_timer_.expires_after(keep_alive_ms_);
             }
 
             boost::system::error_code ec;

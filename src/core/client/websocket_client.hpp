@@ -12,7 +12,7 @@
 
 class WebSocketClient {
 public:
-    explicit WebSocketClient(boost::asio::io_context& ioc);
+    explicit WebSocketClient(boost::asio::io_context& ioc,bool ssl_verify);
 
     /**
      * @brief 异步连接到一个 WebSocket 端点。
@@ -33,12 +33,13 @@ private:
 
     // 复用 HttpClient 的 URL 解析器
     struct ParsedUrl {
-        std::string scheme; // 是带:格式的。例如: https:,而非: https
+        std::string scheme; // 是带:格式的。例如: ws:,而非: wss:
         std::string host;
         uint16_t port;
         std::string target;
     };
-    ParsedUrl parse_url(std::string_view url);
+
+    static ParsedUrl parse_url(std::string_view url_strv);
 };
 
 #endif // WEBSOCKET_CLIENT_HPP

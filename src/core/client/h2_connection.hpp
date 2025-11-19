@@ -8,7 +8,6 @@
 #include <nghttp2/nghttp2.h>
 #include <boost/beast/ssl.hpp>
 #include <atomic>
-#include <boost/asio/strand.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -16,7 +15,6 @@
 #include <iostream>
 #include <boost/asio/experimental/channel.hpp>
 
-#include "core/server.hpp"
 #include "http/http_common_types.hpp"
 // 单协程融合模型 (Single-Coroutine Fused Model)
 
@@ -29,17 +27,19 @@ struct H2RequestMessage {
     // actor_loop() 完成请求处理后，会通过这个 channel 将最终的 HttpResponse 发回给等待的 execute() 协程。
     std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>> response_channel;
 };
+
 struct H2PingMessage {
     std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, bool)>> result_channel;
 };
 
-struct H2CloseMessage {};
+struct H2CloseMessage {
+};
 
 using H2ActorMessage = std::variant<H2RequestMessage, H2PingMessage, H2CloseMessage>;
 
 // 定义 Actor 的“邮箱”（Mailbox）类型。这是一个协程安全的消息队列。
 // `execute()` 方法是生产者，`actor_loop()` 是消费者。
-using RequestChannel = boost::asio::experimental::channel<void(boost::system::error_code, H2ActorMessage)> ;
+using RequestChannel = boost::asio::experimental::channel<void(boost::system::error_code, H2ActorMessage)>;
 
 
 /**
@@ -55,10 +55,10 @@ using RequestChannel = boost::asio::experimental::channel<void(boost::system::er
  */
 class Http2Connection final : public IConnection, public std::enable_shared_from_this<Http2Connection> {
 public:
-        /**
-         * @struct StreamContext
-         * @brief 存储单个 HTTP/2 流（即一个请求-响应对）的上下文信息。
-         */
+    /**
+     * @struct StreamContext
+     * @brief 存储单个 HTTP/2 流（即一个请求-响应对）的上下文信息。
+     */
     struct StreamContext {
         // 指向该流的响应通道，用于将最终结果发回。
         std::shared_ptr<boost::asio::experimental::channel<void(boost::system::error_code, HttpResponse)>> response_channel;
@@ -79,7 +79,7 @@ public:
     using StreamType = boost::beast::ssl_stream<tcp::socket>;
     using StreamPtr = std::shared_ptr<StreamType>;
 
-    Http2Connection(StreamPtr stream, std::string pool_key,size_t max_concurrent_streams,size_t max_idle_ms);
+    Http2Connection(StreamPtr stream, std::string pool_key, size_t max_concurrent_streams, std::chrono::milliseconds max_idle_ms);
     ~Http2Connection() override;
 
 
@@ -88,8 +88,8 @@ public:
     Http2Connection& operator=(const Http2Connection&) = delete;
 
     // 工厂方法，用于安全地创建被 std::shared_ptr 管理的对象。
-    static std::shared_ptr<Http2Connection> create(StreamPtr stream, std::string key,size_t max_concurrent_streams, size_t max_idle_ms) {
-        return std::make_shared<Http2Connection>(std::move(stream), std::move(key),max_concurrent_streams,max_idle_ms);
+    static std::shared_ptr<Http2Connection> create(StreamPtr stream, std::string key, size_t max_concurrent_streams, std::chrono::milliseconds max_idle_ms) {
+        return std::make_shared<Http2Connection>(std::move(stream), std::move(key), max_concurrent_streams, max_idle_ms);
     }
 
     /**
@@ -130,7 +130,6 @@ public:
     tcp::socket& lowest_layer_socket() const;
 
 
-
     // --- 连接池支持 ---
 
     // 更新最后使用时间戳，用于连接池的空闲回收策略。
@@ -138,9 +137,9 @@ public:
     void update_last_used_time() override;
     void update_ping_used_time() override;
     // 获取最后使用时间戳（ms）。
-    int64_t get_last_used_timestamp_ms() const override { return last_used_timestamp_ms_.load(); }
+    std::chrono::steady_clock::time_point get_last_used_timestamp_ms() const override { return last_used_timestamp_ms_.load(); }
     // 更新最后一次进行ping操作的时间戳
-    int64_t get_ping_used_timestamp_ms() const override{return last_ping_timestamp_ms_.load();}
+    std::chrono::steady_clock::time_point get_ping_used_timestamp_ms() const override { return last_ping_timestamp_ms_.load(); }
     // 发送 PING 帧以检查连接的活性。
     boost::asio::awaitable<bool> ping() override;
     // 返回 true，因为 HTTP/2 支持多路复用。
@@ -150,11 +149,7 @@ public:
     // 获取服务器通告的最大并发流数量。
     size_t get_max_concurrent_streams() const override { return max_concurrent_streams_.load(); }
 
-
 private:
-
-
-
     /**
      * @brief 唯一的、统一的 Actor 协程，管理所有状态和 I/O。
      *        这是此类的核心，在一个循环中处理网络读、新请求和定时器事件。
@@ -183,7 +178,7 @@ private:
     // --- nghttp2 C-style 静态回调函数 ---
     static int on_begin_headers_callback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data);
     static int on_header_callback(nghttp2_session* session, const nghttp2_frame* frame, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len, uint8_t flags, void* user_data);
-    static int on_data_chunk_recv_callback(nghttp2_session* session, uint8_t flags, int32_t stream_id, const uint8_t* data, size_t len, void* user_data);
+    static int on_data_chunk_recv_callback(nghttp2_session* session, uint8_t flags, const int32_t stream_id, const uint8_t* data, size_t len, void* user_data);
     static int on_stream_close_callback(nghttp2_session* session, int32_t stream_id, uint32_t error_code, void* user_data);
     static int on_frame_recv_callback(nghttp2_session* session, const nghttp2_frame* frame, void* user_data);
     static ssize_t read_request_body_callback(nghttp2_session* session, int32_t stream_id, uint8_t* buf, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void* user_data);
@@ -194,32 +189,31 @@ private:
     std::string pool_key_;
     std::string id_;
 
-    RequestChannel actor_channel_; // Actor 的“邮箱”，用于接收新请求。
+    RequestChannel actor_channel_;                                                         // Actor 的“邮箱”，用于接收新请求。
     boost::asio::experimental::channel<void(boost::system::error_code)> handshake_signal_; // 用于在 run() 和 actor_loop() 之间同步握手状态的信号。
-    std::array<char, 8192> read_buffer_{}; // 网络读取缓冲区。
+    std::array<char, 8192> read_buffer_{};                                                 // 网络读取缓冲区。
 
 
-    nghttp2_session* session_ = nullptr; // nghttp2 的会话状态机。
+    nghttp2_session* session_ = nullptr;                                  // nghttp2 的会话状态机。
     std::unordered_map<int32_t, std::unique_ptr<StreamContext>> streams_; // 存储所有活跃流的上下文。
 
     // 使用原子变量来允许从外部线程（如连接池管理器）安全地读取连接状态。
-    std::atomic<bool> is_closing_{false}; // 标记连接是否正在关闭。
-    std::atomic<bool> close_called_{false}; // 防止 close() 被多次调用。
-    std::atomic<bool> handshake_completed_{false}; // 标记 HTTP/2 握手是否已完成。
-    std::atomic<size_t> max_concurrent_streams_; // 服务器允许的最大并发流数。
-    std::atomic<int64_t> last_used_timestamp_ms_; // 连接最后一次被使用的时间戳（ms）。
-    std::atomic<int64_t>  last_ping_timestamp_ms_; // 上次PING的时间戳（ms）。
-    std::atomic<size_t> active_streams_{0}; // 当前活跃的流数量。
-    std::atomic<bool> remote_goaway_received_{false}; // 标记是否已收到服务器的 GOAWAY 帧。
+    std::atomic<bool> is_closing_{false};                                       // 标记连接是否正在关闭。
+    std::atomic<bool> close_called_{false};                                     // 防止 close() 被多次调用。
+    std::atomic<bool> handshake_completed_{false};                              // 标记 HTTP/2 握手是否已完成。
+    std::atomic<size_t> max_concurrent_streams_;                                // 服务器允许的最大并发流数。
+    std::atomic<std::chrono::steady_clock::time_point> last_used_timestamp_ms_; // 连接最后一次被使用的时间点
+    std::atomic<std::chrono::steady_clock::time_point> last_ping_timestamp_ms_; // 上次PING的时间点
+    std::atomic<size_t> active_streams_{0};                                     // 当前活跃的流数量。
+    std::atomic<bool> remote_goaway_received_{false};                           // 标记是否已收到服务器的 GOAWAY 帧。
 
-    boost::asio::steady_timer idle_timer_; // 用于在连接空闲时触发超时的计时器。
-    size_t max_idle_ms_; // 连接最大空闲时间
+    boost::asio::steady_timer idle_timer_;    // 用于在连接空闲时触发超时的计时器。
+    std::chrono::milliseconds max_idle_time_; // 连接最大空闲时间
 
     /**
      * @brief 生成一个简单的、用于调试的唯一ID。
      */
     static std::string generate_connection_id();
-
 };
 
 

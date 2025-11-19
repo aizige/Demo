@@ -7,7 +7,7 @@
 #include <boost/asio/redirect_error.hpp>
 #include <spdlog/spdlog.h>
 #include <ada.h>
-#include "utils/utils.hpp"   // 假设 time_utils 和 Finally 在这里
+#include "utils/time_util.hpp"   // 假设 time_utils 和 Finally 在这里
 #include "utils/finally.hpp" // 明确包含 Finally
 #include "utils/pocess_info.hpp"
 
@@ -26,26 +26,9 @@ HttpConnection::HttpConnection(tcp::socket socket, std::string pool_key)
     : socket_(std::move(socket)),
       id_(generate_connection_id()),
       pool_key_(std::move(pool_key)),
-      last_used_timestamp_ms_(time_utils::steady_clock_seconds_since_epoch()),
-      last_ping_timestamp_ms_(time_utils::steady_clock_seconds_since_epoch()) {
+      last_used_timestamp_ms_(std::chrono::steady_clock::now()),
+      last_ping_timestamp_ms_(std::chrono::steady_clock::now()) {
     SPDLOG_TRACE("[{}]-[{}] 创建", id_, pool_key_);
-    boost::system::error_code ec;
-    // 启用 SO_KEEPALIVE
-    socket_.socket().set_option(boost::asio::socket_base::keep_alive(true), ec);
-    if (ec) {
-        std::cerr << "SO_KEEPALIVE 设置失败: " << ec.message() << "\n";
-        return;
-    }
-
-    // Linux-specific 参数设置
-    int native = socket.native_handle();
-    // 设置为 60 秒空闲后开始探测，每 10 秒探测一次，最多失败 3 次
-    int idle = 60, interval = 10, count = 3;
-
-    setsockopt(native, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-    setsockopt(native, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-    setsockopt(native, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
-
 }
 
 /**
@@ -240,14 +223,14 @@ boost::asio::awaitable<void> HttpConnection::close() {
  *  @brief 更新连接的最后一次活动时间戳为当前时间。
  */
 void HttpConnection::update_last_used_time() {
-    last_used_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
+    last_used_timestamp_ms_ = std::chrono::steady_clock::now();
 }
 
 /**
  * @brief 更新连接的最后一次ping动作的时间戳为当前时间。
  */
 void HttpConnection::update_ping_used_time() {
-    last_ping_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
+    last_ping_timestamp_ms_ = std::chrono::steady_clock::now();
 }
 
 /**

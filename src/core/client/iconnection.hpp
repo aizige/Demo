@@ -88,13 +88,13 @@ public:
      * @brief 获取连接的最后一次活动时间戳。
      * @return 自某个固定时间点以来的毫秒数
      */
-    [[nodiscard]] virtual int64_t get_last_used_timestamp_ms() const = 0;
+    [[nodiscard]] virtual std::chrono::steady_clock::time_point get_last_used_timestamp_ms() const = 0;
 
 
 
     /// @brief 上次PING的时间戳（ms）。
     /// 由 ConnectionManager 的后台维护任务使用，以判断连接多久没ping过了
-    [[nodiscard]] virtual int64_t get_ping_used_timestamp_ms() const =0;
+    [[nodiscard]] virtual std::chrono::steady_clock::time_point get_ping_used_timestamp_ms() const =0;
 
     /**
      * @brief 返回当前连接上正在并发处理的请求（流）的数量。

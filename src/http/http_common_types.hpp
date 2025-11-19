@@ -12,7 +12,6 @@
 #include <string_view> // <<-- 包含 string_view
 #include <boost/asio/awaitable.hpp>
 
-#include "http/string_view_body.hpp"
 
 class RequestContext;
 
@@ -38,8 +37,7 @@ namespace http = boost::beast::http;
 
 using tcp = boost::asio::ip::tcp;
 
-// 用于发送请求的类型，使用 string_view_body 实现零拷贝
-using HttpRequestView = http::request<string_view_body>;
+
 
 
 using HttpRequest  = http::request<http::string_body>;

@@ -11,6 +11,7 @@
 
 #include "h2_connection.hpp"
 #include "iconnection.hpp"
+#include "version.hpp"
 #include "error/aizix_error.hpp"
 #include "utils/compression_manager.hpp"
 #include "utils/finally.hpp"
@@ -362,70 +363,95 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
 
 
 /**
- * @brief [私有] 使用 ada-url 库安全地解析URL字符串。
+ * @brief 使用 ada-url 库安全、高效地解析 URL 字符串。
  *
- * 包含对缺少协议头的URL的自动补全逻辑。
- * @throws std::runtime_error 如果URL格式无效。
+ * 这是一个生产级别的 URL 解析函数，具有以下特性：
+ * - 高性能: 对于格式正确的 URL，解析过程几乎是零堆内存分配的，因为它尽可能地
+ *   使用 `std::string_view` 进行操作。
+ * - 健壮性: 能够自动为缺少协议头的 URL (如 "google.com") 补全 "http://" 协议，
+ *   并对端口号等组件进行严格的格式验证。
+ * - 写时复制: 只有在需要修改输入 URL (如补全协议) 时，才会创建 `std::string` 的
+ *   拷贝，保证了“快速路径”的极致性能。
+ *
+ * @param url_strv 要解析的 URL 字符串视图。
+ * @return ParsedUrl 一个包含 scheme, host, port, target 的结构体。
+ * @throws std::runtime_error 如果 URL 格式无效且无法修复。
  */
 HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
-    std::string url_string(url_strv);
+     // has_value()或者 if (url) 确保对象内部有有效值，是访问 ada::url_aggregator 成员（比如 is_valid）之前必须检查的第一步。
+     // is_valid：在确定对象有效后，进一步判断 URL 是否满足Url有效性规则。
+     // 如果未先检查 has_value()或者 if (url) 而直接调用 is_valid，当解析失败时程序可能崩溃（因为在无效的 tl::expected 上调用其成员是未定义行为）。
 
-    // 1. 使用 ada::parse 解析 URL
-    /**
-     * has_value()：确保对象内部有有效值，是访问 ada::url_aggregator 成员（比如 is_valid）之前必须检查的第一步。
-     * is_valid：在确定对象有效后，进一步判断 URL 是否满足Url有效性规则。
-     * 如果未先检查 has_value() 或者 而直接调用 is_valid，当解析失败时程序可能崩溃（因为在无效的 tl::expected 上调用其成员是未定义行为）。
-     */
-    auto url = ada::parse<ada::url_aggregator>(url_string);
+    // 1. 尝试直接解析 string_view (零拷贝的快速路径)
+     auto url = ada::parse<ada::url_aggregator>(url_strv);
 
-    // 如果解析失败，则补全协议并重试
+    std::string url_storage; // 仅在需要修改或存储时才分配内存
+
+    // 2. 如果初步解析失败，通常是因为缺少协议头，尝试补全并重试
     if (!url) {
-        SPDLOG_WARN("Parsing failed for URL: {}, attempting with protocol...", url_strv);
-        if (url_string.find("http://") != 0 && url_string.find("https://") != 0) {
-            url_string = "http://" + url_string;
+        url_storage = std::string(url_strv);
+        // 只有在完全没有 "://" 分隔符时，才认为需要补全 "http://"
+        // 这可以避免错误地修改 "user:pass@host" 或网络路径 "//host/path"
+        if (url_storage.find("://") == std::string::npos) {
+            url_storage.insert(0, "http://");
         }
-        SPDLOG_DEBUG("Re-parsing URL: {}", url_string);
+        SPDLOG_DEBUG("Re-parsing URL with protocol hint: {}", url_storage);
 
-        // 再次尝试解析
-        url = ada::parse<ada::url_aggregator>(url_string);
+        // 在修改后的 string 上再次解析
+        url = ada::parse<ada::url_aggregator>(url_storage);
+
+        // 如果再次失败，则 URL 格式确实有问题
         if (!url) {
-            throw std::runtime_error("Parsing failed for URL: " + url_string);
+            throw std::runtime_error("Failed to parse URL: " + std::string(url_strv));
         }
     }
 
-    // 2. 检查解析是否成功
+    // 3. 检查 URL 的语义有效性
+    // ada::parse 成功不代表 URL 一定有效（例如可能有无效的 a hostname）。
+    // is_valid 提供了更深层次的检查,判断 URL 是否是一个正确的URL
     if (!url->is_valid) {
-        SPDLOG_ERROR("Invalid URL format: {}", url_string);
-        throw std::runtime_error("Invalid URL format: " + std::string{url_string});
+        SPDLOG_ERROR("Invalid URL format: {}", url_strv);
+        throw std::runtime_error("Invalid URL format: " + std::string{url_strv});
     }
 
-
+    // 4. 从解析结果中提取所需信息
     ParsedUrl result;
-    // 3. 从解析结果中提取信息
+    // get_protocol() 和 get_hostname() 返回 string_view，
+    // 在这里隐式转换为 string 并拷贝给成员变量。这是必要的拷贝，将数据从临时解析器中保存下来。
     result.scheme = url->get_protocol();
     result.host = url->get_hostname();
 
+    SPDLOG_DEBUG("scheme = {}", result.scheme);
 
-    // 4. 获取端口，并处理默认值
-    if (const std::string port(url->get_port()); port.empty()) {
-        // 如果端口为空字符串，说明是默认端口
-        // **直接调用 scheme_default_port() 获取默认端口**
+    // 5. 健壮地解析端口，直接操作 string_view，避免创建临时 string
+     const std::string_view port = url->get_port();
+    if (port.empty()) {
+        // 如果端口字段为空，则根据 scheme 获取标准默认端口 (如 http ---> 80, https ---> 443)
         result.port = url->scheme_default_port();
     } else {
-        // 否则，转换端口号
-        try {
-            result.port = std::stoi(port);
-        } catch (const std::exception& e) {
-            throw std::runtime_error("Invalid port in URL: '" + port + "' " + e.what());
+        // 否则，转换端口号（使用 std::from_chars 进行严格、无异常、高性能的解析）
+        uint16_t parsed_port;
+        auto [ptr, ec] = std::from_chars(port.data(), port.data() + port.size(), parsed_port);
+        // 确保整个字符串都被解析了 (ptr == end)，并且没有发生错误 (ec == OK)
+        if (ec != std::errc{} || ptr != port.data() + port.size()) {
+            throw std::runtime_error("Invalid port in URL: '" + std::string(port) + "'");
         }
+        result.port = parsed_port;
     }
-    // 5. 获取路径和查询字符串
-    std::string pathname(url->get_pathname());
-    std::string search(url->get_search());
-    result.target = pathname + search;
-    if (result.target.empty()) {
+
+    // 6. 高效地组合 target (path + query)
+    const std::string_view pathname = url->get_pathname();
+    const std::string_view search = url->get_search();
+
+    if (pathname.empty() && search.empty()) {
         result.target = "/";
+    } else {
+        // 预分配内存，然后通过 append(string_view) 追加，避免因 '+' 操作符而产生不必要的临时 std::string
+        result.target.reserve(pathname.length() + search.length());
+        result.target.append(pathname);
+        result.target.append(search);
     }
-    SPDLOG_DEBUG("解析URL成功: scheme = {}, host = {}, port = {}, target = {}", result.scheme, result.host, result.port, result.target);
+
+    SPDLOG_DEBUG("Parsed URL successfully: scheme={}, host={}, port={}, target={}", result.scheme, result.host, result.port, result.target);
     return result;
 }

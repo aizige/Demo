@@ -8,7 +8,7 @@
 #include <boost/asio/thread_pool.hpp>
 
 #include "controller/user_controller.hpp"
-#include "core/server.hpp"
+#include "core/Server.hpp"
 #include "core/client/connection_manager.hpp"
 #include "core/client/http_client.hpp"
 #include "utils/config/AizixConfig.hpp"

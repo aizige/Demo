@@ -5,6 +5,7 @@
 #include "Application.hpp"
 
 #include <filesystem>
+#include <iostream>
 #include <numa.h>
 #include <fmt/ranges.h>   // 关键头文件，提供对 STL 容器的格式化支持
 
@@ -96,7 +97,7 @@ Application::Application(const AizixConfig& config)
  *
  * @param core_id 要绑定的 CPU 核心编号（从 0 开始）。
  */
-void Application::bind_thread_to_core(size_t core_id) {
+void Application::bind_thread_to_core(const size_t core_id) {
     // 定义一个 CPU 集合，用来描述线程可以运行在哪些 CPU 上
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset); // 将集合清空（所有位设为0）
@@ -267,7 +268,7 @@ void Application::setup_threading() {
             ThreadUtils::set_current_thread_name(thread_name);
 
             // 计算该 Worker 线程的全局索引。它排在所有 IO 线程之后。
-            size_t cpu_index = io_threads_count + i;
+            const size_t cpu_index = io_threads_count + i;
 
             // 检查是否有可用core，并且计算出的索引没有超出core列表范围
             if (!all_cpu_cores_.empty() && cpu_index < all_cpu_cores_.size()) {
@@ -311,7 +312,7 @@ void Application::setup_services() {
 
     // 依赖注入链
     http_client_ = std::make_shared<HttpClient>(connection_manager_);
-    ws_client_ = std::make_shared<WebSocketClient>(ioc_);
+    ws_client_ = std::make_shared<WebSocketClient>(ioc_,config_.client.ssl_verify);
     user_service_ = std::make_shared<UserService>(ioc_.get_executor(), worker_pool_->get_executor(), http_client_, ws_client_);
     user_controller_ = std::make_shared<UserController>(user_service_);
 

@@ -18,7 +18,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/strand.hpp>
-#include "utils/utils.hpp"
+#include "utils/time_util.hpp"
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/beast/http/basic_parser.hpp>
@@ -42,6 +42,19 @@ struct PooledConnection {
     std::shared_ptr<IConnection> connection;
     /// @brief 如果连接是从池中复用的，则为 true；如果是新创建的，则为 false。
     bool is_reused = false;
+};
+
+
+/// @brief 缓存与每个主机的协议协商历史结果。
+enum class ProtocolKnowledge {
+    Unknown, // 初始状态，尚未知晓
+    SupportsH2, // 已知该主机支持并协商成功过 H2
+    RequiresH1 // 已知该主机仅支持 H1.1（或协商降级）
+};
+
+struct ProtocolInfo {
+    ProtocolKnowledge knowledge;
+    std::chrono::steady_clock::time_point last_updated;
 };
 
 /**
@@ -149,12 +162,7 @@ public:
     uint8_t max_redirects;
 
 private:
-    /// @brief 缓存与每个主机的协议协商历史结果。
-    enum class ProtocolKnowledge {
-        Unknown, // 初始状态，尚未知晓
-        SupportsH2, // 已知该主机支持并协商成功过 H2
-        RequiresH1 // 已知该主机仅支持 H1.1（或协商降级）
-    };
+
 
 
     /**
@@ -226,7 +234,7 @@ private:
 
 
     /// 连接建立超时TCP + TLS 握手阶段的最大等待时间，
-    size_t connect_timeout_ms_;
+    std::chrono::milliseconds connect_timeout_;
 
     /// 客户端是否启用Http2
     bool http2_enabled_ = false;
@@ -238,11 +246,11 @@ private:
     /// 用于触发周期性维护任务的定时器。
     boost::asio::steady_timer maintenance_timer_;
     /// 连接池维护间隔
-    size_t maintenance_interval_ms_;
+    std::chrono::milliseconds maintenance_interval_;
     /// 连接闲置关闭时间
-    size_t idle_timeout_for_close_ms_;
+    std::chrono::milliseconds idle_timeout_for_close_;
     /// 主动发送PING帧或者head请求间隔
-    size_t idle_timeout_for_ping_ms_;
+    std::chrono::milliseconds idle_timeout_for_ping_;
 
     /// @brief 标志位，用于在关闭时安全地停止后台循环。
     std::atomic<bool> stopped_ = false;
@@ -253,7 +261,35 @@ private:
     /// 单个个HTTP2 Host的最大连接池大小
     size_t max_h2_connections_per_host_;
 
-    std::unordered_map<std::string, ProtocolKnowledge> hosts_protocol_;
+
+    /// @brief 主机的协议缓存有效时间 (Time-To-Live)（毫秒）
+    /// 缓存的协议信息（如主机支持H2或H1.1）超过此时间后将被视为过期，
+    /// 以便客户端能够适应服务器配置的变化。
+    std::chrono::milliseconds protocol_cache_ttl_;
+
+    /**
+     * @brief 主机的HTTP连接是的协议协商历史，动态学习并缓存每个主机的协议支持情况。
+     *
+     * @details
+     * 该映射map是 ConnectionManager 实现自适应连接策略的核心。它的键是连接池的唯一键
+     * (e.g., "https://www.google.com:443")，值是 `ProtocolInfo<ProtocolKnowledge,缓存时间>` 枚举，
+     * 记录了与该主机最近一次成功连接时协商出的协议。
+     * - 目的: 解决 `get_connection` 在面对池空情况下的决策难题。避免了对已知仅支持 H1.1 的主机进行不必要的创建等待，从而解决了延迟放大问题。.只要知道对应Host是HTTP1.1协议并且池中没有现成的连接就返回空值让调用者自己创建连接
+     *
+     * - 工作流程:
+     *
+     *   1. 学习: 在 `create_new_connection` 成功后，根据 ALPN 结果或协议类型，
+     *      更新此映射map。
+     *   2. 决策: `get_connection` 在决定是否要启动“创建者/等待者”模式前，
+     *      会查询此map：
+     *      - 如果记录为 `SupportsH2`，则启动自动创建流程。
+     *      - 如果记录为 `RequiresH1`，则立即返回 `nullptr`，将创建权交由调用者。
+     *      - 如果记录为 `Unknown` (首次连接)，则进行一次乐观的 H2 连接尝试。
+     *   3. **自愈**: 如果连接创建失败，对应的条目会被清除，允许下次请求重新探测。
+     *
+     * @note 所有的读写操作都必须在 `strand_` 的保护下进行，以保证线程安全。
+     */
+    std::unordered_map<std::string, ProtocolInfo> hosts_protocol_;
 };
 
 

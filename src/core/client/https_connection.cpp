@@ -9,7 +9,7 @@
 
 #include "utils/finally.hpp"
 #include "utils/pocess_info.hpp"
-#include "utils/utils.hpp" // 假设 time_utils 在这里
+#include "utils/time_util.hpp" // 假设 time_utils 在这里
 
 
 // 将 C++14 的时间字面量（如 30s）引入当前作用域
@@ -25,27 +25,8 @@ HttpsConnection::HttpsConnection(StreamPtr stream, std::string pool_key)
     : stream_(std::move(stream)), // 直接移动传入的 stream
       id_(generate_connection_id()),
       pool_key_(std::move(pool_key)),
-      last_used_timestamp_ms_(time_utils::steady_clock_seconds_since_epoch()), last_ping_timestamp_ms_(time_utils::steady_clock_seconds_since_epoch()) {
+      last_used_timestamp_(std::chrono::steady_clock::now()), last_ping_timestamp_(std::chrono::steady_clock::now()) {
     SPDLOG_DEBUG("HttpsConnection [{}] for pool [{}] created.", id_, pool_key_);
-    auto& socket = stream_->next_layer(); // 获取底层 socket
-    boost::system::error_code ec;
-    stream_->next_layer().set_option(boost::asio::socket_base::keep_alive(true), ec);
-    // 启用 SO_KEEPALIVE
-    if (ec) {
-        std::cerr << "SO_KEEPALIVE 设置失败: " << ec.message() << "\n";
-        return;
-    }
-
-    // Linux-specific 参数设置
-    const int native = socket.native_handle();
-    constexpr int idle = 60;
-    // 设置为 60 秒空闲后开始探测，每 10 秒探测一次，最多失败 3 次
-    constexpr int interval = 10;
-    constexpr int count = 3;
-
-    setsockopt(native, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-    setsockopt(native, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-    setsockopt(native, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
 }
 
 
@@ -240,14 +221,14 @@ boost::asio::awaitable<void> HttpsConnection::close() {
  * @brief 更新连接的最后一次活动时间戳为当前时间。
  */
 void HttpsConnection::update_last_used_time() {
-    last_used_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
+    last_used_timestamp_  = std::chrono::steady_clock::now();
 }
 
 /**
  * @brief 更新连接的最后一次ping动作的时间戳为当前时间。
  */
 void HttpsConnection::update_ping_used_time() {
-    last_ping_timestamp_ms_ = time_utils::steady_clock_ms_since_epoch();
+    last_ping_timestamp_  = std::chrono::steady_clock::now();
 }
 
 /**

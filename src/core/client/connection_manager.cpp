@@ -5,24 +5,29 @@
 #include "connection_manager.hpp"
 
 #include <ranges>
+#include <unordered_set>
+#include <boost/asio/as_tuple.hpp>
 #include <spdlog/spdlog.h>
 
 #include "http_connection.hpp"
 #include "https_connection.hpp"
 #include "h2_connection.hpp"
 #include "iconnection.hpp"
-#include "utils/utils.hpp"
+#include "utils/time_util.hpp"
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/redirect_error.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <boost/beast/ssl.hpp>
 
 #include "error/aizix_error.hpp"
+#include "http/network_constants.hpp"
 
 // 命名空间和类型别名
 using namespace std::literals::chrono_literals;
 using results_type = boost::asio::ip::tcp::resolver::results_type;
-
+using boost::asio::experimental::awaitable_operators::operator||;
+using ConnectionResult = std::pair<std::shared_ptr<IConnection>, ProtocolKnowledge>;
 /**
  * @brief ConnectionManager 的构造函数。
  *        负责初始化 SSL 上下文、DNS 解析器，并根据配置启动后台维护任务。
@@ -33,15 +38,16 @@ ConnectionManager::ConnectionManager(boost::asio::io_context& ioc, const AizixCo
       strand_(ioc.get_executor()),
       ssl_ctx_(boost::asio::ssl::context::tls_client),
       resolver_(ioc),
-      connect_timeout_ms_(config.client.connect_timeout_ms),
+      connect_timeout_(config.client.connect_timeout_ms),
       http2_enabled_(config.client.http2_enabled),
       http2_max_concurrent_streams_(config.client.http2_max_concurrent_streams),
       maintenance_timer_(ioc),
-      maintenance_interval_ms_(config.client.maintenance_interval_ms),
-      idle_timeout_for_close_ms_(config.client.idle_timeout_for_close_ms),
-      idle_timeout_for_ping_ms_(config.client.idle_timeout_for_ping_ms),
+      maintenance_interval_(config.client.maintenance_interval_ms),
+      idle_timeout_for_close_(config.client.idle_timeout_for_close_ms),
+      idle_timeout_for_ping_(config.client.idle_timeout_for_ping_ms),
       max_h1_connections_per_host_(config.client.max_h1_connections_per_host),
-      max_h2_connections_per_host_(config.client.max_h2_connections_per_host) {
+      max_h2_connections_per_host_(config.client.max_h2_connections_per_host),
+      protocol_cache_ttl_(config.client.protocol_cache_ttl_ms) {
     // 配置 SSL/TLS 上下文，增强安全性。
     ssl_ctx_.set_options(network::ssl::CONTEXT_OPTIONS);
 
@@ -65,17 +71,10 @@ ConnectionManager::ConnectionManager(boost::asio::io_context& ioc, const AizixCo
     // 设置客户端 ALPN (Application-Layer Protocol Negotiation) 协议列表。
     // "h2" 优先于 "http/1.1"，让服务器在 TLS 握手期间选择最优协议。
     // 3. 确定并打印服务器将要提供的协议列表
-    const unsigned char* client_protos;
-    size_t client_protos_len;
-    if (config.client.http2_enabled) {
-        client_protos = network::alpn::PROTOS_H2_PREFERRED;
-        client_protos_len = sizeof(network::alpn::PROTOS_H2_PREFERRED);
-    } else {
-        client_protos = network::alpn::PROTOS_H1_ONLY;
-        client_protos_len = sizeof(network::alpn::PROTOS_H1_ONLY);
+    const std::span<const unsigned char> client_protos = network::alpn::get_alpn_protos(config.client.http2_enabled);
+    if (SSL_CTX_set_alpn_protos(ssl_ctx_.native_handle(), client_protos.data(), client_protos.size_bytes()) != 0) {
+        throw std::runtime_error("Failed to set ALPN protocols on SSL_CTX.");
     }
-
-    SSL_CTX_set_alpn_protos(ssl_ctx_.native_handle(), client_protos, client_protos_len);
 
     // 启动后台维护任务
     start_maintenance();
@@ -177,20 +176,33 @@ boost::asio::awaitable<PooledConnection> ConnectionManager::get_connection(const
 
         // 步骤 3: 池空且无创建任务，进行动态决策
         {
-            auto knowledge_it = hosts_protocol_.find(key);
-            const ProtocolKnowledge knowledge = (knowledge_it == hosts_protocol_.end()) ? ProtocolKnowledge::Unknown : knowledge_it->second;
+            ProtocolKnowledge knowledge = ProtocolKnowledge::Unknown;
+            auto iterator = hosts_protocol_.find(key);
+            // 检查主机的协议缓存是否有效
+            if (iterator != hosts_protocol_.end()) {
+                if (std::chrono::steady_clock::now() - iterator->second.last_updated > protocol_cache_ttl_) {
+                    // 缓存已过期，当作未知处理，并从 map 中移除
+                    SPDLOG_DEBUG("Protocol cache for host '{}' has expired. Re-probing.", key);
+                    hosts_protocol_.erase(iterator);
+                    knowledge = ProtocolKnowledge::Unknown;
+                } else {
+                    // 缓存有效
+                    knowledge = iterator->second.knowledge;
+                }
+            }
+
             bool should_auto_create = false;
             switch (knowledge) {
-            case ProtocolKnowledge::SupportsH2:
-                should_auto_create = true;
-                break;
-            case ProtocolKnowledge::RequiresH1:
-                should_auto_create = false;
-                break;
-            case ProtocolKnowledge::Unknown:
-                // 只有在配置允许 H2 且协议是 https 时，才进行乐观尝试
-                should_auto_create = (scheme == "https:" && http2_enabled_);
-                break;
+                case ProtocolKnowledge::SupportsH2:
+                    should_auto_create = true;
+                    break;
+                case ProtocolKnowledge::RequiresH1:
+                    should_auto_create = false;
+                    break;
+                case ProtocolKnowledge::Unknown:
+                    // 只有在配置允许 H2 且协议是 https 时，才进行乐观尝试
+                    should_auto_create = (scheme == "https:" && http2_enabled_);
+                    break;
             }
             if (!should_auto_create) {
                 // 决策为：不自动创建，交由调用者处理
@@ -331,7 +343,7 @@ void ConnectionManager::release_connection(const std::shared_ptr<IConnection>& c
             if (usable) {
                 //  H1 的归还池中...
                 self->pool_[key].push_back(conn); // 放回队尾，实现 LIFO/FIFO 策略
-                SPDLOG_DEBUG("将连接 [{}] {}存入连接池,当前连接 [{}] 的连接池大小: {}", conn->id(), key, pool_[key].back()->get_pool_key(), pool_[key].size());
+                //SPDLOG_DEBUG("将连接 [{}] {}存入连接池,当前连接 [{}] 的连接池大小: {}", conn->id(), key, pool_[key].back()->get_pool_key(), pool_[key].size());
                 return;
             }
             SPDLOG_DEBUG("[{}] {} 这个H1连接已经断开了不用归还直接丢弃 ", conn->id(), conn->get_pool_key());
@@ -454,19 +466,19 @@ void ConnectionManager::add_connection_to_pool_h2(const std::string& key, const 
  */
 boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_new_connection(const std::string& key, const std::string_view scheme, std::string_view host, const uint16_t port) {
     // 初始化变量
-    ProtocolKnowledge protocol = ProtocolKnowledge::Unknown; // 默认未知
+    ProtocolKnowledge protocol = ProtocolKnowledge::Unknown;
     std::shared_ptr<IConnection> new_conn = nullptr;
-    std::exception_ptr eptr = nullptr;
+    std::exception_ptr exception_ptr = nullptr;
 
     try {
         // 直接在 ioc_ 上创建定时器
         boost::asio::steady_timer timer(ioc_);
         // 1. 设置一个总的连接超时
         //    这涵盖了 DNS、TCP 和 TLS 握手的总和时间。
-        timer.expires_after(std::chrono::milliseconds(connect_timeout_ms_));
+        timer.expires_after(connect_timeout_);
 
         // 2. 使用 `||` 操作符，让连接创建逻辑与超时定时器进行“竞赛”。
-        const auto result = co_await ([&]() -> boost::asio::awaitable<std::shared_ptr<IConnection>> {
+        auto result = co_await ([this, key, scheme, host, port]() -> boost::asio::awaitable<ConnectionResult> {
                 // --- 操作A: 完整的连接创建逻辑，被封装在 lambda 协程中 ---
 
                 // 3. 异步 DNS 解析。
@@ -503,20 +515,19 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
                     const unsigned char* proto = nullptr;
                     unsigned int len = 0;
                     SSL_get0_alpn_selected(stream->native_handle(), &proto, &len);
+
                     if (proto && std::string_view(reinterpret_cast<const char*>(proto), len) == "h2") {
                         // 协商成功，创建 H2 连接。
                         SPDLOG_DEBUG("ALPN为 {} 选择了HTTP/2协议", host);
-                        auto conn = Http2Connection::create(stream, key, http2_max_concurrent_streams_, idle_timeout_for_close_ms_);
+                        auto conn = Http2Connection::create(stream, key, http2_max_concurrent_streams_, idle_timeout_for_close_);
 
                         // 等待 H2 握手完成。
                         co_await conn->run();
-                        protocol = ProtocolKnowledge::SupportsH2;
-                        co_return conn;
+                        co_return ConnectionResult{conn, ProtocolKnowledge::SupportsH2}; // co_return 一个包含连接和协议知识的 pair
                     } else {
                         // 协商失败或不支持，回退到 HTTPS/1.1。
                         SPDLOG_DEBUG("ALPN selected HTTP/1.1 for {}.", host);
-                        protocol = ProtocolKnowledge::RequiresH1;
-                        co_return std::make_shared<HttpsConnection>(stream, key);
+                        co_return ConnectionResult{std::make_shared<HttpsConnection>(stream, key), ProtocolKnowledge::RequiresH1}; // co_return 一个包含连接和协议知识的 pair
                     }
                 }
                 if (scheme == "http:") {
@@ -526,8 +537,8 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
 
                     co_await async_connect(socket, endpoints.begin(), endpoints.end(), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
                     if (ec) { throw boost::system::system_error(ec, "TCP connect failed"); }
-                    protocol = ProtocolKnowledge::RequiresH1;
-                    co_return std::make_shared<HttpConnection>(std::move(socket), key);
+
+                    co_return ConnectionResult{std::make_shared<HttpConnection>(std::move(socket), key), ProtocolKnowledge::RequiresH1};
                 }
                 // 确保所有路径都有出口
                 throw std::runtime_error("未知协议Http: '" + std::string(scheme) + "'. 仅支持 'http:' and 'https:' 协议");
@@ -536,7 +547,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
             // --- 操作B: 超时定时器 ---
             timer.async_wait(boost::asio::use_awaitable));
 
-        // 5. 检查是否建立连接超时了
+        // 5. 检查建立连接是否超时了
         if (result.index() == 1) {
             // .index() == 1 表示定时器获胜
             // 超时发生，抛出明确的超时异常。
@@ -547,27 +558,27 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> ConnectionManager::create_n
         // 必须取消仍在后台等待的定时器，以清理资源。
         timer.cancel();
 
-        // 6. 从 variant 中获取连接创建的结果（一个 shared_ptr）并返回。
-        new_conn = std::get<0>(result);
+        // 6. 从 variant 中解包出 ConnectionResult (即 std::pair)
+        const auto [conn_ptr, proto_knowledge] = std::get<0>(result); // 使用 C++17 结构化绑定
+        new_conn = conn_ptr;
+        protocol = proto_knowledge;
     } catch (...) {
-        eptr = std::current_exception(); // 保存原始异常
+        exception_ptr = std::current_exception(); // 保存原始异常
     }
 
     // --- 无论成功或失败，都回到 strand 安全地更新状态 ---
     co_await boost::asio::post(strand_, boost::asio::use_awaitable);
 
     // --- 检查结果，重新抛出异常或返回连接 ---
-    if (eptr) {
+    if (exception_ptr) {
         SPDLOG_ERROR("Failed to create new connection to {}", key);
-        // 网络 I/O 阶段就失败了。在这里选择连接的协议
-        // 一个合理的策略是，如果失败，我们清除知识，以便下次重试。
-        hosts_protocol_.erase(key); // 安全地清除可能已过时的知识
-
-        std::rethrow_exception(eptr); // 如果我们捕获了异常，就在这里重新抛出它
+        // 网络连接失败了
+        // 合理的策略是，清除host的旧协议，以便下次重试。
+        hosts_protocol_.erase(key);            // 安全地清除可能已过时的host 协议
+        std::rethrow_exception(exception_ptr); // 既然捕获了异常，就在这里重新抛出它
     }
-
-
-    hosts_protocol_[key] = protocol;
+    // 连接成功
+    hosts_protocol_[key] = {protocol, std::chrono::steady_clock::now()};
     co_return new_conn;
 }
 
@@ -585,7 +596,7 @@ void ConnectionManager::start_maintenance() {
 boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
     while (!stopped_) {
         // 1. 设置下一次维护的定时器
-        maintenance_timer_.expires_after(std::chrono::milliseconds(maintenance_interval_ms_));
+        maintenance_timer_.expires_after(maintenance_interval_);
         boost::system::error_code ec;
 
 
@@ -601,7 +612,7 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
 
         if (!pool_.empty() || !h2_pool_.empty()) {
             // SPDLOG_DEBUG("开始维护连接池...");
-            const auto now = time_utils::steady_clock_ms_since_epoch();
+            const auto now = std::chrono::steady_clock::now();
             // 4. 维护所有的 HTTP/1.1 连接池
             //    使用 C++20 的 ranges::views::values 可以优雅地只遍历 map 中的值（即 deque）。
             for (auto& [key, queue] : pool_) {
@@ -624,7 +635,7 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
                     }
 
                     // 规则3：连接空闲时间过长，启动关闭流程
-                    else if (now - conn->get_last_used_timestamp_ms() > idle_timeout_for_close_ms_) {
+                    else if (now - conn->get_last_used_timestamp_ms() > idle_timeout_for_close_ && conn->get_active_streams() < 1) {
                         SPDLOG_DEBUG("关闭闲置时间过长的连接 {}", conn->id());
                         boost::asio::co_spawn(
                             strand_,
@@ -637,7 +648,7 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
                     }
 
                     // 规则4：连接需要 Ping 保活
-                    else if (now - conn->get_ping_used_timestamp_ms() > idle_timeout_for_ping_ms_) {
+                    else if (now - conn->get_ping_used_timestamp_ms() > idle_timeout_for_ping_) {
                         //SPDLOG_DEBUG("对空闲连接 {} 发送 PING 保活，暂时将其移出池。", conn->id());
                         // 将连接的所有权完全移交给后台任务
                         boost::asio::co_spawn(
@@ -716,7 +727,7 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
                         continue; // 直接丢弃
                     }
 
-                    if (now - conn->get_last_used_timestamp_ms() > idle_timeout_for_close_ms_) {
+                    if (now - conn->get_last_used_timestamp_ms() > idle_timeout_for_close_ && conn->get_active_streams() < 1) {
                         SPDLOG_DEBUG("关闭闲置时间过长的H2连接 {}", conn->id());
                         boost::asio::co_spawn(
                             strand_,
@@ -725,18 +736,18 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
                             },
                             boost::asio::detached
                         );
-                    } else if (now - conn->get_ping_used_timestamp_ms() > idle_timeout_for_ping_ms_) {
-                        SPDLOG_DEBUG("对空闲H2连接 {} 发送 PING 保活", conn->id());
+                    } else if (now - conn->get_ping_used_timestamp_ms() > idle_timeout_for_ping_) {
+                        //SPDLOG_DEBUG("对空闲H2连接 {} 发送 PING 保活", conn->id());
                         // 同样，应该异步执行 PING，避免阻塞 strand
                         boost::asio::co_spawn(
                             ioc_,
                             [self = shared_from_this(), conn_to_ping = conn]() -> boost::asio::awaitable<void> {
                                 if (!co_await conn_to_ping->ping()) {
-                                    SPDLOG_WARN("H2连接 {} PING 失败，将予以关闭.", conn_to_ping->id());
+                                    //SPDLOG_WARN("H2连接 {} PING 失败，将予以关闭.", conn_to_ping->id());
                                     co_await conn_to_ping->close();
                                 } else {
                                     co_await post(self->strand_, boost::asio::use_awaitable);
-                                    SPDLOG_DEBUG("H2连接 {} PING 成功，归还到连接池。", conn_to_ping->id());
+                                    //SPDLOG_DEBUG("H2连接 {} PING 成功，归还到连接池。", conn_to_ping->id());
                                     self->h2_pool_[conn_to_ping->get_pool_key()].push_back(conn_to_ping);
                                 }
                             },
@@ -797,6 +808,31 @@ boost::asio::awaitable<void> ConnectionManager::run_maintenance() {
             std::erase_if(h2_pool_, [](const auto& item) {
                 return item.second.empty();
             });
+
+
+            // --- 清理主机的协议缓存 ---
+
+            // 1. 获取当前时间，只调用一次以提高效率
+            const auto now_steady = std::chrono::steady_clock::now();
+
+            // 2. 调用 std::erase_if，它会遍历 map 中的每个元素
+            std::erase_if(hosts_protocol_,
+                          // 3. 这是一个 lambda 表达式，作为“删除条件”
+                          [&](const auto& item) -> bool {
+                              // 4. 使用结构化绑定，从 item (一个 pair) 中解构出 key 和 info
+                              const auto& [key, info] = item;
+                              // 5. 计算缓存条目的“年龄”
+                              auto age = now_steady - info.last_updated;
+                              // 6. 判断年龄是否超过了设定的 TTL (Time-To-Live)
+                              if (age > protocol_cache_ttl_) {
+                                  // 7. 如果超过，返回 true，告诉 std::erase_if：“请删除这个元素”
+                                  SPDLOG_DEBUG("Pruning expired protocol cache for host '{}'.", key);
+                                  return true;
+                              }
+                              // 8. 如果没超过，返回 false，告诉 std::erase_if：“请保留这个元素”
+                              return false;
+                          }
+            );
         }
     }
 }

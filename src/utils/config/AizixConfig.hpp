@@ -9,7 +9,6 @@
 #include <vector>
 #include <optional>
 #include <cstdint> // For specific integer types like uint16_t, uint32_t
-#include <thread>
 #include <unordered_map>
 
 // ------------------------------------------------
@@ -67,7 +66,7 @@ struct ServerConfig {
     /// 专门用于执行CPU耗时计算的线程数. 默认值：总核心数减I/O的线程数，当只有一个核心的时候此值默认为1
     uint16_t worker_threads = 0;
     /// keep alive超时时间. 默认值：180000ms(3分钟)
-    uint32_t keep_alive_ms = 180000;
+    size_t keep_alive_ms = 180000;
     /// 请求体最大大小. 默认值：1048576 bytes(1MB)
     uint32_t max_request_size_bytes = 1024 * 1024;
     /// http server ssl配置
@@ -85,23 +84,28 @@ struct ClientConfig {
     /// 最大重定向次数.默认3，(0则关闭重定向)
     uint8_t max_redirects = 3;
     /// 连接建立超时TCP + TLS 握手阶段的最大等待时间，默认值：1500ms
-    uint32_t connect_timeout_ms = 1500;
+    size_t connect_timeout_ms = 1500;
+    /// @brief 主机的协议缓存有效时间（毫秒）。
+    /// 缓存的协议信息（如主机支持H2或H1.1）超过此时间后将被视为过期，
+    /// 以便客户端能够适应服务器配置的变化。
+    /// 默认值：1800000 (30分钟)
+    size_t protocol_cache_ttl_ms = 1800000;
     /// 连接池维护间隔，默认值：5,000 ms (5秒)
     /// @note 必须是三个值中最小的。这个值决定了你的维护操作的“精度”或“反应时间”。<br>
     /// <br>举个例子：如果一个连接在 T=0 时变为空闲，你的 ping 阈值是15秒。如果巡逻间隔是5秒，那么巡逻队会在 T=5, T=10, T=15 时过来检查。在 T=15 这次检查时，它会发现 15 - 0 >= 15，于是触发 PING。实际的 PING 时间在15秒到20秒之间，这是完全可以接受的。<br>
     /// 如果巡逻间隔太长，比如10秒，那么 PING 可能会在15秒到25秒之间才被触发，精度就变差了。<br>
     /// 如果巡逻间隔太短，比如100毫秒，那么会频繁唤醒协程，即使什么都不需要做，也会带来微小的CPU开销。5秒是一个非常经典的折中值，既保证了足够的响应速度，又不会给系统带来负担。<br>
-    uint32_t maintenance_interval_ms = 5000;
+    size_t maintenance_interval_ms = 5000;
     /// 空闲连接关闭时间 控制连接在无活动时多久关闭，默认值：300,000ms(5分钟)
     /// @note 必须留出安全边际小于服务器的keep alive时间！ 客户端和服务器之间可能存在网络延迟、时钟不完全同步等问题。<br>
     ///       如果客户端在第59.9秒时认为连接是好的，并发起一个请求，但服务器恰好在第60秒关闭了连接，请求就会失败（通常是 "Connection reset by peer" 错误）。
-    uint32_t idle_timeout_for_close_ms = 3000000;
+    size_t idle_timeout_for_close_ms = 300000;
     /// PING 这个值决定了客户端在连接空闲多久后，会主动发送一个 PING帧或者head请求来确认连接是否还活着。默认值：15,000 ms (15秒)
     /// @note 必须远小于 idle_timeout_for_close_ms_ 。PING 的目的是为了“保活”和“探测”，它必须在连接被判定为“太老该关闭”之前发生。15秒远小于45秒，逻辑上是正确的。<br>
     ///       可以对抗网络中间设备（NAT/防火墙）。很多网络设备会对空闲的TCP连接进行超时清理，这个超时时间通常在30-300秒之间。每15秒发送一次 PING，对于绝大多数网络环境来说，都足以刷新这些设备的超时计时器，让连接“看起来”一直很活跃，从而避免被意外断开。
-    uint32_t idle_timeout_for_ping_ms = 15000;
+    size_t idle_timeout_for_ping_ms = 15000;
     /// 单个个HTTP1.1 Host的最大连接池大小 ，默认值：100
-    uint32_t max_h1_connections_per_host = 100;
+    size_t max_h1_connections_per_host = 100;
     //// 单个个HTTP2 Host的最大连接池大小，默认值：100
     uint32_t max_h2_connections_per_host = 100;
     /// HTTP2初始最大并发流数	控制每个连接允许的最大并发请求数（默认值 100）
@@ -146,7 +150,7 @@ struct PostgresConfig {
     std::string password;
     std::string database = "postgres";
     /// 获取连接超时时间. 默认值：5000ms
-    uint16_t connection_timeout_ms = 5000;
+    size_t connection_timeout_ms = 5000;
 
     std::optional<PostgresSslConfig> ssl;
     std::optional<PostgresPoolConfig> pool;
@@ -168,7 +172,7 @@ struct RedisPoolConfig {
     /// 最小连接数. 默认值：1
     uint16_t min_connections = 1;
     /// 空闲连接超时时间. 默认值：30000ms
-    uint16_t idle_timeout_ms = 30000;
+    size_t idle_timeout_ms = 30000;
 
 };
 
@@ -181,7 +185,7 @@ struct RedisConfig {
     uint16_t database = 0;
     std::string password;
     /// 获取连接超时时间. 默认值：5000ms
-    uint16_t connection_timeout_ms = 5000;
+    size_t connection_timeout_ms = 5000;
 
     std::optional<RedisPoolConfig> pool;
     std::optional<RedisSslConfig> ssl;
@@ -203,7 +207,7 @@ struct ClickhousePoolConfig {
     /// 最小连接数. 默认值：1
     uint16_t min_connections = 1;
     /// 空闲连接超时时间. 默认值：30000ms
-    uint16_t idle_timeout_ms = 30000;
+    size_t idle_timeout_ms = 30000;
 
 };
 
@@ -217,7 +221,7 @@ struct ClickhouseConfig {
     std::string user;
     std::string password;
     /// 获取连接超时时间. 默认值：5000ms
-    uint16_t connection_timeout_ms = 5000;
+    size_t connection_timeout_ms = 5000;
 
     std::optional<ClickhouseSslConfig> ssl;
     std::optional<ClickhousePoolConfig> pool;

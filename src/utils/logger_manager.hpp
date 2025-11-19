@@ -13,10 +13,11 @@
 #include <spdlog/sinks/null_sink.h>
 #include <chrono>               // std::chrono::seconds 等时间单位
 #include "config/AizixConfig.hpp"
-#include "spdlog/sinks/rotating_file_sink.h"
+#include <spdlog/sinks/rotating_file_sink.h>
 
 
-
+using namespace std::literals::chrono_literals;
+using namespace std::chrono_literals;
 class LoggerManager {
 public:
 
@@ -76,7 +77,11 @@ public:
 
 
         // 6. 设置通用配置 (格式、刷写策略等)
-        spdlog::flush_every(std::chrono::seconds(5));   // 每 5 秒
+        using namespace std::chrono;
+
+        // 假设 interval 是一个 std::chrono::duration 类型，
+        // 比如我们定义它为存储秒数的 duration：
+        spdlog::flush_every(10s);   // 每 5 秒
         spdlog::flush_on(spdlog::level::err);
         spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e %z] [thread %t] [%s:%#] [%^%l%$] %v");
 

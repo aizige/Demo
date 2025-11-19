@@ -33,14 +33,17 @@ tls_versions  = ["TLSv1.3", "TLSv1.2"]                        # 服务端Tls版�
 
 
 [client]
-http2_enabled = false  # 启用HTTP2客户端(启用后对于Https连接，优先使用H2协议发起请求)
+http2_enabled = true  # 启用HTTP2客户端(启用后对于Https连接，优先使用H2协议发起请求)
 ssl_verify = false     # false 表示跳过证书验证，仅用于测试环境
 max_redirects_ = 3    # 最大重定向次数.默认3，(≤ 0则关闭重定向)
 connect_timeout_ms = 1500        # 连接建立超时	TCP + TLS 握手阶段的最大等待时间（如 1500ms）
-idle_timeout_for_close_ms = 300000 # 空闲连接关闭时间 控制连接在无活动时多久关闭（如5分钟 300000ms ）
+protocol_cache_ttl_ms = 1800000   # 主机的协议缓存有效时间（毫秒）。默认值：1800000ms (30分钟)
+idle_timeout_for_close_ms = 60000 # 空闲连接关闭时间 控制连接在无活动时多久关闭（如5分钟 300,000ms ）
 idle_timeout_for_ping_ms = 20000         # PING 保活间隔	定期发送 PING 帧检测连接是否挂起（如 20000ms）
+
 max_h1_connections_per_host = 100  # 单个个HTTP1.1 Host的最大连接池大小
 max_h2_connections_per_host = 20  # 单个个HTTP2 Host的最大连接池大小
+
 
 http2_max_concurrent_streams = 100 # 最大并发流数	控制每个连接允许的最大并发请求数（如 100），这个一般是设置服务器 SETTINGS 帧中获取的值
 

@@ -264,6 +264,7 @@ ClientConfig ConfigLoader::parse_client(const toml::table& client_tb) {
         cfg.ssl_verify = (*client_tbl)["ssl_verify"].value_or(cfg.ssl_verify);
         cfg.max_redirects = (*client_tbl)["max_redirects"].value_or(cfg.max_redirects);
         cfg.connect_timeout_ms = (*client_tbl)["connect_timeout_ms"].value_or(cfg.connect_timeout_ms);
+        cfg.protocol_cache_ttl_ms = (*client_tbl)["protocol_cache_ttl_ms"].value_or(cfg.protocol_cache_ttl_ms);
         cfg.idle_timeout_for_close_ms = (*client_tbl)["idle_timeout_for_close_ms"].value_or(cfg.idle_timeout_for_close_ms);
         cfg.idle_timeout_for_ping_ms = (*client_tbl)["idle_timeout_for_ping_ms"].value_or(cfg.idle_timeout_for_ping_ms);
         cfg.max_h1_connections_per_host = (*client_tbl)["max_h1_connections_per_host"].value_or(cfg.max_h1_connections_per_host);

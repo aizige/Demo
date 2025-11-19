@@ -5,7 +5,7 @@
 #ifndef WEBSOCKET_CONNECTION_HPP
 #define WEBSOCKET_CONNECTION_HPP
 #include "http/http_common_types.hpp"
-#include "utils/utils.hpp"
+#include "utils/time_util.hpp"
 #include "iwebsocket_client_handler.hpp"
 #include <boost/beast/websocket.hpp>
 #include <boost/asio/experimental/channel.hpp>
