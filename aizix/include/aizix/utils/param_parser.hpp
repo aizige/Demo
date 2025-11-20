@@ -1,0 +1,72 @@
+//
+// Created by Aiziboy on 2025/10/11.
+//
+
+#ifndef AIZIX_PARAM_PARSER_HPP
+#define AIZIX_PARAM_PARSER_HPP
+
+#include <charconv>
+#include <optional>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <algorithm> // for std::equal
+#include <string>    // for std::string conversion
+#include <chrono>
+#include <sstream>
+namespace param_parser {
+
+    // 不区分大小写的string_view比较）
+    inline bool isEquals(std::string_view a, std::string_view b) {
+        return std::equal(a.begin(), a.end(),
+                          b.begin(), b.end(),
+                          [](char a, char b) {
+                              return std::tolower(static_cast<unsigned char>(a)) ==
+                                     std::tolower(static_cast<unsigned char>(b));
+                          });
+    }
+
+    template<typename T>
+    std::optional<T> tryParse(std::string_view sv) {
+        // 对于数字类型整数和浮点（所有的“算术类型”）
+        if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, char>) {
+            T value;
+            auto result = std::from_chars(sv.data(), sv.data() + sv.size(), value);
+            if (result.ec == std::errc() && result.ptr == sv.data() + sv.size()) {
+                return value;
+            }
+        }
+        // 对于 bool
+        else if constexpr (std::is_same_v<T, bool>) {
+            if (isEquals(sv, "true") || sv == "1") return true;
+            if (isEquals(sv, "false") || sv == "0") return false;
+        }
+        // 对于 std::string （创建副本）
+        else if constexpr (std::is_same_v<T, std::string>) {
+            return std::string{sv};
+        }
+        // 对于 std::string_view 直接返回
+        else if constexpr (std::is_same_v<T, std::string_view>) {
+            return sv;
+        }
+        // 对于时间类型（如 "2025-10-11T10:00:00Z"）
+        // 例如：ctx.query_param_as<std::chrono::system_clock::time_point>("start_time")
+        else if constexpr (std::is_same_v<T, std::chrono::system_clock::time_point>) {
+            std::chrono::system_clock::time_point tp;
+            // 注意：from_stream 需要一个 null 结尾的字符串，所以这里有开销
+            std::string temp_str{sv};
+            std::stringstream ss{temp_str};
+            ss >> std::chrono::parse("%FT%TZ", tp); // 解析 ISO 8601 格式
+            if (!ss.fail()) {
+                return tp;
+            }
+        }
+
+        // All other types fail to parse
+        return std::nullopt;
+    }
+
+} // namespace utils
+
+
+#endif //AIZIX_PARAM_PARSER_HPP
