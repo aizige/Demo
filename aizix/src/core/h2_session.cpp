@@ -11,20 +11,17 @@
 #include <boost/asio/experimental/parallel_group.hpp> // 引入 parallel_group，一个更强大的并行操作工具（在此代码中未直接使用，但包含进来）
 
 
-
-
 /// @brief Http2Session 构造函数
-Http2Session::Http2Session(StreamPtr stream, boost::asio::any_io_executor work_executor, Router& router, size_t max_request_body_size_bytes, const std::chrono::milliseconds keep_alive_timeout)
+Http2Session::Http2Session(StreamPtr stream, boost::asio::any_io_executor work_executor, Router& router, const size_t max_request_body_size_bytes, const std::chrono::milliseconds keep_alive_timeout)
     : stream_(std::move(stream)), // 移动语义，接管 SSL 流的所有权
       work_executor_(std::move(work_executor)),
-      router_(router), // 保存对路由器的引用
+      router_(router),                  // 保存对路由器的引用
       strand_(stream_->get_executor()), // 从流中获取执行器并构造一个 strand，保证所有异步操作都在此 strand 上串行执行，确保线程安全
-      session_(nullptr), // 初始化 nghttp2 会话指针为空，将在 init_session() 中创建
+      session_(nullptr),                // 初始化 nghttp2 会话指针为空，将在 init_session() 中创建
       idle_timer_(strand_),
       max_request_body_size_bytes_(max_request_body_size_bytes), // 在同一个 strand 上构造空闲计时器
       keep_alive_ms_(keep_alive_timeout),
-      write_trigger_(strand_), // 在同一个 strand 上构造写触发器
-      dispatch_channel_(strand_) // 在同一个 strand 上构造分发通道
+      write_trigger_(strand_)  // 在同一个 strand 上构造写触发器
 {
     // 初始化时，将两个定时器都设置为永不超时。
     // idle_timer_ 将在连接变为空闲时被重置。
@@ -69,7 +66,9 @@ boost::asio::awaitable<void> Http2Session::start() {
         // 使用 '&&' 操作符并行运行几个核心循环协程。
         // 这个操作会等待所有协程都完成。如果任何一个协程因异常或正常原因退出，
         // 其他协程将会被自动取消，从而优雅地结束整个 session。
-        co_await (session_loop() && dispatcher_loop() && writer_loop() && idle_timer_loop());
+       // co_await (session_loop() && dispatcher_loop() && writer_loop() && idle_timer_loop());
+        co_await (session_loop() || writer_loop() || idle_timer_loop());
+        SPDLOG_INFO("H2 Session 结束");
     } catch (const std::exception& e) {
         // 捕获任何未处理的异常，记录日志
         SPDLOG_DEBUG("H2 session ended: {}", e.what());
@@ -93,8 +92,10 @@ boost::asio::awaitable<void> Http2Session::do_write() {
             }
 
             if (len > 0) {
+                SPDLOG_TRACE("H2: 正在发送 {} 字节数据...", len);
                 // 如果有数据，则通过 asio 异步写入到 SSL 流
                 co_await boost::asio::async_write(*stream_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
+                SPDLOG_TRACE("H2: 发送完成");
             }
         }
     } catch (const std::exception& e) {
@@ -132,23 +133,32 @@ boost::asio::awaitable<void> Http2Session::writer_loop() {
     try {
         // 只要连接处于打开状态，就一直循环
         while (stream_->next_layer().is_open()) {
-            boost::system::error_code ec;
-            // 挂起协程，等待被 schedule_write() 唤醒。
-            co_await write_trigger_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
 
-            // 如果等待被取消 (ec == operation_aborted)，这是正常唤醒，继续执行。
-            // 如果是其他错误，则退出循环。
-            if (ec && ec != boost::asio::error::operation_aborted) break;
-            // 再次检查连接状态
-            if (!stream_->next_layer().is_open()) break;
+            // 先检查有没有数据要写！
+            // 如果 nghttp2 已经有数据（比如刚启动时的 SETTINGS 帧），直接去写，别睡！
+            if (!session_ || !nghttp2_session_want_write(session_)) {
+                boost::system::error_code ec;
 
+                // 只有真的没数据写了，才挂起等待挂起协程，等待被 schedule_write() 唤醒。
+                // 重置定时器为永不超时
+                write_trigger_.expires_at(std::chrono::steady_clock::time_point::max());
 
+                co_await write_trigger_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+
+                // 如果等待被取消 (ec == operation_aborted)，说明是被 schedule_write 唤醒的 这是正常唤醒，继续执行。
+                // 如果是其他错误，则退出循环。
+                if (ec && ec != boost::asio::error::operation_aborted) break;
+                // 再次检查连接状态
+                if (!stream_->next_layer().is_open()) break;
+            }
+
+            // --- 下面是写逻辑 ---
             if (write_in_progress_) continue; // 防止重入
             write_in_progress_ = true;
             // 使用互斥标志和 RAII guard 确保同一时间只有一个 do_write 循环在运行。确保在协程退出时（无论是正常还是异常）都能重置标志位
             auto guard = Finally([this] { write_in_progress_ = false; });
 
-            // ** "清空队列" 循环**
+            // 清空队列 循环
             // 一旦被唤醒，就持续写，直到 nghttp2 的发送缓冲区被清空。
             // 这可以减少 writer_loop 被唤醒的次数，提高效率。
             while (session_ && nghttp2_session_want_write(session_)) {
@@ -173,6 +183,8 @@ boost::asio::awaitable<void> Http2Session::writer_loop() {
 
 /// @brief 会话/读取循环协程
 boost::asio::awaitable<void> Http2Session::session_loop() {
+    SPDLOG_INFO("H2: session_loop 启动");
+
     // 确保当前协程在 strand 上下文中执行
     co_await boost::asio::dispatch(strand_, boost::asio::use_awaitable);
     init_session(); // 初始化 nghttp2
@@ -185,6 +197,8 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
     std::array<char, 8192> buf{}; // 读缓冲区
     try {
         while (stream_->next_layer().is_open()) {
+            SPDLOG_TRACE("H2: 正在读取数据...");
+
             auto [ec, n] = co_await stream_->async_read_some(
                 boost::asio::buffer(buf),
                 boost::asio::as_tuple(boost::asio::use_awaitable)
@@ -192,11 +206,14 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
 
             // EOF 或 stream_truncated 是客户端正常关闭，不视为错误。
             if (ec) {
+                SPDLOG_WARN("H2: 读取失败/结束: {}", ec.message());
                 if (ec != boost::asio::error::eof && ec != boost::asio::ssl::error::stream_truncated) {
                     SPDLOG_DEBUG("read error: {} (value: {}, category: {})", ec.message(), ec.value(), ec.category().name());
                 }
                 break; // 退出 循环
             }
+
+            SPDLOG_TRACE("H2: 读到 {} 字节，喂给 nghttp2", n);
 
             // 将从 socket 读取到的数据喂给 nghttp2 引擎进行协议解析
             if (const ssize_t rv = nghttp2_session_mem_recv(session_, reinterpret_cast<const uint8_t*>(buf.data()), n); rv < 0) {
@@ -208,35 +225,13 @@ boost::asio::awaitable<void> Http2Session::session_loop() {
             schedule_write();
         }
     } catch (const std::exception& e) {
-        SPDLOG_ERROR("Exception in H2 session_loop [{}]: {}", remote_endpoint().address().to_string(), e.what());
+        SPDLOG_ERROR("H2: session_loop 异常 [{}]: {}", remote_endpoint().address().to_string(), e.what());
     }
-    // 循环结束后，关闭分发通道，通知 dispatcher_loop 退出。
-    dispatch_channel_.close();
     // 同时取消任何可能在等待的空闲计时器。
     idle_timer_.cancel();
 }
 
 
-/// @brief 分发循环协程
-boost::asio::awaitable<void> Http2Session::dispatcher_loop() {
-    for (;;) {
-        // 异步地从 channel 接收一个 stream_id。这里会一直阻塞直到有数据或 channel 关闭。
-        auto [ec, stream_id] = co_await dispatch_channel_.async_receive(boost::asio::as_tuple(boost::asio::use_awaitable));
-        // Channel 已关闭（通常由 session_loop 退出时关闭），意味着会话结束，我们也应该退出。
-        if (ec) break;
-
-        // 收到一个新请求，活跃流计数 +1
-        if (++active_streams_ == 1) {
-            // 如果连接从空闲变为繁忙 (0 -> 1)，取消空闲计时器
-            idle_timer_.cancel();
-        }
-
-        // 对于每个接收到的 stream_id，co_spawn 一个独立的协程来处理它。
-        // 这使得请求处理可以并行化，而不会阻塞 dispatcher_loop 接收下一个请求。
-        // boost::asio::detached 表示我们不关心这个新协程的完成或返回值。
-        boost::asio::co_spawn(strand_, dispatch(stream_id), boost::asio::detached);
-    }
-}
 
 /// @brief 处理单个请求的协程
 boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
@@ -278,13 +273,13 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
         }
     }
     req.body() = std::move(stream_ctx.body); // 移动请求体
-    req.prepare_payload(); // 计算 Content-Length 等
+    req.prepare_payload();                   // 计算 Content-Length 等
     // --- 路由和处理 ---
-    RouteMatch match = router_.dispatch(req.method(), req.target());
-    RequestContext ctx(std::move(req), std::move(match.path_params));
+    auto [handler, path_params] = router_.dispatch(req.method(), req.target());
+    RequestContext ctx(std::move(req), std::move(path_params), remote_endpoint().address().to_string());
     try {
         // 调用匹配到的业务逻辑处理函数
-        co_await match.handler(ctx);
+        co_await handler(ctx);
     } catch (const std::exception& e) {
         // 捕获业务逻辑中的异常，并返回一个 500 错误
         SPDLOG_ERROR("Exception in H2 handler for [{}]: {}", ctx.request().target(), e.what());
@@ -293,7 +288,7 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
     // --- 准备并提交响应 ---
     auto& resp = ctx.response();
     co_await ctx.compressIfAcceptable(work_executor_); // 压缩响应体
-    resp.prepare_payload(); // 准备响应，计算 Content-Length
+    resp.prepare_payload();                            // 准备响应，计算 Content-Length
     // 将 Beast HTTP 响应头转换为 nghttp2 的 nghttp2_nv 格式
     std::vector<nghttp2_nv> headers;
     std::string status_code = std::to_string(resp.result_int());
@@ -338,14 +333,22 @@ boost::asio::awaitable<void> Http2Session::dispatch(int32_t stream_id) {
 /// @brief nghttp2 回调：当一个完整的帧被接收时调用
 int Http2Session::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
     auto* self = static_cast<Http2Session*>(user_data);
-    int32_t sid = frame->hd.stream_id;
+
     // 我们只关心带有 END_STREAM 标志的 HEADERS 或 DATA 帧，因为它代表一个请求的接收已完成
-    if (sid != 0 && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-        // 确保这个流的上下文还存在（可能之前已因错误关闭）
+    if (int32_t sid = frame->hd.stream_id; sid != 0 && frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
         if (self->streams_.count(sid) > 0) {
-            // 通过 channel 将 stream_id 发送给 dispatcher_loop 进行处理。
-            // try_send 是非阻塞的，对于 Asio channel 来说通常是安全的。
-            self->dispatch_channel_.try_send(boost::system::error_code{}, sid);
+            SPDLOG_TRACE("H2: 收到完整请求 Stream ID: {}, 直接启动 Dispatch...", sid);
+
+            // [修改] 直接 co_spawn 启动业务处理协程
+            // 因为我们已经在 strand 里了，这会把任务加到 strand 队列尾部，稍后执行
+            boost::asio::co_spawn(
+                self->strand_,
+                [self, sid]() -> boost::asio::awaitable<void> {
+                    // 这里的 self 是 shared_ptr，保证 session 活着
+                    co_await self->dispatch(sid);
+                },
+                boost::asio::detached
+            );
         }
     }
     return 0; // 返回 0 表示成功
@@ -362,19 +365,18 @@ int Http2Session::on_header_callback(nghttp2_session*, const nghttp2_frame* fram
     std::string name_str(reinterpret_cast<const char*>(name), name_len);
     std::string value_str(reinterpret_cast<const char*>(value), value_len);
 
-    // 2. 使用 post 将状态修改调度到 strand 上。
-    // 这对于多线程 io_context 是绝对安全的。
-    boost::asio::post(self->strand_, [self, sid, n = std::move(name_str), v = std::move(value_str)]() {
+
         // 在收到第一个 header 时，就认为新流开始了
         if (!self->streams_.contains(sid)) {
             // 是新流，为它创建上下文
             self->streams_[sid] = {};
         }
 
-        // 获取流的上下文并添加 header
-        // 我们在这里用 .at() 是安全的，因为我们刚确保了它存在
-        self->streams_.at(sid).headers.emplace_back(n, v);
-    });
+
+    // 安全地直接插入
+    self->streams_[sid].headers.emplace_back(std::move(name_str), std::move(value_str));
+
+
     return 0;
 }
 

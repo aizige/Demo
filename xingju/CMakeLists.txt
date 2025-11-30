@@ -7,20 +7,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(spdlog REQUIRED)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
-
-add_executable(xingju src/main.cpp
+add_executable(xingju
+        src/main.cpp
         src/controller/user_controller.cpp
-        src/controller/user_service.cpp)
+        src/controller/user_service.cpp
+        src/controller/XingjuController.cpp
+        src/ServiceInstanceManager.cpp
+        src/error/xingju_error.hpp
+)
 
-
-target_include_directories(xingju PRIVATE ${PROJECT_SOURCE_DIR}/src)
-
-target_link_libraries(xingju PRIVATE aizix)
+target_include_directories(xingju PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
 
 target_link_libraries(xingju PRIVATE
+        aizix
         spdlog::spdlog
 )
 

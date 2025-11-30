@@ -10,14 +10,15 @@
 #include <cstdlib>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>
-
+#include <boost/json/serialize.hpp>
 
 
 // --- 构造函数实现 ---
 
-RequestContext::RequestContext(HttpRequest req, PathParams params)
+RequestContext::RequestContext(HttpRequest req, PathParams params, std::string ip)
     : request_(std::move(req)),
-      path_params_(std::move(params)) {
+      path_params_(std::move(params)),
+      ip_(std::move(ip)) {
     // 在构造时，可以为 response 对象设置一些通用的默认值
     // response_.version(request_.version());
     response_.keep_alive(request_.keep_alive());
@@ -40,7 +41,7 @@ std::optional<std::string_view> RequestContext::pathParam(std::string_view key) 
 
 std::optional<std::string_view> RequestContext::queryParam(std::string_view key) const {
     parseQueryIfNeeded(); // 确保已解析
-    auto it = queryParams_.find(key);
+    const auto it = queryParams_.find(key);
     if (it != queryParams_.end() && !it->second.empty()) {
         return it->second.front(); // 返回第一个值
     }
@@ -48,11 +49,10 @@ std::optional<std::string_view> RequestContext::queryParam(std::string_view key)
 }
 
 
-std::vector<std::string_view> RequestContext::queryParamList(std::string_view key) const {
+std::vector<std::string_view> RequestContext::queryParamList(const std::string_view key) const {
     parseQueryIfNeeded(); // 确保已解析
 
-    auto it = queryParams_.find(key);
-    if (it != queryParams_.end()) {
+    if (const auto it = queryParams_.find(key); it != queryParams_.end()) {
         return it->second; // 返回所有值
     }
     return {}; // 空 vector
@@ -77,18 +77,28 @@ void RequestContext::string(const http::status status, const std::string_view bo
     response_.body() = body;
 }
 
-/*void RequestContext::json(http::status status, const nlohmann::json& j) {
+void RequestContext::string(const http::status status, const std::string_view body) {
     response_.result(status);
-    response_.set(http::field::content_type, "application/json");
-    response_.body() = j.dump(); // nlohmann::json::dump() 返回 std::string
-    compressIfAcceptable();
+    response_.set(http::field::content_type, "text/plain; charset=utf-8");
+    response_.body() = body;
+}
 
-}*/
+void RequestContext::string(const std::string_view body) {
+    response_.result(http::status::ok);
+    response_.set(http::field::content_type, "text/plain; charset=utf-8");
+    response_.body() = body;
+}
 
-void RequestContext::json(http::status status, std::string_view json) {
+void RequestContext::json(const http::status status, const boost::json::value& json) {
     response_.result(status);
-    response_.set(http::field::content_type, "application/json;charset=UTF-8");
-    response_.body() = json;
+    response_.set(http::field::content_type, "application/json; charset=utf-8");
+    response_.body() = boost::json::serialize(json);
+}
+
+void RequestContext::json(const boost::json::value& json) {
+    response_.result(http::status::ok);
+    response_.set(http::field::content_type, "application/json; charset=utf-8");
+    response_.body() = boost::json::serialize(json);
 }
 
 
@@ -97,11 +107,10 @@ void RequestContext::json(http::status status, std::string_view json) {
 void RequestContext::parseQueryIfNeeded() const {
     if (queryParamsParsed_) return;
 
-    // 标记为已解析，即使没有查询参数也只执行一次
-    queryParamsParsed_ = true;
 
-    std::string_view target = request_.target();
-    auto pos = target.find('?');
+
+    const std::string_view target = request_.target();
+    const auto pos = target.find('?');
     if (pos == std::string_view::npos) {
         return; // 没有查询字符串
     }
@@ -124,7 +133,7 @@ void RequestContext::parseQueryIfNeeded() const {
         spdlog::warn("Query parse failed: {}", query_str);
         return;
     }
-    boost::urls::params_view params = result.value(); // 安全
+    const boost::urls::params_view params = result.value(); // 安全
     for (const auto& param : params) {
         // param.key 和 param.value 已经是解码后的 std::string
         // 我们需要将它们的内容拷贝到我们自己的稳定 buffer 中
@@ -144,10 +153,13 @@ void RequestContext::parseQueryIfNeeded() const {
         // 3. 将指向 buffer 的稳定 string_view 存入 map
         queryParams_[key_sv].push_back(value_sv);
     }
+
+    // 标记为已解析，即使没有查询参数也只执行一次
+    queryParamsParsed_ = true;
 }
 
 
-void RequestContext::urlDecode(std::string_view sv, std::string& buffer) {
+void RequestContext::urlDecode(const std::string_view sv, std::string& buffer) {
     for (size_t i = 0; i < sv.size(); ++i) {
         if (sv[i] == '%' && i + 2 < sv.size()) {
             const char hex[3] = {sv[i + 1], sv[i + 2], '\0'};
@@ -185,7 +197,7 @@ bool is_compressible_content_type(std::string_view content_type) {
         "log"
     };
 
-    for (auto keyword : compressible_keywords) {
+    for (const auto keyword : compressible_keywords) {
         if (contains_ci(content_type, keyword)) {
             return true;
         }
@@ -216,7 +228,7 @@ boost::asio::awaitable<void> RequestContext::compressIfAcceptable(const boost::a
     // 1. 检查客户端是否支持压缩
     std::string client_accepts_encoding;
     if (request_.count(http::field::accept_encoding)) {
-        std::string_view value = request_.at(http::field::accept_encoding);
+        const std::string_view value = request_.at(http::field::accept_encoding);
         if (value.find("gzip") != std::string_view::npos) {
             client_accepts_encoding = "gzip";
         } else if (value.find("deflate") != std::string_view::npos) {
@@ -243,7 +255,7 @@ boost::asio::awaitable<void> RequestContext::compressIfAcceptable(const boost::a
     }
 
     // 3. 检查响应体大小是否值得压缩
-    constexpr size_t min_compress_size = 1024 * 5; // 最小压缩大小 5KB
+    constexpr size_t min_compress_size = 1024 * 5;           // 最小压缩大小 5KB
     constexpr size_t min_async_compression_size = 1024 * 10; // 最小异步压缩大小 10KB
     if (response_.body().size() < min_compress_size) {
         co_return; // body 太小，不值得压缩
@@ -282,4 +294,8 @@ boost::asio::awaitable<void> RequestContext::compressIfAcceptable(const boost::a
         SPDLOG_WARN("压缩失败: {}", e.what());
         co_return;
     }
+}
+
+const std::string& RequestContext::ip() {
+    return ip_;
 }

@@ -16,46 +16,27 @@
 #include <aizix/utils/config/ConfigLoader.hpp>
 
 
-/// 当前架构评
-/// 你的分配方式（3 个核心跑 io_context.run()，5 个核心跑 asio::thread_pool，1 核 1 线程、维护连接池与保活）在可用性和吞吐上是合理的，但在低抖动和尾延迟方面有改进空间。两个关键点：线程亲和性与执行器边界。没有亲和性会导致线程在核心间迁移、缓存失效；把关键路径任务 post 到共享 thread_pool 会引入调度不确定性和队列竞争。
+/// =================================================================================
+///                          架构设计说明 (Architecture Overview)
+/// =================================================================================
+/// 本框架采用高性能的 "One Loop Per Thread" (Multi-Reactor) 模型，结合 NUMA 亲和性优化。
 ///
-/// 核心建议与重构方向
-/// • 	**绑定与隔离：**为每个 io_context 线程与计算/下单线程设置 CPU 亲和与隔离（避免被系统任务抢占）。在双路（NUMA）机器上，确保线程与其主要内存分配在同一 NUMA 节点。
-/// • 	**减少跨执行器迁移：**行情接收与初步解码在同核完成，不再把关键计算任务 post 到共享 thread_pool。改为每策略/市场一个固定线程（或少量固定线程）消费 SPSC 队列，线程绑定核心。
-/// • 	**连接池分层：**HTTP/2 与 WebSocket 连接池置于独立“下单线程”或少量下单线程；避免与计算线程共享 thread_pool。下单线程串行（或有限并行度）处理，使用预分配缓冲。
-/// • 	**协程纪律：**协程只在同一执行器内 await，避免跨执行器导致线程迁移；关键路径中避免 co_await 通用 thread_pool。
-/// • 	**批量与背压：**计算线程批量消费 N 条行情（例如 8/16），下单线程合并或限速提交，必要时丢弃低价值中间帧以稳住尾延迟。
+/// One Loop Per Thread: 就像每辆出租车都有一个司机，各跑各的。
+/// Thread Pool (Shared Loop): 就像一个巨大的任务队列，所有工人（线程）都盯着这个队列，谁闲谁抢。
 ///
-/// 具体资源布局建议（8 核示例）
-/// • 	**核 0–2：**3 个 io_context 线程（每核一个），负责网络接收与同核解码，写入各自的 SPSC 队列（每会话或每策略一条）。
-/// • 	**核 3–6：**4 个策略计算线程（或按策略数设置），每线程消费一个或多个 SPSC 队列，批量处理、生成下单指令，写入“下单队列”（SPSC）。
-/// • 	**核 7：**1 个下单线程，维护连接池（HTTP/2、WebSocket、必要时 HTTP/1.1），串行或小并发度发送，处理回执与重试。
-/// • 	**后台池：**如确实需要 thread_pool，仅用于日志、快照、风控批处理，不参与行情-计算-下单链路。
-/// 如果你的策略数较多，可以将核 6 也分给下单，形成 2 个下单线程（各自绑定核心），将订单按 venue 或账户分片，减少同一连接池的竞争。
+/// 1. IO 线程池 (io_context_pool_)
+///    - 包含 N 个独立的 io_context，每个绑定到一个独立的系统线程和 CPU 核心。
+///    - io-0 (主线程): 负责 Accept 连接、信号处理、全局组件的 Strand 串行化。
+///    - io-1..N (子线程): 负责 Socket 的读写、TLS 握手、HTTP 协议解析。
+///    - 连接分配: 新连接通过 Round-Robin 策略分配给某个 IO 线程，终身绑定，无锁竞争，Cache 友好。
 ///
-/// 针对 Http/1.1、Http/2、WebSocket 的下单细化
-/// • 	**HTTP/2：**优先使用，单连接多路复用，减少连接管理与队头阻塞；开启 ALPN 与持久连接，预构建请求头与正文缓冲，复用 HPACK 上下文。
-/// • 	**HTTP/1.1：**必须时使用 keep-alive，连接池要限制并发度与每连接排队长度；请求模板预分配，尽量避免分配与格式化开销。
-/// • 	**WebSocket（wss）：**若交易所对下单/推送支持 WS，尽量使用二进制帧，维护少量持久连接；序列化为扁平（flat）缓冲，避免 JSON 热路径。
-/// • 	**TLS：**复用会话、禁用过度证书链检查开销（在允许范围内）、预热握手；为关键连接设置更短的超时与快速失败策略。
-/// • 	**超时与幂等：**严格 per-op 超时（毫秒级、甚至更小），请求携带序列号，失败快速重试但限速，避免队列爆炸。
+/// 2. 计算线程池 (compute_ioc_)
+///    - 包含 M 个 Worker 线程，共享同一个 io_context (Thread Pool 模式)。
+///    - 负责 CPU 密集型任务（如 gzip 压缩、复杂加解密），避免阻塞 IO 线程。
 ///
-/// 操作系统与网络栈调优
-/// • 	**IRQ 与 RSS：**将 NIC 队列的中断亲和到对应 io_context 核心，启用 RSS 保证流按队列分片；避免跨核跳转。
-/// • 	**套接字选项：**开启 TCP_NODELAY，合理设置 SO_SNDBUF/SO_RCVBUF；对小消息合并发送（应用层批处理），同时控制 Nagle 影响。
-/// • 	**内存与分页：**HugePages、锁定关键内存（mlock），避免缺页；选择线程本地分配器（jemalloc/tcmalloc），预热对象池。
-/// • 	**时钟与计时：**统一使用单一时间源（例如 TSC 或稳态时钟），避免跨核时间漂移影响度量与策略节奏。
-///
-/// 🖼 推荐分配方案（8 核）
-///  核心编号	     分配角色	               说明
-///  Core 0	     系统后台	               预留给操作系统内核线程、中断处理、后台服务
-///  Core 1	     io_context #1	       网络 I/O 事件循环，绑定 NIC 队列
-///  Core 2	     io_context #2	       网络 I/O 事件循环，绑定 NIC 队列
-///  Core 3	     io_context #3	       网络 I/O 事件循环，绑定 NIC 队列
-///  Core 4	     策略计算 #1            消费行情队列，执行策略逻辑
-///  Core 5	     策略计算 #2            消费行情队列，执行策略逻辑
-///  Core 6	     策略计算 #3            消费行情队列，执行策略逻辑
-///  Core 7	     下单线程	维护           TTP/2 / WebSocket 连接池，串行或有限并发下单
+/// 3. NUMA 优化
+///    - 自动探测硬件拓扑，优先将 IO 线程和计算线程绑定到不同的 NUMA 节点，减少跨节点内存访问延迟。
+/// =================================================================================
 
 
 /**
@@ -72,9 +53,29 @@
  */
 aizix::App::App(const std::string& config_path)
     : config_(ConfigLoader::load(config_path)),
-      worker_ioc_(config_.server.worker_threads),                    // 初始化 Worker Context
-      worker_work_guard_(boost::asio::make_work_guard(worker_ioc_)), // 初始化 Work Guard，锁住 worker_ioc_
-      signals_(ioc_, SIGINT, SIGTERM) {
+      compute_ioc_(config_.server.worker_threads),                   // 初始化 Worker Context
+      compute_work_guard_(boost::asio::make_work_guard(compute_ioc_)) // 初始化 Work Guard，锁住 worker_ioc_
+{
+    // 2. 初始化 IO Context 池 (One Loop Per Thread 核心)
+    const size_t io_threads_count = config_.server.io_threads;
+    if (io_threads_count == 0) {
+        throw std::runtime_error("IO threads count must be > 0");
+    }
+
+    io_context_pool_.reserve(io_threads_count);
+    io_work_guards_.reserve(io_threads_count);
+
+    // 为每个线程创建一个独立的 io_context
+    for (size_t i = 0; i < io_threads_count; ++i) {
+        // hint: 1 表示这是一个单线程 loop，asio 可以据此优化
+        auto ioc = std::make_shared<boost::asio::io_context>(1);
+        io_context_pool_.push_back(ioc);
+        io_work_guards_.emplace_back(boost::asio::make_work_guard(*ioc));  // 创建 guard 防止 run() 在无任务时退出
+    }
+
+    // 3. 初始化信号集 (必须绑定到主线程 io-0)
+    signals_ = std::make_unique<boost::asio::signal_set>(*io_context_pool_[0], SIGINT, SIGTERM);
+
 
     // 初始化日志管理器（单例），应用全局的日志级别、格式等配置
     aizix::LoggerManager::init(config_.logging);
@@ -89,6 +90,16 @@ aizix::App::App(const std::string& config_path)
 }
 
 aizix::App::~App() = default;
+
+/**
+ * @brief [负载均衡] 获取下一个 IO Context
+ * 用于 Server Acceptor 将新连接均匀分发给各个 IO 线程。
+ */
+boost::asio::io_context& aizix::App::get_ioc() {
+    // 使用原子操作实现无锁 Round-Robin
+    const size_t index = next_io_context_.fetch_add(1, std::memory_order_relaxed);
+    return *io_context_pool_[index % io_context_pool_.size()];
+}
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
 void aizix::App::addController(const std::vector<std::shared_ptr<aizix::HttpController>>& controllers) {
@@ -187,26 +198,26 @@ std::vector<std::vector<int>> aizix::App::get_numa_topology() {
 /**
  * @brief 初始化线程拓扑与线程绑定策略。
  *
- * 此函数负责根据系统 NUMA 拓扑和配置文件中的线程数，合理分配并绑定 I/O 线程和 Worker 线程：
+ * 此函数负责根据系统 NUMA 拓扑和配置文件中的线程数，合理分配并绑定 I/O 线程和 Compute 线程：
  *
  * 主要步骤：
  * 1. 调用 get_numa_topology() 探测系统的 NUMA 节点和 CPU 分布，并打印调试信息。
  * 2. 将所有 NUMA 节点的 CPU 核心合并到 all_cpu_cores_，作为后续分配的候选集合。
  * 3. 如果无法探测到 CPU 拓扑，则禁用线程亲和性绑定，仅使用操作系统默认调度。
  * 4. 创建额外的 I/O 线程（除主线程外），优先绑定在低编号核心上，用于运行 io_context。
- * 5. 创建 Worker 线程池中的线程，均匀分布在剩余的 CPU 核心上，避免与 I/O 线程冲突。
+ * 5. 创建 Compute 线程池中的线程，均匀分布在剩余的 CPU 核心上，避免与 I/O 线程冲突。
  * 6. 保留最后一个核心给系统使用，避免所有核心都被占用导致系统调度压力。
  *
  * 设计目的：
  * - “尽力而为”的核心绑定：允许用户配置的线程数多于物理核心数。只有当可用核心充足时，线程才会被绑定。
  * - I/O 线程数量少，固定在前几个核心，保证网络事件响应的低延迟。
- * - Worker 线程数量多，均匀分布在所有剩余核心上，充分利用 CPU 并行能力。
+ * - Compute 线程数量多，均匀分布在所有剩余核心上，充分利用 CPU 并行能力。
  * - 保留一个核心给系统，避免后台任务与应用线程争抢资源。
  * - NUMA 亲和性：所有被绑定的线程都会同时设置其 NUMA 节点亲和性，以优化内存访问。
- * @note 主线程作为第一个 I/O 线程（io_worker_main），在 run() 中绑定并运行 io_context。
+ * @note 主线程作为第一个 I/O 线程（io_context_pool_[0]），在 run() 中绑定并运行 io_context。
  */
 void aizix::App::setup_threading() {
-    // --- 1. 探测系统拓扑结构 ---
+    // --- 1. 探测硬件拓扑 ---
 
     // 调用辅助函数获取系统的 NUMA 拓扑（一个二维数组，外层是节点，内层是该节点上的 CPU 核心 ID）
     cpu_topology_ = get_numa_topology();
@@ -236,7 +247,7 @@ void aizix::App::setup_threading() {
     const size_t io_threads_count = config_.server.io_threads;
     const size_t worker_threads_count = config_.server.worker_threads;
 
-    // --- 2. 创建并启动额外的 IO 线程 ---
+    // --- 2. 创建并启动额外的 IO 线程  (io-1 到 io-N)---
 
     // 主线程将作为第一个 IO 线程，因此我们只需要创建 (总数 - 1) 个额外的线程。
     // 如果总数只有1，则不创建任何额外线程。
@@ -274,15 +285,15 @@ void aizix::App::setup_threading() {
                 // 如果没有足够的核心，则不进行绑定，让操作系统自由调度
                 SPDLOG_INFO("IO thread '{}' started without core affinity.", thread_name);
             }
-            // 启动 io_context 事件循环，处理网络 I/O 事件，线程将在此阻塞直到 io_context 停止
-            ioc_.run();
+            // 启动 io_context 事件循环，处理网络 I/O 事件，运行该线程独占的 io_context
+            io_context_pool_[thread_index]->run();
         });
     }
 
-    // --- 绑定 Worker 线程 ---
+    // --- 启动 Compute (Worker) 线程 ---
     // 遍历所有需要创建的 Worker 线程，均匀分布在剩余核心上
     for (size_t i = 0; i < worker_threads_count; ++i) {
-        worker_threads_.emplace_back([this, i,io_threads_count]() {
+        compute_threads_.emplace_back([this, i,io_threads_count]() {
             // 设置线程名称，便于调试和日志分析
             const std::string thread_name = "worker-" + std::to_string(i);
             ThreadUtils::set_current_thread_name(thread_name);
@@ -309,7 +320,7 @@ void aizix::App::setup_threading() {
                 // 如果没有足够的核心，则不进行绑定
                 SPDLOG_INFO("Worker thread '{}' started without core affinity.", thread_name);
             }
-            worker_ioc_.run(); // 启动 worker_ioc_ 事件循环，处理网络耗时任务，线程将在此阻塞直到 worker_ioc_ 停止
+            compute_ioc_.run(); // 启动 worker_ioc_ 事件循环，处理网络耗时任务，线程将在此阻塞直到 worker_ioc_ 停止
         });
     }
 }
@@ -323,12 +334,15 @@ void aizix::App::setup_threading() {
  * 此函数完成了应用的服务层和控制层初始化。
  */
 void aizix::App::init_services() {
-    server_ = std::make_unique<Server>(ioc_, worker_ioc_.get_executor(), config_);
-    http_client_pool_ = std::make_shared<HttpClientPool>(ioc_, config_);
+    // 注入 App 自身引用，以便 Server 和 Client 获取 IO Context
+    server_ = std::make_unique<Server>(*this, config_);
+
+    // HttpClientPool 绑定到 Main Loop 用于管理全局连接池状态
+    http_client_pool_ = std::make_shared<HttpClientPool>(*this, config_);
 
     // 依赖注入链
     http_client_ = std::make_shared<HttpClient>(http_client_pool_);
-    ws_client_ = std::make_shared<WebSocketClient>(ioc_, config_.client.ssl_verify);
+    ws_client_ = std::make_shared<WebSocketClient>(*this, config_.client.ssl_verify);
 }
 
 /**
@@ -342,20 +356,33 @@ void aizix::App::init_services() {
  * 该函数确保应用在接收到终止信号时能够优雅地关闭，而不是直接退出。
  */
 void aizix::App::setup_signal_handling() {
-    signals_.async_wait([this](const boost::system::error_code& error, int signal_number) {
+    signals_->async_wait([this](const boost::system::error_code& error, int signal_number) {
         if (!error) {
             SPDLOG_INFO("Received signal {}, starting graceful shutdown...", signal_number);
-            signals_.cancel(); // 防止重复触发
-            boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+            signals_->cancel(); // 防止重复触发
+
+            // 在 Main Loop 上启动停止协程
+            boost::asio::co_spawn(get_main_ioc(), [&]() -> boost::asio::awaitable<void> {
+                // 1. 关闭入口
                 SPDLOG_INFO("Shutting down server sessions...");
                 co_await server_->stop();
+
+                // 2. 关闭出口
                 SPDLOG_INFO("Shutting down client connections...");
                 co_await http_client_pool_->stop();
-                SPDLOG_INFO("Stopping worker pool and io_context...");
-                worker_work_guard_.reset(); // 释放 guard
-                worker_ioc_.stop();         // 强制停止
-                SPDLOG_INFO("All services stopped. Stopping io_context...");
-                ioc_.stop();
+
+                // 3. 停止计算线程
+                SPDLOG_INFO("Stopping compute pool...");
+                compute_work_guard_.reset(); // 释放 guard
+                compute_ioc_.stop();         // 强制停止
+
+                // 4. 停止所有 IO 线程
+                SPDLOG_INFO("Stopping all IO contexts...");
+                io_work_guards_.clear(); // 释放所有 guard
+                // 停止io_context
+                for (const auto& ioc : io_context_pool_) {
+                    ioc->stop();
+                }
             }, boost::asio::detached);
         }
     });
@@ -378,8 +405,6 @@ void aizix::App::setup_signal_handling() {
  */
 int aizix::App::run() {
     try {
-        auto work_guard = boost::asio::make_work_guard(ioc_.get_executor());
-
         setup_threading();
 
         setup_signal_handling();
@@ -389,8 +414,9 @@ int aizix::App::run() {
         SPDLOG_INFO("Server started on port {}. I/O threads: {}, Worker threads: {}. Press Ctrl+C to shut down.",
                     config_.server.port, config_.server.io_threads, config_.server.worker_threads);
 
-        // 主线程作为第一个 IO 线程
+        // 主线程 io-0 作为第一个 IO 线程
         ThreadUtils::set_current_thread_name("io-0");
+
         if (!all_cpu_cores_.empty()) {
             // 主线程使用第一个核心 (index 0)
             const int cpu_id = all_cpu_cores_[0];
@@ -401,7 +427,8 @@ int aizix::App::run() {
             }
             SPDLOG_INFO("Main IO thread 'io-worker-0' bound to CPU {}.", all_cpu_cores_[0]);
         }
-        ioc_.run();
+        // 运行第 0 个 io_context
+        io_context_pool_[0]->run();
 
 
         // 等待所有线程结束
@@ -414,7 +441,7 @@ int aizix::App::run() {
         ///  }
 
         SPDLOG_INFO("Server shut down gracefully.");
-       //spdlog::shutdown();
+        //spdlog::shutdown();
         return 0;
     } catch (const std::exception& e) {
         SPDLOG_ERROR("Fatal error during server execution: {}", e.what());

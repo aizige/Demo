@@ -3,12 +3,13 @@
 
 #include <aizix/http/http_common_types.hpp>
 #include <aizix/utils/param_parser.hpp>
+#include <boost/json/value.hpp>
 
 
 class RequestContext {
 public:
 
-    RequestContext(HttpRequest req, PathParams params);
+    RequestContext(HttpRequest req, PathParams params, std::string ip);
 
     // --- 请求数据访问 ---
 
@@ -24,16 +25,17 @@ public:
     // --- 带类型转换的参数访问 ---
 
     template <typename T>
-    std::optional<T> path_param_as(std::string_view key) const {
-        auto sv_opt = pathParam(key);
+    std::optional<T> path_param_as(const std::string_view key) const {
+        const auto sv_opt = pathParam(key);
         if (!sv_opt) {
             return std::nullopt;
         }
         return param_parser::tryParse<T>(*sv_opt);
     }
+
     template <typename T>
-    std::optional<T> query_param_as(std::string_view key) const {
-        auto sv_opt = queryParam(key);
+    std::optional<T> query_param_as(const std::string_view key) const {
+        const auto sv_opt = queryParam(key);
         if (!sv_opt) {
             return std::nullopt;
         }
@@ -44,12 +46,16 @@ public:
     // --- 响应构建 ---
     HttpResponse& response();
 
-    void string(http::status status, std::string_view body, std::string_view content_type = "text/plain; charset=utf-8");
-    //void json(http::status status, const nlohmann::json& j);
-    void json(http::status status, std::string_view body);
+    void string(http::status status, std::string_view body, std::string_view content_type);
+    void string(http::status status, std::string_view body);
+    void string(const std::string_view body);
+    void json(http::status status, const boost::json::value& json);
+    void json(const boost::json::value& json);
 
     // --- 压缩响应body ---
     boost::asio::awaitable<void> compressIfAcceptable(const boost::asio::any_io_executor& work_executor);
+
+   const std::string& ip();
 
 private:
 
@@ -63,6 +69,7 @@ private:
     HttpRequest request_;   // 持有请求对象的值
     HttpResponse response_; // 持有响应对象的值
     PathParams path_params_; // 持有路径参数的值
+    std::string ip_; // 持有远程主机的ip
 
 
     mutable std::string decodeBuffer_; // 所有解码后的 key 和 value 拼接在一起

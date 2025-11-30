@@ -9,16 +9,14 @@
 #include <functional> // for std::function
 #include <stdexcept>
 #include <spdlog/spdlog.h>
-#include <ada.h>
+#include <aizix/lib/ada.h>
 #include <boost/asio/detail/impl/scheduler.ipp>
 #include <boost/system/result.hpp>
 #include <boost/url/parse.hpp>
 #include <boost/url/url.hpp>
-
-
-
-
-
+#include <system_error>
+#include <boost/beast/core/error.hpp> // 引用 http::error
+#include <boost/asio/error.hpp>       // 引用 boost::asio::error
 /**
  * @brief HttpClient 的构造函数。
  * @param manager 一个 ConnectionManager 的共享指针，HttpClient 将依赖它来获取和管理连接。
@@ -80,7 +78,6 @@ std::string HttpClient::resolve_url(const std::string& base_url, const std::stri
 }
 
 
-
 /**
  * @brief 所有HTTP请求的统一入口点，实现了重定向处理和零拷贝优化。
  *
@@ -120,7 +117,7 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
 
         // Headers 状态
         const Headers* current_headers_ptr = &headers; // 初始指向原始 headers
-        std::optional<Headers> modified_headers; // 仅在需要修改时分配
+        std::optional<Headers> modified_headers;       // 仅在需要修改时分配
 
 
         // 创建一个 optional<pair> 来持有结果和连接
@@ -278,16 +275,34 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
  * 可重试的错误通常是由于复用一个已被服务器关闭的“陈旧连接”(stale connection)
  * 导致的。对于新创建的连接，这些错误通常表示更严重的问题。
  */
-bool is_retryable_network_error(const boost::system::error_code& ec) {
-    return ec == http::error::end_of_stream || // 在 keep-alive 连接上读取，但对方已关闭。
-        ec == boost::asio::error::eof || // 当你尝试读取一个对方已关闭发送的连接时
-        ec == boost::asio::error::connection_reset || // 连接被对端强制重置 (RST包)。
-        ec == boost::asio::error::connection_aborted || // 连接在本机中止（通常也是因为对端问题）。
-        ec == boost::asio::error::broken_pipe || // 尝试写入一个已关闭读端的socket。
-        ec == aizix_error::h2::receive_timeout || // 等待H2响应超时，网络不好的时候好像会出现这种问题
+bool is_retryable_network_error(const std::error_code& ec) {
+
+    // 1. 优先与标准库的 std::errc 比较 (覆盖面最广，兼容 boost 和 std 产生的系统错误)
+    if (ec == std::errc::connection_reset ||   // 连接被对端强制重置 (RST包)。
+        ec == std::errc::connection_aborted || // 连接在本机中止（通常也是因为对端问题）。
+        ec == std::errc::broken_pipe ||        // 尝试写入一个已关闭读端的socket。
+        ec == std::errc::timed_out)            // Asio 标准超时错误
+    {
+        return true;
+    }
+
+    // 2. 比较 Boost.Asio/Beast 特有的错误
+    // 现代 Boost 会自动将这些 boost::error_code 隐式转换为 std::error_code 进行比较
+    if (ec == boost::system::error_code(boost::asio::error::eof) || // 当尝试读取一个对方已关闭发送的连接时
+        ec == boost::system::error_code(boost::beast::http::error::end_of_stream)) // HTTP 流结束. 在已关闭的连接上进行读取
+        {
+        return true;
+    }
+
+    // 3. 比较你自定义的 aizix 错误
+    if (ec == aizix_error::h2::receive_timeout ||   // 等待H2响应超时，网络不好的时候好像会出现这种问题
         ec == aizix_error::network::connection_timeout || // 连接超时
-        ec == aizix_error::network::connection_error || // 连接超时
-        ec == boost::asio::error::timed_out; // Asio 标准超时错误
+        ec == aizix_error::network::connection_error)     // 连接error
+    {
+        return true;
+    }
+
+    return false;
 }
 
 
@@ -349,7 +364,7 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
                             conn ? conn->id() : "N/A", e.code().message(), attempt + 1, MAX_ATTEMPTS);
 
                 // 显式递增尝试次数，继续循环
-                attempt++;
+                ++attempt;
             } else {
                 // 情况B: 不可重试错误（例如权限错误、逻辑错误），直接抛出
                 SPDLOG_ERROR("HttpClient: 出现不可重试错误，立即终止。错误: {}", e.code().message());
@@ -380,12 +395,12 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
  * @throws std::runtime_error 如果 URL 格式无效且无法修复。
  */
 HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
-     // has_value()或者 if (url) 确保对象内部有有效值，是访问 ada::url_aggregator 成员（比如 is_valid）之前必须检查的第一步。
-     // is_valid：在确定对象有效后，进一步判断 URL 是否满足Url有效性规则。
-     // 如果未先检查 has_value()或者 if (url) 而直接调用 is_valid，当解析失败时程序可能崩溃（因为在无效的 tl::expected 上调用其成员是未定义行为）。
+    // has_value()或者 if (url) 确保对象内部有有效值，是访问 ada::url_aggregator 成员（比如 is_valid）之前必须检查的第一步。
+    // is_valid：在确定对象有效后，进一步判断 URL 是否满足Url有效性规则。
+    // 如果未先检查 has_value()或者 if (url) 而直接调用 is_valid，当解析失败时程序可能崩溃（因为在无效的 tl::expected 上调用其成员是未定义行为）。
 
     // 1. 尝试直接解析 string_view (零拷贝的快速路径)
-     auto url = ada::parse<ada::url_aggregator>(url_strv);
+    auto url = ada::parse<ada::url_aggregator>(url_strv);
 
     std::string url_storage; // 仅在需要修改或存储时才分配内存
 
@@ -426,7 +441,7 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
     SPDLOG_DEBUG("scheme = {}", result.scheme);
 
     // 5. 健壮地解析端口，直接操作 string_view，避免创建临时 string
-     const std::string_view port = url->get_port();
+    const std::string_view port = url->get_port();
     if (port.empty()) {
         // 如果端口字段为空，则根据 scheme 获取标准默认端口 (如 http ---> 80, https ---> 443)
         result.port = url->scheme_default_port();

@@ -10,7 +10,7 @@
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/redirect_error.hpp>
 #include <spdlog/spdlog.h>
-#include <ada.h>
+#include <aizix/lib/ada.h>
 
 
 
@@ -106,7 +106,7 @@ boost::asio::awaitable<bool> HttpConnection::ping() {
     }
 
     // 更新最后一次发送ping的时间
-    update_last_used_time();
+    update_ping_used_time();
 
     // 已经有业务在用了，那肯定是活的，直接返回成功，不要去添乱
     if (active_streams_.load() > 0) {

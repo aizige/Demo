@@ -55,7 +55,7 @@ boost::asio::awaitable<void> UserController::handle_http_client(RequestContext& 
 
 
     auto basic_string = co_await user_service_->test_http_client(*basic_string_view);
-    ctx.json(http::status::ok, basic_string);
+    ctx.string(http::status::ok, basic_string);
 }
 
 boost::asio::awaitable<void> UserController::handle_test_wss(RequestContext& ctx) {
@@ -70,5 +70,5 @@ boost::asio::awaitable<void> UserController::intensive_computing(RequestContext&
     auto user_result = co_await user_service_->intensiveComputing();
     SPDLOG_DEBUG("计算结果: {}", user_result);
     std::string str = fmt::format("计算结果: {}\t  ",user_result);
-    co_return ctx.json(http::status::ok,str);
+    co_return ctx.string(http::status::ok,str);
 }

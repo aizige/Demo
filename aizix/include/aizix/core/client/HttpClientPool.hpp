@@ -27,7 +27,7 @@
 
 // 向前声明，以减少头文件依赖
 class IConnection;
-
+namespace aizix { class App; }
 /**
  * @struct PooledConnection
  * @brief 封装了从连接池获取的连接及其状态。
@@ -103,10 +103,10 @@ class HttpClientPool : public std::enable_shared_from_this<HttpClientPool> {
 public:
     /**
      * @brief 构造函数。
-     * @param ioc 对主 `io_context` 的引用。
+     * @param app 应用程序实例引用 (用于获取 IO Context 池)
      * @param config 配置文件
      */
-    explicit HttpClientPool(boost::asio::io_context& ioc, const AizixConfig& config);
+    explicit HttpClientPool(aizix::App& app, const AizixConfig& config);
 
     /**
      * @brief 析构函数。会触发后台任务的停止。
@@ -197,7 +197,10 @@ private:
 
     // --- 核心数据成员 ---
 
-    // @brief I/O 上下文，对应用程序主 io_context 的引用。
+    ///  @brief App 引用
+    aizix::App& app_;
+
+    /// @brief I/O 上下文 (Main Context)，用于 Strand, Timer, Resolver
     boost::asio::io_context& ioc_;
 
     /// @brief 核心同步原语。所有对内部状态（连接池(pool_)、`creation_in_progress_` map）

@@ -3,7 +3,7 @@
 //
 
 #include <aizix/utils/config/ConfigLoader.hpp>
-#include <aizix/utils/toml.hpp>
+#include <aizix/lib/toml.hpp>
 
 #include <stdexcept>
 #include <iostream>

@@ -4,7 +4,7 @@
 
 #include <aizix/core/client/h2_connection.hpp>
 #include <aizix/utils/pocess_info.hpp>
-#include <aizix/utils/toml.hpp>
+#include <aizix/lib/toml.hpp>
 #include <aizix/error/aizix_error.hpp>
 #include <aizix/utils/finally.hpp>
 
@@ -162,11 +162,7 @@ asio::awaitable<HttpResponse> Http2Connection::execute(const HttpRequest& reques
 
         SPDLOG_DEBUG("[{}] execute: 收到响应，状态码 {}, 当前活动的steam = {}", id_, response.result_int(), active_streams_.load());
         co_return response;
-    } catch (const boost::system::system_error& e) {
-        // 特殊处理超时错误，提供更明确的错误信息
-        if (e.code() == asio::error::operation_aborted) {
-            throw boost::system::system_error(aizix_error::h2::receive_timeout, "接收响应超时（连接空闲）");
-        }
+    } catch (std::exception&) {
         throw;
     }
 }
@@ -295,9 +291,6 @@ boost::asio::awaitable<void> Http2Connection::do_write() {
  *
  * 这种单一协程模型从根本上消除了对 `strand` 或 `mutex` 的需求，
  * 因为所有对共享状态（`session_`, `streams_` map 等）的访问都在这个协程中串行执行。
- */
-/**
- * @brief [Actor] 核心 Actor 协程，管理此连接的整个生命周期。
  */
 asio::awaitable<void> Http2Connection::actor_loop() {
     // 使用 Finally guard 确保无论如何（即使异常退出），握手信号 channel 都会被关闭，
@@ -535,7 +528,7 @@ void Http2Connection::prepare_headers(std::vector<nghttp2_nv>& nva, const HttpRe
         // 这里累加的是原始 name 的长度，因为 to_lower_copy 不改变长度。这是安全的。
         total_size += field.name_string().length();
         total_size += field.value().length();
-        header_count++;
+        ++header_count;
     }
 
     // --- 阶段二: 一次性分配内存 ---

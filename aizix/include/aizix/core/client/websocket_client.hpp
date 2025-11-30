@@ -8,12 +8,14 @@
 #include <aizix/core/client/HttpClientPool.hpp>
 #include <aizix/core/client/websocket_connection.hpp>
 #include <aizix/core/client/iwebsocket_client_handler.hpp>
-
 #include <string_view>
 
-class WebSocketClient  : public std::enable_shared_from_this<WebSocketClient> {
+
+namespace aizix { class App; }
+
+class WebSocketClient : public std::enable_shared_from_this<WebSocketClient> {
 public:
-    explicit WebSocketClient(boost::asio::io_context& ioc,bool ssl_verify);
+    explicit WebSocketClient(aizix::App& app, bool ssl_verify);
 
     /**
      * @brief 异步连接到一个 WebSocket 端点。
@@ -28,7 +30,12 @@ public:
         const Headers& headers = {});
 
 private:
-    boost::asio::io_context& ioc_;
+    // App 引用
+    aizix::App& app_;
+
+    // Main IO Context (用于 Resolver)
+    boost::asio::io_context& main_ioc_;
+
     boost::asio::ssl::context ssl_ctx_;
     boost::asio::ip::tcp::resolver resolver_;
 
@@ -40,7 +47,7 @@ private:
         std::string target;
     };
 
-    static ParsedUrl parse_url(std::string_view url_strv);
+    static ParsedUrl parse_url(std::string_view url_strview);
 };
 
 #endif // AIZIX_WEBSOCKET_CLIENT_HPP

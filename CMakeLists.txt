@@ -13,11 +13,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # -fno-omit-frame-pointer	保留帧指针，便于调试器和 ASan 追踪调用栈
 # -g	                    生成调试信息（DWARF），用于 GDB 或 LLDB 调试
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
-#set(CMAKE_BUILD_TYPE Debug)  # 设置构建类型为 Debug
+
 message(STATUS "Current Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "CXX Flags for Release: ${CMAKE_CXX_FLAGS_RELEASE}")
 
 add_subdirectory(aizix)
-
 add_subdirectory(xingju)
 

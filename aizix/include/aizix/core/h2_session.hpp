@@ -12,19 +12,15 @@
 
 #include <aizix/http/router.hpp>         // 引入应用层的路由定义
 
-/// 为 Asio channel 定义一个类型别名，方便使用。
-/// 这个 channel 用于从 session_loop 的回调中向 dispatcher_loop 发送已准备好的 stream_id。
-/// 它可以传递一个 error_code 和一个 int32_t (stream_id)。
-using StreamIdChannel = boost::asio::experimental::channel<void(boost::system::error_code, int32_t)>;
+
 /**
 @class Http2Session
 @brief 管理一个完整的服务器端 HTTP/2 会话。
 这个类实现了“三协程 Actor”模型，将读、写和请求分发逻辑分离到
-三个并行的、常驻的协程 (session_loop, writer_loop, dispatcher_loop) 中，
+三个并行的、常驻的协程 (session_loop()、 writer_loop()、idle_timer_loop()) 中，
 以实现最高的并发性能和最清晰的逻辑分离。
 session_loop: 负责从 socket 读取数据，并将其喂给 nghttp2 引擎进行解析。
 writer_loop: 负责检查 nghttp2 引擎是否有待发送的数据，并将其写入 socket。
-dispatcher_loop: 负责从 channel 中接收已完成的请求流 ID，并派发给具体的处理逻辑。
 所有对共享状态（如 nghttp2_session、streams_ 等）的访问都通过 strand_ 来串行化，
 从而从根本上避免了数据竞争，使得代码逻辑更简单，无需手动加锁。
 */
@@ -101,12 +97,7 @@ private:
  */
     boost::asio::awaitable<void> session_loop();
 
-    /**
-     * @brief 核心协程之一：分发循环。
-     *        - 从 `dispatch_channel_` 异步等待已完成的请求流 ID。
-     *        - 为每个请求 `co_spawn` 一个新的协程 (`dispatch`) 进行处理，实现请求的并行处理。
-     */
-    boost::asio::awaitable<void> dispatcher_loop();
+
 
     /**
      * @brief 执行一次写操作。
@@ -195,8 +186,6 @@ private:
     boost::asio::steady_timer write_trigger_; // 一个定时器，通过取消它来立即触发一次写操作，比使用 channel 更轻量。
     bool write_in_progress_ = false; // 一个标志位，防止 writer_loop 的重入。
 
-    // 用于在 reader 和 dispatcher 之间传递 stream_id 的协程安全通道。
-    StreamIdChannel dispatch_channel_;
 
 };
 #endif // AIZIX_HTTP2_SESSION_HPP

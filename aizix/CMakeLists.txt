@@ -5,17 +5,13 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(aizix
-        src/core/HttpSession.cpp
-        include/aizix/core/HttpSession.hpp
-        src/core/HttpsSession.cpp
-        include/aizix/core/HttpsSession.hpp) # 默认是静态库, 可以用 add_library(aizix SHARED) 改为动态库
-
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+add_library(aizix) # 默认是静态库, 可以用 add_library(aizix SHARED) 改为动态库
 
 target_sources(aizix PRIVATE
         src/core/h2_session.cpp
+        src/core/HttpSession.cpp
+        src/core/HttpsSession.cpp
+        src/core/Server.cpp
         src/core/client/http_connection.cpp
         src/core/client/HttpClientPool.cpp
         src/core/client/http_client.cpp
@@ -29,8 +25,9 @@ target_sources(aizix PRIVATE
         src/core/client/websocket_connection.cpp
         src/core/client/websocket_client.cpp
         src/utils/config/ConfigLoader.cpp
+
         src/App.cpp
-        src/core/Server.cpp
+        src/lib/ada.cpp
 
 )
 add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
@@ -51,7 +48,6 @@ find_package(ZLIB REQUIRED)
 find_package(Boost REQUIRED)
 find_package(libnghttp2 REQUIRED)
 find_package(spdlog REQUIRED)
-find_package(ada REQUIRED)
 find_package(libnuma REQUIRED)
 
 # --- 正确地链接库 ---
@@ -61,6 +57,5 @@ target_link_libraries(aizix PUBLIC
         ZLIB::ZLIB
         libnghttp2::libnghttp2
         spdlog::spdlog
-        ada::ada
         libnuma::libnuma
 )

@@ -17,13 +17,12 @@
 namespace param_parser {
 
     // 不区分大小写的string_view比较）
-    inline bool isEquals(std::string_view a, std::string_view b) {
-        return std::equal(a.begin(), a.end(),
-                          b.begin(), b.end(),
-                          [](char a, char b) {
-                              return std::tolower(static_cast<unsigned char>(a)) ==
-                                     std::tolower(static_cast<unsigned char>(b));
-                          });
+    inline bool isEquals(const std::string_view a, const std::string_view b) {
+        return std::ranges::equal(a, b,
+                                  [](const char a1, const char b1) {
+                                      return std::tolower(static_cast<unsigned char>(a1)) ==
+                                          std::tolower(static_cast<unsigned char>(b1));
+                                  });
     }
 
     template<typename T>
@@ -31,6 +30,7 @@ namespace param_parser {
         // 对于数字类型整数和浮点（所有的“算术类型”）
         if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool> && !std::is_same_v<T, char>) {
             T value;
+            // ReSharper disable once CppTooWideScopeInitStatement
             auto result = std::from_chars(sv.data(), sv.data() + sv.size(), value);
             if (result.ec == std::errc() && result.ptr == sv.data() + sv.size()) {
                 return value;
@@ -54,7 +54,7 @@ namespace param_parser {
         else if constexpr (std::is_same_v<T, std::chrono::system_clock::time_point>) {
             std::chrono::system_clock::time_point tp;
             // 注意：from_stream 需要一个 null 结尾的字符串，所以这里有开销
-            std::string temp_str{sv};
+            const std::string temp_str{sv};
             std::stringstream ss{temp_str};
             ss >> std::chrono::parse("%FT%TZ", tp); // 解析 ISO 8601 格式
             if (!ss.fail()) {

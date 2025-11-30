@@ -26,6 +26,8 @@
 #include <boost/asio/experimental/parallel_group.hpp> // 引入 parallel_group
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
+#include <aizix/App.hpp>
+
 
 // 命名空间别名
 namespace http = boost::beast::http;
@@ -34,19 +36,19 @@ using namespace std::literals::chrono_literals;
 using namespace boost::asio::experimental::awaitable_operators;
 /**
  * @brief 构造函数 (带 IP 和端口)。
- * @param ioc 对主 io_context 的引用。
- * @param work_executor 工作线程的executor
+ * @param app 应用程序实例引用 (用于获取 IO Context 池)
  * @param config 配置文件
  */
-Server::Server(boost::asio::io_context& ioc, boost::asio::any_io_executor work_executor, const AizixConfig& config)
-    : io_context_(ioc),
-      work_executor_(std::move(work_executor)),
+Server::Server(aizix::App& app, const AizixConfig& config)
+    : app_(app), // 保存 App 引用
+      work_executor_(app.worker_pool_executor()),
       ssl_context_(boost::asio::ssl::context::tlsv12_server), // 先用 io_context 构造 acceptor
-      acceptor_(ioc),
+      acceptor_(app.get_main_ioc()),                          // Acceptor 必须绑定在 Main Context 上
       use_ssl_(config.server.ssl->enabled),
-      h2_strand_(boost::asio::make_strand(ioc)),
-      https_strand_(boost::asio::make_strand(ioc)),
-      h1_strand_(boost::asio::make_strand(ioc)),
+      // Strand 保护全局集合，绑定在 Main Context 上
+      h2_strand_(boost::asio::make_strand(app.get_main_ioc())),
+      https_strand_(boost::asio::make_strand(app.get_main_ioc())),
+      h1_strand_(boost::asio::make_strand(app.get_main_ioc())),
       max_request_body_size_bytes_(config.server.max_request_size_bytes),
       http2_enabled_(config.server.http2_enabled),
       tls_versions_(config.server.ssl->tls_versions),
@@ -124,8 +126,8 @@ void Server::set_tls(const std::string& cert_file, const std::string& key_file) 
  * 这是一个非阻塞操作，它会启动一个后台协程来处理连接接受。
  */
 void Server::run() {
-    // 启动一个常驻的监听协程
-    boost::asio::co_spawn(io_context_, listener(), boost::asio::detached);
+    // 启动一个常驻的监听协程 在 Main Context 上运行
+    boost::asio::co_spawn(app_.get_main_ioc(), listener(), boost::asio::detached);
 }
 
 /**
@@ -157,8 +159,7 @@ boost::asio::awaitable<void> Server::stop() {
     //  HTTP/1.1 普通会话的安全关闭
     // ========================================================================
     {
-        std::vector<std::shared_ptr<HttpSession>> sessions_snapshot;
-         sessions_snapshot = co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<HttpSession>>> {
+        auto [e_ptr, sessions_snapshot] = co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<HttpSession>>> {
             std::vector<std::shared_ptr<HttpSession>> snapshot;
             snapshot.reserve(http_sessions_.size());
             for (const auto& s : http_sessions_) {
@@ -166,7 +167,7 @@ boost::asio::awaitable<void> Server::stop() {
             }
             http_sessions_.clear();
             co_return snapshot;
-        }, boost::asio::use_awaitable);
+        }, boost::asio::as_tuple(boost::asio::use_awaitable));
 
         // 在 strand 外部（并发地）调用 stop
         for (const auto& s : sessions_snapshot) {
@@ -179,8 +180,7 @@ boost::asio::awaitable<void> Server::stop() {
     //  HTTPS 会话的安全关闭
     // ========================================================================
     {
-        std::vector<std::shared_ptr<HttpsSession>> sessions_snapshot;
-        sessions_snapshot = co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<HttpsSession>>> {
+        auto [e_ptr, sessions_snapshot] = co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<HttpsSession>>> {
             std::vector<std::shared_ptr<HttpsSession>> snapshot;
             snapshot.reserve(https_sessions_.size());
             for (const auto& s : https_sessions_) {
@@ -188,32 +188,39 @@ boost::asio::awaitable<void> Server::stop() {
             }
             https_sessions_.clear();
             co_return snapshot;
-        }, boost::asio::use_awaitable);
+        }, boost::asio::as_tuple(boost::asio::use_awaitable));
 
-        for (auto& s : sessions_snapshot) s->stop();
-        SPDLOG_INFO("Stopped {} HTTPS TLS sessions.", sessions_snapshot.size());
+        if (e_ptr) {
+            SPDLOG_ERROR("Error retrieving HTTPS sessions snapshot.");
+        } else {
+            for (const auto& s : sessions_snapshot) s->stop();
+            SPDLOG_INFO("Stopped {} HTTPS TLS sessions.", sessions_snapshot.size());
+        }
     }
 
     // ========================================================================
     //  HTTP/2 会话的安全收集与优雅等待
     // ========================================================================
     // 获取快照
-    std::vector<std::shared_ptr<Http2Session>> h2_sessions_to_stop;
-     h2_sessions_to_stop = co_await boost::asio::co_spawn(h2_strand_, [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<Http2Session>>> {
-        std::vector<std::shared_ptr<Http2Session>> snapshot;
-        for (const auto& weak_session : h2_sessions_) {
-            if (auto session = weak_session.lock()) {
-                snapshot.push_back(session);
-            }
-        }
-        h2_sessions_.clear();
-        co_return snapshot;
-    }, boost::asio::use_awaitable);
 
-    // 如果没有 H2 会话，直接返回
-    if (h2_sessions_to_stop.empty()) {
+    auto [e_ptr, h2_sessions_to_stop] = co_await boost::asio::co_spawn(
+        h2_strand_,
+        [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<Http2Session>>> {
+            std::vector<std::shared_ptr<Http2Session>> snapshot;
+            for (const auto& weak_session : h2_sessions_) {
+                if (auto session = weak_session.lock()) {
+                    snapshot.push_back(session);
+                }
+            }
+            h2_sessions_.clear();
+            co_return snapshot;
+        }, boost::asio::as_tuple(boost::asio::use_awaitable));
+
+    // 如果出错或 H2 会话列表为空，直接返回
+    if (e_ptr || h2_sessions_to_stop.empty()) {
         co_return;
     }
+
 
     // --- 并行等待所有 H2 会话优雅关闭 (代码逻辑复用你原有的 Channel 机制) ---
 
@@ -271,7 +278,8 @@ boost::asio::awaitable<void> Server::stop() {
 
 
 /**
- * @brief 主监听协程，一个无限循环，负责接受新连接。
+ * @brief 主监听协程 (运行在 Main Thread)
+ * 职责单一化：只负责 Accept，然后立即分发给 Worker
  */
 boost::asio::awaitable<void> Server::listener() {
     // 获取当前协程的执行器，用于派生新的协程
@@ -286,10 +294,19 @@ boost::asio::awaitable<void> Server::listener() {
             if (is_stopping_) co_return;
             boost::system::error_code ec;
 
+            // 从 Pool 获取下一个 IO Context
+            auto& client_ioc = app_.get_ioc();
+
+            // 创建 Socket 并绑定到该 Context
+            // 之后的读写操作都会自动在这个 client_ioc 的线程上执行
+            tcp::socket socket(client_ioc);
+
             // 异步等待并接受一个新的 TCP 连接
-            tcp::socket raw_sock = co_await acceptor_.async_accept(
-                boost::asio::redirect_error(boost::asio::use_awaitable, ec)
-            );
+            // 直接把 socket 传给 accept
+            // 这样 accept 成功后，socket 既拥有连接句柄，又绑定在 IO Worker context 线程池的线程上
+            co_await acceptor_.async_accept(
+                socket,
+                boost::asio::redirect_error(boost::asio::use_awaitable, ec));
 
             // 接受失败，记录日志并继续等待下一个连接
             if (ec) {
@@ -309,157 +326,22 @@ boost::asio::awaitable<void> Server::listener() {
                 }
                 continue;
             }
-
-            // --- 根据是否启用 SSL 进行分支处理 ---
-            if (!use_ssl_) {
-                // 防止 stop() 刚刚清空了列表，我们又往里塞了一个
-                if (is_stopping_) {
-                    // 也可以选择在这里 raw_sock.close()，但析构会自动处理
-                    co_return;
-                }
-
-                // 处理普通的 HTTP/1.1 连接
-
-                // 创建会话
-                auto session = std::make_shared<HttpSession>(std::move(raw_sock), router_, work_executor_, max_request_body_size_bytes_, initial_timeout_ms_, keep_alive_timeout);
-                // 注册
-                // [修改] 切换到 H1 strand 执行插入
-                // 使用 co_spawn 临时跳到 strand 上执行，执行完后 co_await 返回
-                co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<bool> {
-                    if (is_stopping_) co_return false;
-                    http_sessions_.insert(session);
-                    co_return true;
-                }, boost::asio::use_awaitable);
-
-                // 启动并自动清理
-                boost::asio::co_spawn(exec, [session, this]() -> boost::asio::awaitable<void> {
-                    try {
-                        // 我们现在 co_await session 的整个生命周期
-                        co_await session->run();
-                    } catch (const std::exception& e) {
-                        SPDLOG_DEBUG("HttpSession ended with exception: {}", e.what());
-                    }
-                    // 当 session->run() 结束后（无论正常或异常），
-                    // 这个协程会继续执行这里的代码。
-                    co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<void> {
-                        http_sessions_.erase(session);
-                        co_return;
-                    }, boost::asio::use_awaitable);
-                }, boost::asio::detached);
-                continue;
-            }
-
-            // --- SSL/TLS 连接处理流程 ---
-            // 1. 创建一个 SSL 流，将原始 TCP 套接字包装起来
-            auto tls_stream = std::make_shared<boost::asio::ssl::stream<tcp::socket>>(std::move(raw_sock), ssl_context_);
-
-            // 2. 异步执行 TLS 握手
-            co_await tls_stream->async_handshake(boost::asio::ssl::stream_base::server,
-                                                 // 以服务器模式进行握手
-                                                 boost::asio::redirect_error(boost::asio::use_awaitable, ec)
+            // 此时 socket 是 valid 的，且 get_executor() 返回的是 client_ioc
+            // socket.get_executor() 绑定的是 io_contexts_ 池子里的某一个 IO Context
+            /*boost::asio::co_spawn(
+                socket.get_executor(),
+                handle_connection(std::move(socket)),
+                boost::asio::detached
+            );*/
+            auto executor = socket.get_executor();
+            boost::asio::co_spawn(
+                executor,
+                [this, s = std::move(socket)]() mutable -> boost::asio::awaitable<void> {
+                    return handle_connection(std::move(s));
+                },
+                boost::asio::detached
             );
 
-            if (ec) {
-                // 这里可以根据具体的 SSL 错误码判断是否是协议错配
-                // 这里管你三七二十一只要遇到错误就返回这个
-
-                // 我们现在拥有底层的 tcp::socket，可以用来发送明文响应
-                auto& sock = tls_stream->next_layer();
-
-                HttpResponse resp{http::status::bad_request, 11};
-                resp.set(http::field::content_type, "text/html");
-                resp.set(http::field::connection, "close");
-                resp.set(http::field::server, aizix::framework::name + "/" + aizix::framework::version);
-                resp.body() = "<html><body><h1>400 Bad Request</h1>"
-                    "<p>This port requires HTTPS, but a plain HTTP request was received.</p>"
-                    "</body></html>";
-                resp.prepare_payload();
-
-                // 在原始 socket 上发送明文响应
-                // 我们需要忽略写操作的错误，因为对方可能已经不等响应就关闭了连接
-                co_await http::async_write(sock, resp, boost::asio::as_tuple(boost::asio::use_awaitable));
-                SPDLOG_ERROR("TLS handshake failed (likely HTTP request on HTTPS port) from {}: {}", tls_stream->next_layer().remote_endpoint().address().to_string(), ec.message());
-                // 无论如何都关闭连接
-                sock.close();
-                continue; // 握手失败，放弃此连接
-            }
-
-            // 握手是个耗时操作，握手回来后，服务器可能已经 stop 了
-            // 必须检查！否则会发生上述的 Use-After-Free 崩溃
-            if (is_stopping_) co_return;
-
-            // 3. ALPN 协议协商：检查客户端和服务器共同选择的应用层协议
-            const unsigned char* proto = nullptr;
-            unsigned int len = 0;
-            // 从 SSL 对象中获取协商结果
-            SSL_get0_alpn_selected(tls_stream->native_handle(), &proto, &len);
-            const std::string_view alpn{reinterpret_cast<const char*>(proto), len};
-
-            SPDLOG_INFO("ALPN 协商结果: {}", alpn);
-            // 4. 根据协商的协议，将连接分发给不同的处理器
-            if (alpn == "h2") {
-                // 如果协商结果是 HTTP/2
-                // 创建一个 Http2Session 来处理这个连接
-                auto session = Http2Session::create(tls_stream, work_executor_, router_, max_request_body_size_bytes_, keep_alive_timeout);
-
-                // 将 session 的 weak_ptr 转换为 shared_ptr 添加 Session 到列表中存起来
-                // 这样我们就有了一个可以安全地从集合中移除自身的 token
-                auto weak_session_ptr = std::weak_ptr<Http2Session>(session);
-
-                //  H2 Strand 插入
-                co_await boost::asio::co_spawn(h2_strand_, [&]() -> boost::asio::awaitable<bool> {
-                    if (is_stopping_) co_return false;
-                    h2_sessions_.insert(weak_session_ptr);
-                    co_return true;
-                }, boost::asio::use_awaitable);
-
-
-                // 启动 session 的处理循环
-                boost::asio::co_spawn(exec, [session, weak_session_ptr, this]() -> boost::asio::awaitable<void> {
-                                          try {
-                                              // 我们现在 co_await session 的整个生命周期
-                                              co_await session->start();
-                                          } catch (const std::exception& e) {
-                                              SPDLOG_DEBUG("Http2Session ended with exception: {}", e.what());
-                                          }
-
-                                          // --- 自动清理 ---
-                                          // [修改] H2 Strand 删除
-                                          co_await boost::asio::co_spawn(h2_strand_, [&]() -> boost::asio::awaitable<void> {
-                                              h2_sessions_.erase(weak_session_ptr);
-                                              SPDLOG_DEBUG("Http2Session removed.");
-                                              co_return;
-                                          }, boost::asio::use_awaitable);
-                                      },
-                                      boost::asio::detached);
-            } else {
-                // 回退到处理 HTTPS的逻辑
-
-                // 创建会话
-                auto session = std::make_shared<HttpsSession>(std::move(tls_stream), router_, work_executor_, max_request_body_size_bytes_, initial_timeout_ms_, keep_alive_timeout);
-                // 注册
-                co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<bool> {
-                    if (is_stopping_) co_return false;
-                    https_sessions_.insert(session);
-                    co_return true;
-                }, boost::asio::use_awaitable);
-
-                // 启动并自动清理
-                boost::asio::co_spawn(exec, [session, this]() -> boost::asio::awaitable<void> {
-                    try {
-                        // 我们现在 co_await session 的整个生命周期
-                        co_await session->run();
-                    } catch (const std::exception& e) {
-                        SPDLOG_DEBUG("HttpSession ended with exception: {}", e.what());
-                    }
-
-                    // HTTPS Strand 删除
-                    co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<void> {
-                        https_sessions_.erase(session);
-                        co_return;
-                    }, boost::asio::use_awaitable);
-                }, boost::asio::detached);
-            }
         } catch (const std::exception& e) {
             // 捕获异常后只打印日志，循环继续执行，确保服务器继续监听
             SPDLOG_ERROR("Exception in listener loop iteration: {}", e.what());
@@ -467,6 +349,158 @@ boost::asio::awaitable<void> Server::listener() {
     }
 }
 
+/**
+ * @brief 连接处理协程 (运行在 Worker Thread)
+ * 包含原 listener 中繁重的握手和 Session 创建逻辑
+ */
+boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::socket socket) {
+    try {
+        // 性能优化: 禁用 Nagle 算法开启TCP_NODELAY，这对 HTTP/2/1 性能至关重要
+        boost::system::error_code ec;
+        socket.set_option(boost::asio::ip::tcp::no_delay(true), ec);
+        if (ec) {
+            SPDLOG_WARN("Failed to set TCP_NODELAY: {}", ec.message());
+        }
+
+        SPDLOG_INFO("Handle connection start. Socket open: {}", socket.is_open());
+
+        if (!use_ssl_) {
+            if (is_stopping_) co_return;
+
+
+
+            const auto session = std::make_shared<HttpSession>(
+                std::move(socket), router_, work_executor_,
+                max_request_body_size_bytes_, initial_timeout_ms_, keep_alive_timeout);
+
+            // 注册到全局集合
+            // 使用 co_spawn 临时跳到 Main H1 Strand  上执行，执行完后 co_await 返回
+            co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<void> {
+                if (!is_stopping_) http_sessions_.insert(session);
+                co_return;
+            }, boost::asio::use_awaitable);
+
+            // 启动/运行 Session(当前线程)
+            try {
+                co_await session->run();
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR("HttpSession run error: {}", e.what());
+            }
+
+            // 清理集合 (切回 Main Strand)
+            co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<void> {
+                http_sessions_.erase(session);
+                co_return;
+            }, boost::asio::use_awaitable);
+
+            co_return;
+        }
+
+        // --- SSL/TLS 连接处理流程 ---
+        // 1. 创建一个 SSL 流，将原始 TCP 套接字包装起来
+        auto tls_stream = std::make_shared<boost::asio::ssl::stream<tcp::socket>>(std::move(socket), ssl_context_);
+
+        // 在 Worker 线程执行握手，不阻塞 Main Thread
+        co_await tls_stream->async_handshake(boost::asio::ssl::stream_base::server, // 以服务器模式进行握手
+                                             boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+
+        if (ec) {
+            // 这里可以根据具体的 SSL 错误码判断是否是协议错配
+            // 这里管你三七二十一只要遇到错误就返回这个
+
+            // 我们现在拥有底层的 tcp::socket，可以用来发送明文响应
+            auto& sock = tls_stream->next_layer();
+
+            HttpResponse resp{http::status::bad_request, 11};
+            resp.set(http::field::content_type, "text/html");
+            resp.set(http::field::connection, "close");
+            resp.set(http::field::server, aizix::framework::name + "/" + aizix::framework::version);
+            resp.body() = "<html><body><h1>400 Bad Request</h1>"
+                "<p>This port requires HTTPS, but a plain HTTP request was received.</p>"
+                "</body></html>";
+            resp.prepare_payload();
+
+            // 在原始 socket 上发送明文响应
+            // 我们需要忽略写操作的错误，因为对方可能已经不等响应就关闭了连接
+            co_await http::async_write(sock, resp, boost::asio::as_tuple(boost::asio::use_awaitable));
+            SPDLOG_ERROR("TLS handshake failed (likely HTTP request on HTTPS port) from {}: {}", tls_stream->next_layer().remote_endpoint().address().to_string(), ec.message());
+            // 无论如何都关闭连接
+            sock.close();
+            co_return; // 握手失败，放弃此连接
+        }
+
+        // 握手是个耗时操作，握手回来后，服务器可能已经 stop 了
+        // 必须检查！否则会发生上述的 Use-After-Free 崩溃
+        if (is_stopping_) co_return;
+
+        // 3. ALPN 协议协商：检查客户端和服务器共同选择的应用层协议
+        const unsigned char* proto = nullptr;
+        unsigned int len = 0;
+        // 从 SSL 对象中获取协商结果
+        SSL_get0_alpn_selected(tls_stream->native_handle(), &proto, &len);
+        // ReSharper disable once CppTooWideScopeInitStatement
+        const std::string_view alpn{reinterpret_cast<const char*>(proto), len};
+
+        SPDLOG_INFO("ALPN 协商结果: {}", alpn);
+        // 4. 根据协商的协议，将连接分发给不同的处理器
+        if (alpn == "h2") {
+            const auto session = Http2Session::create(tls_stream, work_executor_, router_, max_request_body_size_bytes_, keep_alive_timeout);
+
+            SPDLOG_INFO("H2: 准备注册 Session...");
+
+            // 将 session 的 weak_ptr 转换为 shared_ptr 添加 Session 到列表中存起来
+            // 这样我们就有了一个可以安全地从集合中移除自身的 token
+            const auto weak_session_ptr = std::weak_ptr<Http2Session>(session);
+
+            //  H2 Strand 插入
+            // 注册 (Main Strand)
+            co_await boost::asio::co_spawn(h2_strand_, [&]() -> boost::asio::awaitable<void> {
+                if (!is_stopping_) h2_sessions_.insert(weak_session_ptr);
+                co_return;
+            }, boost::asio::use_awaitable);
+
+            SPDLOG_INFO("H2: 注册完成，准备 Start...");
+
+            // 启动 session 的处理循环 (Worker Thread)
+            try {
+                co_await session->start();
+            } catch (const std::exception& e) {
+                SPDLOG_DEBUG("H2 error: {}", e.what());
+            }
+
+            // 清理 (Main h2 Strand)
+            co_await boost::asio::co_spawn(h2_strand_, [&]() -> boost::asio::awaitable<void> {
+                h2_sessions_.erase(weak_session_ptr);
+                co_return;
+            }, boost::asio::use_awaitable);
+        } else {
+            // 回退到处理 HTTPS的逻辑
+
+            // HTTPS 逻辑
+            const auto session = std::make_shared<HttpsSession>(std::move(tls_stream), router_, work_executor_, max_request_body_size_bytes_, initial_timeout_ms_, keep_alive_timeout);
+
+            // 注册
+            co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<void> {
+                if (!is_stopping_) https_sessions_.insert(session);
+                co_return;
+            }, boost::asio::use_awaitable);
+
+            //  启动session
+            try {
+                co_await session->run();
+            } catch (...) {
+            }
+
+            // 清理
+            co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<void> {
+                https_sessions_.erase(session);
+                co_return;
+            }, boost::asio::use_awaitable);
+        }
+    } catch (...) {
+        throw;
+    }
+}
 
 /**
  * @brief [私有] 配置并启动 TCP acceptor。

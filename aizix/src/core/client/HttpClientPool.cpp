@@ -20,7 +20,7 @@
 #include <boost/asio/redirect_error.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <boost/beast/ssl.hpp>
-
+#include <aizix/App.hpp>
 
 
 // 命名空间和类型别名
@@ -32,16 +32,17 @@ using ConnectionResult = std::pair<std::shared_ptr<IConnection>, ProtocolKnowled
  * @brief ConnectionManager 的构造函数。
  *        负责初始化 SSL 上下文、DNS 解析器，并根据配置启动后台维护任务。
  */
-HttpClientPool::HttpClientPool(boost::asio::io_context& ioc, const AizixConfig& config)
+HttpClientPool::HttpClientPool(aizix::App& app, const AizixConfig& config)
     : max_redirects(config.client.max_redirects),
-      ioc_(ioc),
-      strand_(ioc.get_executor()),
+      app_(app),                                  // 保存 App 引用
+      ioc_(app.get_main_ioc()),                   // 绑定到 Main Context
+      strand_(app.get_main_ioc().get_executor()), // Strand 绑定到 Main Context，保护全局 Map
       ssl_ctx_(boost::asio::ssl::context::tls_client),
-      resolver_(ioc),
+      resolver_(app.get_main_ioc()), // Resolver 绑定到 Main Context (DNS 解析量不大，且有缓存，放在主线程无妨)
       connect_timeout_(config.client.connect_timeout_ms),
       http2_enabled_(config.client.http2_enabled),
       http2_max_concurrent_streams_(config.client.http2_max_concurrent_streams),
-      maintenance_timer_(ioc),
+      maintenance_timer_(app.get_main_ioc()),
       maintenance_interval_(config.client.maintenance_interval_ms),
       idle_timeout_for_close_(config.client.idle_timeout_for_close_ms),
       idle_timeout_for_ping_(config.client.idle_timeout_for_ping_ms),
@@ -87,9 +88,8 @@ HttpClientPool::~HttpClientPool() {
     // ✅ 直接清理
     // 此时 ioc 通常已经停止了，或者是正在销毁过程中
     // 我们只需要确保 timer 被取消，不再触发回调即可
-    if (!stopped_)  stopped_ = true;
+    if (!stopped_) stopped_ = true;
     maintenance_timer_.cancel();
-
 }
 
 /**
@@ -467,11 +467,12 @@ void HttpClientPool::add_connection_to_pool_h2(const std::string& key, const std
  * @param port 目标端口号。
  * @return 一个协程句柄，其结果是成功创建的 `IConnection` 对象的共享指针。
  * @throws boost::system::system_error 如果在任何网络I/O阶段发生错误。
+ * @throws std::system_error 如果连接超时
  * @throws std::runtime_error 如果协议不被支持。
  */
 boost::asio::awaitable<std::shared_ptr<IConnection>> HttpClientPool::create_new_connection(const std::string& key, const std::string_view scheme, std::string_view host, const uint16_t port) {
     // 初始化变量
-    ProtocolKnowledge protocol = ProtocolKnowledge::Unknown;
+    auto protocol = ProtocolKnowledge::Unknown;
     std::shared_ptr<IConnection> new_conn = nullptr;
     std::exception_ptr exception_ptr = nullptr;
 
@@ -486,20 +487,24 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> HttpClientPool::create_new_
         auto result = co_await ([this, key, scheme, host, port]() -> boost::asio::awaitable<ConnectionResult> {
                 // --- 操作A: 完整的连接创建逻辑，被封装在 lambda 协程中 ---
 
-                // 3. 异步 DNS 解析。
+                // 3. 异步 DNS 解析。 (在 Main Context 执行)
                 boost::system::error_code ec;
                 const results_type endpoints = co_await resolver_.async_resolve(tcp::v4(), host, std::to_string(port), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
                 if (ec) throw boost::system::system_error(ec, "DNS resolution failed");
 
-                // 4. 创建连接
+                // 4. 创建连接 为新连接分配一个 Worker IO Context
+                auto& io_context = app_.get_ioc();
                 if (scheme == "https:") {
-                    // a. 创建 HTTP/1.1 socket连接。
-                    tcp::socket socket(ioc_);
+                    // a. 创建 HTTP/1.1 socket连接。绑定到 Worker Context, 之后的读写、加密都在 Worker 线程并行执行
+                    tcp::socket socket(io_context);
 
-                    // b. 用 socket 创建 ssl_stream
+                    // 性能优化: 禁用 Nagle 算法开启TCP_NODELAY，这对 HTTP/1/2 性能至关重要
+                    socket.set_option(boost::asio::ip::tcp::no_delay(true), ec);
+
+                    // b. 用 socket 创建 ssl_stream (它会继承 socket 的 executor)
                     auto stream = std::make_shared<boost::beast::ssl_stream<tcp::socket>>(std::move(socket), ssl_ctx_);
 
-                    // c. 建立 TCP 连接，底层 socket 是 stream->next_layer()
+                    // c. 建立 TCP 连接，async_connect 会跨线程操作，最终在 io_context 线程完成
                     ec.clear();
                     co_await async_connect(stream->next_layer(), endpoints, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
                     if (ec) throw boost::system::system_error(ec, "TCP connect failed for SSL");
@@ -511,7 +516,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> HttpClientPool::create_new_
                         throw boost::system::system_error(static_cast<int>(::ERR_get_error()), boost::asio::error::get_ssl_category());
                     }
 
-                    // e. 执行 TLS 握手。
+                    // e. 执行 TLS 握手。  (计算密集型，将在 io_contexts_ 池里的某一个线程 上执行)
                     ec.clear();
                     co_await stream->async_handshake(boost::asio::ssl::stream_base::client, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
                     if (ec) throw boost::system::system_error(ec, "TLS handshake failed");
@@ -538,7 +543,10 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> HttpClientPool::create_new_
                 if (scheme == "http:") {
                     // 创建纯文本 HTTP/1.1 连接。
                     ec.clear();
-                    tcp::socket socket(ioc_);
+                    tcp::socket socket(io_context);
+
+                    // 性能优化: 禁用 Nagle 算法开启TCP_NODELAY，这对 HTTP/1/2 性能至关重要
+                    socket.set_option(boost::asio::ip::tcp::no_delay(true), ec);
 
                     co_await async_connect(socket, endpoints.begin(), endpoints.end(), boost::asio::redirect_error(boost::asio::use_awaitable, ec));
                     if (ec) { throw boost::system::system_error(ec, "TCP connect failed"); }
@@ -556,7 +564,7 @@ boost::asio::awaitable<std::shared_ptr<IConnection>> HttpClientPool::create_new_
         if (result.index() == 1) {
             // .index() == 1 表示定时器获胜
             // 超时发生，抛出明确的超时异常。
-            throw boost::system::system_error(aizix_error::network::connection_timeout);
+            throw std::system_error(aizix_error::network::connection_timeout);
         }
 
         // 如果能到这里，说明是连接创建操作 (index 0) 获胜。
@@ -841,5 +849,3 @@ boost::asio::awaitable<void> HttpClientPool::run_maintenance() {
         }
     }
 }
-
-

@@ -5,16 +5,19 @@
 #include <aizix/core/client/websocket_client.hpp>
 #include <aizix/http/network_constants.hpp>
 
-#include <ada.h>
+#include <aizix/lib/ada.h>
 #include <boost/asio/redirect_error.hpp>
 #include <spdlog/spdlog.h>
 
+#include <aizix/App.hpp>
 
-WebSocketClient::WebSocketClient(boost::asio::io_context& ioc,bool ssl_verify)
-    : ioc_(ioc),
+
+WebSocketClient::WebSocketClient(aizix::App& app, const bool ssl_verify)
+    : app_(app),
+      main_ioc_(app.get_main_ioc()), // Resolver 绑定在 Main Context
       // 初始化一个专门用于 WebSocket 的 ssl::context
       ssl_ctx_(boost::asio::ssl::context::tls_client),
-      resolver_(ioc) {
+      resolver_(main_ioc_) {
     // 配置这个专用的 ssl_ctx_
     ssl_ctx_.set_options(network::ssl::CONTEXT_OPTIONS);
 
@@ -61,9 +64,9 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
     using TransportStream = std::variant<std::shared_ptr<PlainStream>, std::shared_ptr<SslStream>>;
     using results_type = boost::asio::ip::tcp::resolver::results_type;
 
-    SPDLOG_DEBUG("11111111111111111 scheme={},host={},port={},target={}", scheme,host,port,target);
+    // SPDLOG_DEBUG("scheme={},host={},port={},target={}", scheme, host, port, target);
     TransportStream transport;
-    // b. DNS 解析
+    // b. DNS 解析(在 Main Context 执行)
     boost::system::error_code ec;
     results_type endpoints = co_await resolver_.async_resolve(
         boost::asio::ip::tcp::v4(),
@@ -73,14 +76,19 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
 
     );
     if (ec) {
-        SPDLOG_DEBUG("Parsed WebSocket URL successfully: scheme={},host={},port={},target={} ...", scheme,host,port,target);
         throw boost::system::system_error(ec, "async_resolve failed");
     }
 
-    SPDLOG_DEBUG("2222222222222222");
+
+    //  获取一个 Worker IO Context
+    auto& worker_ioc = app_.get_ioc();
+
     if (use_ssl) {
-       auto stream = std::make_shared<SslStream>(ioc_, ssl_ctx_);
-        // 2) TCP 连接（迭代器重载 + redirect_error）
+        // Stream 绑定到 Worker IO Context
+        // 之后的 SSL 握手、WebSocket 读写都在 Worker IO Context 线程并行执行
+        auto stream = std::make_shared<SslStream>(worker_ioc, ssl_ctx_);
+
+        // TCP 连接（迭代器重载 + redirect_error）
         ec.clear();
         co_await stream->next_layer().async_connect(
             endpoints.begin(),
@@ -89,20 +97,23 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
         );
         if (ec) throw boost::system::system_error(ec, "tcp async_connect failed");
 
+        // SNI 设置
         std::string host_str(host);
         if (!SSL_set_tlsext_host_name(stream->native_handle(), host_str.c_str())) {
             throw boost::system::system_error(static_cast<int>(::ERR_get_error()), boost::asio::error::get_ssl_category());
         }
-        SPDLOG_DEBUG("ddddddddddddddddddddddddddddddd");
-        // 3) TLS 握手（redirect_error）
+
+        //  TLS 握手 (在 Worker IO Context 线程执行)
         ec.clear();
         co_await stream->async_handshake(boost::asio::ssl::stream_base::client, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
         if (ec) throw boost::system::system_error(ec, "tls async_handshake failed");
 
         transport = std::move(stream);
     } else {
-        auto stream = std::make_shared<PlainStream>(ioc_);
-        // 2) TCP 连接（迭代器重载 + redirect_error）
+        // Plain Stream 绑定到 Worker IO Context 线程
+        auto stream = std::make_shared<PlainStream>(main_ioc_);
+
+        // TCP 连接（迭代器重载 + redirect_error）
         ec.clear();
         co_await stream->async_connect(
             endpoints.begin(),
@@ -114,7 +125,7 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
         transport = std::move(stream);
     }
 
-    SPDLOG_DEBUG("3333333333333333333");
+
     // 1.2. 将 TransportStream 包装成 WsVariantStream
     WebSocketConnection::WsVariantStream ws_transport;
     std::visit([&ws_transport](auto& underlying_stream_ptr) {
@@ -143,7 +154,7 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
     for (const auto& field : headers) {
         upgrade_req.set(field.name(), field.value());
     }
-    SPDLOG_DEBUG("444444444444444444444444444");
+
     // 3. 创建 WebSocketConnection 实例
     static std::atomic<uint64_t> conn_counter = 0;
     std::string conn_id = "ws-conn-" + std::to_string(++conn_counter);
@@ -151,11 +162,12 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
         std::move(ws_transport), std::move(upgrade_req), std::move(handler), std::move(conn_id)
     );
 
-    SPDLOG_DEBUG("5555555555555555555555");
-    // 4. 启动它的 actor_loop
+
+    // 4. 启动 WebSocketConnection 的 actor_loop
+    // ws_conn->run() 会在其内部 stream 所属的 executor (即 Worker IO Context 线程) 上运行 Actor 循环
     ws_conn->run();
-    SPDLOG_DEBUG("666666666666666666666666");
-    // 6. 握手成功，返回可用的连接
+
+    // 5. 握手成功，返回可用的连接
     co_return ws_conn;
 }
 
@@ -167,22 +179,19 @@ boost::asio::awaitable<std::shared_ptr<WebSocketConnection>> WebSocketClient::co
  *   这是因为 WebSocket 没有像 HTTP 那样普遍接受的默认协议，强制明确可以避免连接错误。
  * - **协议验证**: 检查解析出的 scheme 是否确实是 "ws" 或 "wss"。
  *
- * @param url_strv 要解析的 WebSocket URL 字符串视图。
+ * @param url_strview 要解析的 WebSocket URL 字符串视图。
  * @return ParsedUrl 结构体。
  * @throws std::runtime_error 如果 URL 格式无效或协议不是 ws/wss。
  */
-WebSocketClient::ParsedUrl WebSocketClient::parse_url(const std::string_view url_strv) {
-
+WebSocketClient::ParsedUrl WebSocketClient::parse_url(const std::string_view url_strview) {
     // 1. 直接解析 URL
-     auto url = ada::parse<ada::url_aggregator>(url_strv);
-
+    auto url = ada::parse<ada::url_aggregator>(url_strview);
 
 
     // 2. 如果初步解析失败，通常是因为缺少协议头，尝试补全并重试
     if (!url) {
-        throw std::runtime_error("Failed to parse WebSocket URL: " + std::string(url_strv));
+        throw std::runtime_error("Failed to parse WebSocket URL: " + std::string(url_strview));
     }
-
 
 
     // 3. 从解析结果中提取所需信息
@@ -200,7 +209,7 @@ WebSocketClient::ParsedUrl WebSocketClient::parse_url(const std::string_view url
     }
 
     // 5. 解析端口
-     const std::string_view port = url->get_port();
+    const std::string_view port = url->get_port();
     if (port.empty()) {
         // 如果端口字段为空，则根据 scheme 获取标准默认端口 (如 ws ---> 80, wss ---> 443)
         result.port = url->scheme_default_port();

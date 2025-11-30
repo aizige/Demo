@@ -21,6 +21,8 @@
 #include <aizix/core/HttpsSession.hpp>
 
 
+namespace aizix {class App;}
+
 /// @class Server
 /// @brief 主服务器类，负责网络监听和连接分发。
 /// 服务器的“大脑”，负责监听、接受连接、进行协议分发。
@@ -36,11 +38,11 @@ class Server {
 public:
     /**
     @brief 构造函数 (带 IP 和端口)。
-    @param ioc 对主 io_context 的引用。
-    @param work_executor 工作线程的executor
+    @param app 传入 App 引用以获取 io_context  池
     @param config 配置文件
     */
-    Server(boost::asio::io_context& ioc, boost::asio::any_io_executor work_executor, const AizixConfig& config);
+    Server(aizix::App& app, const AizixConfig& config);
+
 
 
     /**
@@ -112,14 +114,23 @@ private
     static int alpn_select_callback(SSL* ssl, const unsigned char** out, unsigned char* out_len, const unsigned char* in, unsigned int in_len, void* arg);
 
 
-    /// @brief 对应用程序主 io_context 的引用。
-    boost::asio::io_context& io_context_;
+    // 处理单个连接的协程 (将在 Worker 线程上运行)
+    // 包含 SSL 握手、ALPN 协商和 Session 启动逻辑
+    boost::asio::awaitable<void> handle_connection(boost::asio::ip::tcp::socket socket);
+
+    // [修改] 引用 App 而不是 io_context
+    aizix::App& app_;
+
+
     /// @brief 工作线程的 executor
     boost::asio::any_io_executor work_executor_;
     /// @brief 用于创建和配置所有 TLS 连接的 SSL 上下文。
     boost::asio::ssl::context ssl_context_;
     /// @brief 负责在指定端口上监听和接受传入的 TCP 连接。
+    /// 绑定到 Main IO Context
     tcp::acceptor acceptor_;
+
+
     /// @brief 标志位，指示服务器当前是否应在 SSL/TLS 模式下运行。
     bool use_ssl_;
     /// @brief 存储所有已注册路由的路由器实例。
@@ -128,7 +139,8 @@ private
     /// listener循环停止标志 为true则不要再处理新连接了
     std::atomic<bool> is_stopping_{false};
 
-    /// @brief   // strand 保证在这个 executor 上提交的任务会串行执行，保证线程安全
+
+    /// @brief Strand 绑定到 Main IO Context (保护全局 Session 集合) 保证在这个 executor 上提交的任务会串行执行，保证线程安全
     boost::asio::strand<boost::asio::any_io_executor> h2_strand_;
     boost::asio::strand<boost::asio::any_io_executor> https_strand_;
     boost::asio::strand<boost::asio::any_io_executor> h1_strand_;
