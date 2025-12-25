@@ -4,14 +4,15 @@
 
 #include "ServiceInstanceManager.hpp"
 
-#include <map>
-#include <ranges>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <map>
+#include <ranges>
 #include <spdlog/spdlog.h>
+#include <utility>
 
 #include "error/xingju_error.hpp"
 
@@ -67,7 +68,7 @@ boost::asio::awaitable<bool> ServiceInstanceManager::registerInstance(aizix::Ins
                 // 列表发生变更，更新版本号
                 updateVersion(service_name);
                 co_return true;
-            } catch (std::exception& exc) {
+            } catch (std::exception& ) {
                 throw; // 让异常传递到 co_spawn 的 e 中
             }
         },
@@ -95,7 +96,7 @@ boost::asio::awaitable<bool> ServiceInstanceManager::registerInstance(aizix::Ins
  */
 void ServiceInstanceManager::removeInstance(const std::string& service_name, const std::string& instance_id) {
     // 将后续的维护工作调度到 strand_ 上，以保证对连接池的线程安全访问
-    boost::asio::post(strand_, [this, service_name, instance_id]() {
+    boost::asio::post(strand_, [this, service_name, instance_id]() ->void {
         const auto it_service = registry_.find(service_name);
         if (it_service != registry_.end()) {
             auto& instance_map = it_service->second;
@@ -222,7 +223,7 @@ boost::asio::awaitable<InstanceArray> ServiceInstanceManager::instances(const st
 
     for (auto service_name : service_name_array) {
         if (!service_name.empty()) {
-            std::string key(service_name); // 构造一次
+            std::string const key(service_name); // 构造一次
             if (const auto it = registry_.find(key); it != registry_.end()) {
                 std::vector<aizix::Instance> serviceInstances;
                 serviceInstances.reserve(it->second.size());
@@ -299,7 +300,7 @@ boost::asio::awaitable<void> ServiceInstanceManager::healthCheckTask() {
         // 这里的 co_await 会挂起协程，释放 strand 锁，允许其他请求(register/ping/get)插入执行
         co_await timer.async_wait(boost::asio::use_awaitable);
 
-        if (stopped_) break;
+        if (stopped_) { break;}
 
         // 醒来后, 依然在 strand 上, 直接操作 map, 不需要再 post！
         auto now = std::chrono::steady_clock::now();
@@ -317,14 +318,14 @@ boost::asio::awaitable<void> ServiceInstanceManager::healthCheckTask() {
                     now - last_heartbeat).count();
 
                 // 逻辑 1: 死亡移除 (Kill)
-                if (elapsed > instance.check_critical_timeout) {
+                if (std::cmp_greater(elapsed , instance.check_critical_timeout)) {
                     SPDLOG_WARN("Remove dead: {}", instance.instance_id);
                     it_inst = instance_map.erase(it_inst);
 
                     service_changed = true; // 标记变动
                 } else {
                     // 逻辑 2: 亚健康标记 (Mark Unhealthy)
-                    if (elapsed > instance.check_interval && instance.status == aizix::InstanceStatus::UP) {
+                    if (std::cmp_greater(elapsed , instance.check_interval) && instance.status == aizix::InstanceStatus::UP) {
                         instance.status = aizix::InstanceStatus::UNHEALTHY;
                         SPDLOG_WARN("Mark unhealthy: {}", instance.instance_id);
 

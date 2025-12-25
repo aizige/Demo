@@ -3,7 +3,6 @@
 
 #include "ResponseState.hpp"
 #include <string>
-#include <type_traits>
 #include <optional>
 #include <boost/json.hpp>
 
@@ -33,7 +32,7 @@ namespace xingju {
         static ResponseResult<T> success(T&& data) {
             return {ResponseState::SUCCESS.code, ResponseState::SUCCESS.message, std::make_optional(std::move(data))};
         }
-        
+
         // 3. 有数据 - 左值拷贝 (One Copy) -> success(vec)
         static ResponseResult<T> success(const T& data) {
             return {ResponseState::SUCCESS.code, ResponseState::SUCCESS.message, std::make_optional(data)};
@@ -70,7 +69,7 @@ namespace xingju {
         static ResponseResult<T> error(const StateInfo& state, T&& data) {
             return {state.code, state.message, std::make_optional(std::move(data))};
         }
-        
+
         // 4. 状态 + 左值数据 (One Copy)
         static ResponseResult<T> error(const StateInfo& state, const T& data) {
             return {state.code, state.message, std::make_optional(data)};

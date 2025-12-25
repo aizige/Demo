@@ -1,10 +1,11 @@
 //
 // Created by Aiziboy on 2025/11/12.
 //
+
 #include <filesystem>
 #include <iostream>
 #include <numa.h>
-#include <fmt/ranges.h>   // 关键头文件，提供对 STL 容器的格式化支持
+#include <fmt/ranges.h>
 
 #include <aizix/App.hpp>
 
@@ -19,10 +20,10 @@
 /// =================================================================================
 ///                          架构设计说明 (Architecture Overview)
 /// =================================================================================
-/// 本框架采用高性能的 "One Loop Per Thread" (Multi-Reactor) 模型，结合 NUMA 亲和性优化。
+/// 本框架采用高性能的 "One Loop Per Thread (io线程)" + Shared Thread Pool (cpu密集计算) 模型，结合 NUMA 亲和性优化。
 ///
 /// One Loop Per Thread: 就像每辆出租车都有一个司机，各跑各的。
-/// Thread Pool (Shared Loop): 就像一个巨大的任务队列，所有工人（线程）都盯着这个队列，谁闲谁抢。
+/// Shared Thread Pool: 就像一个巨大的任务队列，所有工人（线程）都盯着这个队列，谁闲谁抢。
 ///
 /// 1. IO 线程池 (io_context_pool_)
 ///    - 包含 N 个独立的 io_context，每个绑定到一个独立的系统线程和 CPU 核心。
@@ -54,7 +55,7 @@
 aizix::App::App(const std::string& config_path)
     : config_(ConfigLoader::load(config_path)),
       compute_ioc_(config_.server.worker_threads),                   // 初始化 Worker Context
-      compute_work_guard_(boost::asio::make_work_guard(compute_ioc_)) // 初始化 Work Guard，锁住 worker_ioc_
+      compute_work_guard_(make_work_guard(compute_ioc_)) // 初始化 Work Guard，锁住 worker_ioc_
 {
     // 2. 初始化 IO Context 池 (One Loop Per Thread 核心)
     const size_t io_threads_count = config_.server.io_threads;
@@ -70,7 +71,7 @@ aizix::App::App(const std::string& config_path)
         // hint: 1 表示这是一个单线程 loop，asio 可以据此优化
         auto ioc = std::make_shared<boost::asio::io_context>(1);
         io_context_pool_.push_back(ioc);
-        io_work_guards_.emplace_back(boost::asio::make_work_guard(*ioc));  // 创建 guard 防止 run() 在无任务时退出
+        io_work_guards_.emplace_back(make_work_guard(*ioc));  // 创建 guard 防止 run() 在无任务时退出
     }
 
     // 3. 初始化信号集 (必须绑定到主线程 io-0)
@@ -131,9 +132,9 @@ void aizix::App::addController(const std::shared_ptr<aizix::HttpController>& con
  */
 void aizix::App::bind_thread_to_core(const size_t core_id) {
     // 定义一个 CPU 集合，用来描述线程可以运行在哪些 CPU 上
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);         // 将集合清空（所有位设为0）
-    CPU_SET(core_id, &cpuset); // 将指定 core_id 对应的 CPU 加入集合
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);         // 将集合清空（所有位设为0）
+    CPU_SET(core_id, &cpu_set); // 将指定 core_id 对应的 CPU 加入集合
 
     // 获取当前线程的 pthread 标识
     const pthread_t current_thread = pthread_self();
@@ -143,8 +144,8 @@ void aizix::App::bind_thread_to_core(const size_t core_id) {
     // 参数说明：
     //   - current_thread: 当前线程
     //   - sizeof(cpu_set_t): 集合大小
-    //   - &cpuset: CPU 集合指针
-    if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
+    //   - &cpu_set: CPU 集合指针
+    if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpu_set) != 0) {
         // 如果返回值非0，说明设置失败，打印错误信息
         std::cerr << "Error setting thread affinity for core " << core_id << std::endl;
         SPDLOG_ERROR("Error setting thread affinity for core {}", core_id);
@@ -362,7 +363,7 @@ void aizix::App::setup_signal_handling() {
             signals_->cancel(); // 防止重复触发
 
             // 在 Main Loop 上启动停止协程
-            boost::asio::co_spawn(get_main_ioc(), [&]() -> boost::asio::awaitable<void> {
+            co_spawn(get_main_ioc(), [&]() -> boost::asio::awaitable<void> {
                 // 1. 关闭入口
                 SPDLOG_INFO("Shutting down server sessions...");
                 co_await server_->stop();

@@ -4,14 +4,14 @@
 
 #ifndef XINGJU_SERVER_MANAGER_HPP
 #define XINGJU_SERVER_MANAGER_HPP
-#include <chrono>
-#include <map>
-#include <unordered_map>
+#include "response/Instance.hpp"
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/json.hpp>
-#include "response/Instance.hpp"
+#include <chrono>
+#include <map>
+#include <unordered_map>
 
 using namespace std::chrono_literals;
 
@@ -40,7 +40,7 @@ struct InstanceArray {
         InstanceArray p;
         p.version = obj.at("version").as_uint64();
 
-        auto it = obj.find("instances");
+        const auto it = obj.find("instances");
         if (it != obj.end() && it->value().is_array()) {
             p.instances = boost::json::value_to<std::map<std::string, std::vector<aizix::Instance>>>(it->value());
         } else {

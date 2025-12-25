@@ -94,7 +94,7 @@ boost::asio::awaitable<void> Http2Session::do_write() {
             if (len > 0) {
                 SPDLOG_TRACE("H2: 正在发送 {} 字节数据...", len);
                 // 如果有数据，则通过 asio 异步写入到 SSL 流
-                co_await boost::asio::async_write(*stream_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
+                co_await async_write(*stream_, boost::asio::buffer(data_ptr, len), boost::asio::use_awaitable);
                 SPDLOG_TRACE("H2: 发送完成");
             }
         }
@@ -143,7 +143,7 @@ boost::asio::awaitable<void> Http2Session::writer_loop() {
                 // 重置定时器为永不超时
                 write_trigger_.expires_at(std::chrono::steady_clock::time_point::max());
 
-                co_await write_trigger_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+                co_await write_trigger_.async_wait(redirect_error(boost::asio::use_awaitable, ec));
 
                 // 如果等待被取消 (ec == operation_aborted)，说明是被 schedule_write 唤醒的 这是正常唤醒，继续执行。
                 // 如果是其他错误，则退出循环。
@@ -341,7 +341,7 @@ int Http2Session::on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* 
 
             // [修改] 直接 co_spawn 启动业务处理协程
             // 因为我们已经在 strand 里了，这会把任务加到 strand 队列尾部，稍后执行
-            boost::asio::co_spawn(
+            co_spawn(
                 self->strand_,
                 [self, sid]() -> boost::asio::awaitable<void> {
                     // 这里的 self 是 shared_ptr，保证 session 活着
@@ -408,7 +408,7 @@ int Http2Session::on_data_chunk_recv_callback(nghttp2_session*, uint8_t, int32_t
         nghttp2_submit_response(self->session_, stream_id, headers.data(), headers.size(), nullptr);
 
         // 2. 调度写入，尽快发送 413 响应
-        boost::asio::post(self->strand_, [self]() {
+        post(self->strand_, [self]() {
             self->schedule_write();
         });
 
@@ -448,7 +448,7 @@ int Http2Session::on_stream_close_callback(nghttp2_session* session, int32_t str
     // 而 provider_pack_ 和 streams_ 是被多个协程共享的资源。
     // 通过 post 到 strand_，我们确保了对这些 map 的擦除操作是线程安全的，
     // 不会与 dispatch 协程中对它们的访问或修改操作发生数据竞争。
-    boost::asio::post(self->strand_, [self, stream_id, error_code]() {
+    post(self->strand_, [self, stream_id]() {
         // 这个 lambda 会在 strand 的执行上下文中被安全地调用。
 
         // 1. 清理响应体数据提供者。
@@ -516,7 +516,7 @@ boost::asio::awaitable<void> Http2Session::idle_timer_loop() {
             }
 
             boost::system::error_code ec;
-            co_await idle_timer_.async_wait(boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+            co_await idle_timer_.async_wait(redirect_error(boost::asio::use_awaitable, ec));
 
             if (ec == boost::asio::error::operation_aborted) {
                 // 被取消是正常行为（状态改变），继续循环以重新评估状态
