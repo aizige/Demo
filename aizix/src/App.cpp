@@ -86,8 +86,14 @@ aizix::App::App(const std::string& config_path)
 
     // 打印依赖库的版本和当前工作目录
     const nghttp2_info* lib_info = nghttp2_version(0);
-    SPDLOG_DEBUG("📦 libnghttp2 version: {}", lib_info->version_str);
-    SPDLOG_DEBUG("📁 Workdir: {}", std::filesystem::current_path().string());
+    SPDLOG_INFO("📦 libnghttp2 version: {}", lib_info->version_str);
+    SPDLOG_INFO("📁 Workdir: {}", std::filesystem::current_path().string());
+
+    #if defined(BOOST_ASIO_HAS_IO_URING)
+    SPDLOG_INFO("Asio backend: io_uring");
+    #else
+    SPDLOG_INFO("Asio backend: epoll (standard)");
+    #endif
 }
 
 aizix::App::~App() = default;

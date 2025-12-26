@@ -75,10 +75,9 @@ namespace aizix {
         ///
         /// 用于绑定全局单例组件（如 Service 请求分发）、监听器（Acceptor）和信号集（Signals）。
         /// 它是 io_context_pool_ 的第 0 个元素。
-        boost::asio::io_context& get_main_ioc() { return *io_context_pool_[0]; }
+        boost::asio::io_context& get_main_ioc() const { return *io_context_pool_[0]; }
 
-        //boost::asio::io_context& io_context() { return ioc_; }
-        //boost::asio::any_io_executor io_executor() { return ioc_.get_executor(); }
+        const std::vector<std::shared_ptr<boost::asio::io_context>>& get_io_contexts() const { return io_context_pool_; }
 
         // 3. Worker Pool 获取
         // ReSharper disable once CppMemberFunctionMayBeConst
@@ -132,15 +131,14 @@ namespace aizix {
         // --- 网络 IO 线程池 (One Loop Per Thread) ---
         // 使用 shared_ptr 管理，避免 vector 扩容时的对象拷贝问题
         std::vector<std::shared_ptr<boost::asio::io_context>> io_context_pool_; // 网络 IO 线程池 (One Loop Per Thread)
-        std::vector<WorkGuard> io_work_guards_;        // IO Work Guards (防止每个 ioc 退出)
-        std::atomic<size_t> next_io_context_ {0};  //  轮询索引
-
+        std::vector<WorkGuard> io_work_guards_;                                 // IO Work Guards (防止每个 ioc 退出)
+        std::atomic<size_t> next_io_context_{0};                                //  轮询索引
 
 
         // --- 计算线程池 (Shared Loop Thread Pool) ---
         // 专门处理耗时任务，所有 Compute 线程共享这一个 Context
         boost::asio::io_context compute_ioc_;
-        WorkGuard compute_work_guard_;  //  Worker 的 Work Guard (防止 worker_ioc_.run() 在没任务时立刻返回)
+        WorkGuard compute_work_guard_; //  Worker 的 Work Guard (防止 worker_ioc_.run() 在没任务时立刻返回)
 
         // 3. 信号处理 (必须绑定到 main_ioc，使用 unique_ptr 延迟初始化)
         std::unique_ptr<boost::asio::signal_set> signals_;
@@ -153,7 +151,7 @@ namespace aizix {
 
         // 5. 线程句柄 (最后初始化，确保所有资源就绪后再启动线程)
         // 使用 jthread 自动管理生命周期 (自动 join)
-        std::vector<std::jthread> io_threads_;   // 运行 io_context_pool_[1...N]
+        std::vector<std::jthread> io_threads_; // 运行 io_context_pool_[1...N]
         // Worker 线程 (替代 thread_pool 内部线程)
         std::vector<std::jthread> compute_threads_; // 运行 compute_ioc_
 

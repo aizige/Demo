@@ -43,7 +43,6 @@ Server::Server(aizix::App& app, const AizixConfig& config)
     : app_(app), // 保存 App 引用
       work_executor_(app.worker_pool_executor()),
       ssl_context_(boost::asio::ssl::context::tlsv12_server), // 先用 io_context 构造 acceptor
-      acceptor_(app.get_main_ioc()),                          // Acceptor 必须绑定在 Main Context 上
       use_ssl_(config.server.ssl->enabled),
       // Strand 保护全局集合，绑定在 Main Context 上
       h2_strand_(boost::asio::make_strand(app.get_main_ioc())),
@@ -54,11 +53,13 @@ Server::Server(aizix::App& app, const AizixConfig& config)
       tls_versions_(config.server.ssl->tls_versions),
       initial_timeout_ms_(std::chrono::seconds(10s)),
       keep_alive_timeout(config.server.keep_alive_ms) {
-    // 调用一个辅助函数来完成剩下的设置
-    setup_acceptor(config.server.port, config.server.ip_v4);
+    // 1. 设置 TLS (如果启用)
     if (config.server.ssl && config.server.ssl->enabled) {
         set_tls(config.server.ssl->cert.value(), config.server.ssl->cert_private_key.value());
     }
+
+    // 2. 初始化所有 Acceptor (SO_REUSEPORT 核心逻辑)
+    setup_acceptor(config.server.port, config.server.ip_v4);
 }
 
 /**
@@ -123,11 +124,18 @@ void Server::set_tls(const std::string& cert_file, const std::string& key_file) 
 
 /**
  * @brief 启动服务器的监听循环。
- * 这是一个非阻塞操作，它会启动一个后台协程来处理连接接受。
+ * 这是一个非阻塞操作，它会为每个 Acceptor 启动一个监听协程来处理新连接
  */
 void Server::run() {
-    // 启动一个常驻的监听协程 在 Main Context 上运行
-    boost::asio::co_spawn(app_.get_main_ioc(), listener(), boost::asio::detached);
+    // 遍历所有 acceptor，在它们各自绑定的 io_context 上启动监听器
+    for (auto& acceptor : acceptors_) {
+        // 获取该 acceptor 绑定的 executor (即对应的 io_context)
+        auto& ioc = acceptor.get_executor();
+
+        // 在对应的线程上启动协程
+        boost::asio::co_spawn(ioc, listener(acceptor), boost::asio::detached);
+    }
+    SPDLOG_INFO("Server running with SO_REUSEPORT on {} threads.", acceptors_.size());
 }
 
 /**
@@ -150,11 +158,17 @@ boost::asio::awaitable<void> Server::stop() {
     // 设置标志位，通知 listener 不要再处理新连接了
     is_stopping_ = true;
 
-    // 1. 立即停止接受新连接，防止在关闭过程中有新会话建立。
-    if (acceptor_.is_open()) {
-        acceptor_.close();
-        SPDLOG_INFO("Server stopped accepting new connections.");
+    // 1. 关闭所有 Acceptor，立即停止接受新连接，防止在关闭过程中有新会话建立。
+    SPDLOG_INFO("Stopping {} acceptors...", acceptors_.size());
+    for (auto& acceptor : acceptors_) {
+        if (acceptor.is_open()) {
+            boost::system::error_code ec;
+            auto error_code = acceptor.close(ec); // 忽略错误
+
+        }
     }
+    SPDLOG_INFO("Server stopped accepting new connections.");
+
     // ========================================================================
     //  HTTP/1.1 普通会话的安全关闭
     // ========================================================================
@@ -278,15 +292,16 @@ boost::asio::awaitable<void> Server::stop() {
 
 
 /**
- * @brief 主监听协程 (运行在 Main Thread)
+ * @brief 主监听协程
  * 职责单一化：只负责 Accept，然后立即分发给 Worker
  */
-boost::asio::awaitable<void> Server::listener() {
+boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& acceptor) {
     // 获取当前协程的执行器，用于派生新的协程
     const auto exec = co_await boost::asio::this_coro::executor;
 
     // 定义一个定时器用于处理 accept 失败时的休眠
     boost::asio::steady_timer timer(exec);
+
     for (;;) // 无限循环以持续接受连接
     {
         try {
@@ -294,19 +309,17 @@ boost::asio::awaitable<void> Server::listener() {
             if (is_stopping_) co_return;
             boost::system::error_code ec;
 
-            // 从 Pool 获取下一个 IO Context
-            auto& client_ioc = app_.get_ioc();
+            // 直接在当前线程 accept。
+            // 因为 acceptor 已经绑定到了当前线程的 io_context，
+            // 且使用了 SO_REUSEPORT，内核会把连接分发到这里。
 
-            // 创建 Socket 并绑定到该 Context
-            // 之后的读写操作都会自动在这个 client_ioc 的线程上执行
-            tcp::socket socket(client_ioc);
+            // 构造一个 socket，绑定到当前 executor (当前 io_context)
+            tcp::socket socket(exec);
 
             // 异步等待并接受一个新的 TCP 连接
             // 直接把 socket 传给 accept
             // 这样 accept 成功后，socket 既拥有连接句柄，又绑定在 IO Worker context 线程池的线程上
-            co_await acceptor_.async_accept(
-                socket,
-                boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+            co_await acceptor.async_accept(socket, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
 
             // 接受失败，记录日志并继续等待下一个连接
             if (ec) {
@@ -326,22 +339,14 @@ boost::asio::awaitable<void> Server::listener() {
                 }
                 continue;
             }
-            // 此时 socket 是 valid 的，且 get_executor() 返回的是 client_ioc
-            // socket.get_executor() 绑定的是 io_contexts_ 池子里的某一个 IO Context
-            /*boost::asio::co_spawn(
-                socket.get_executor(),
-                handle_connection(std::move(socket)),
-                boost::asio::detached
-            );*/
-            auto executor = socket.get_executor();
+
             boost::asio::co_spawn(
-                executor,
+                exec, // 使用了 SO_REUSEPORT 继续在当前线程运行
                 [this, s = std::move(socket)]() mutable -> boost::asio::awaitable<void> {
                     return handle_connection(std::move(s));
                 },
                 boost::asio::detached
             );
-
         } catch (const std::exception& e) {
             // 捕获异常后只打印日志，循环继续执行，确保服务器继续监听
             SPDLOG_ERROR("Exception in listener loop iteration: {}", e.what());
@@ -366,7 +371,6 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
 
         if (!use_ssl_) {
             if (is_stopping_) co_return;
-
 
 
             const auto session = std::make_shared<HttpSession>(
@@ -515,26 +519,52 @@ void Server::setup_acceptor(const uint16_t port, const std::string& ip) {
     }
     const tcp::endpoint endpoint(address, port);
 
-    // 2. 配置 acceptor
-    if (const auto error_code = acceptor_.open(endpoint.protocol(), ec)) {
-        throw std::runtime_error("Acceptor failed to open: " + error_code.message());
+    // 获取所有 IO Context (包含 Main 和 Workers)
+    const auto& io_contexts = app_.get_io_contexts();
+    acceptors_.reserve(io_contexts.size());
+
+    // 遍历每一个 io_context
+    for (const auto& ioc : io_contexts) {
+        // 在 vector 中就地构造 acceptor，绑定到当前的 ioc
+        acceptors_.emplace_back(*ioc);
+        auto& acceptor = acceptors_.back();
+
+        // 打开协议
+        acceptor.open(endpoint.protocol(), ec);
+        if (ec) throw std::runtime_error("Acceptor open failed: " + ec.message());
+
+        // 设置 SO_REUSEADDR (允许重启后快速绑定端口)
+        acceptor.set_option(boost::asio::socket_base::reuse_address(true), ec);
+        if (ec) {
+            std::cerr << "Warning: Failed to set reuse_address option: " << ec.message() << std::endl; // 通常这不是一个致命错误，可以只打印警告
+            ec.clear();
+        }
+
+        // --- 核心：设置 SO_REUSEPORT ---
+        // 允许多个 socket 绑定到完全相同的 IP:PORT
+        // 注意：Boost.Asio 的 socket_option 封装可能不包含 reuse_port，需要手动定义或使用系统定义
+        #if defined(SO_REUSEPORT)
+        // 使用 setsockopt 的底层封装
+        using reuse_port = boost::asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>;
+        acceptor.set_option(reuse_port(true), ec);
+        if (ec) {
+            SPDLOG_CRITICAL("SO_REUSEPORT set failed! Kernel might be too old. Error: {}", ec.message());
+            throw std::runtime_error("SO_REUSEPORT required but failed to set.");
+        }
+        #else
+        #error "SO_REUSEPORT is not supported on this platform. Cannot use multi-acceptor design."
+        #endif
+
+        // 绑定
+        acceptor.bind(endpoint, ec);
+        if (ec) throw std::runtime_error("Failed to bind to endpoint " + ip + ":" + std::to_string(port) + ". Error: " + ec.message());
+
+        // 监听
+        acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
+        if (ec) throw std::runtime_error("Listen failed: " + ec.message());
     }
 
-    if (const auto error_code = acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec)) {
-        // 通常这不是一个致命错误，可以只打印警告
-        std::cerr << "Warning: Failed to set reuse_address option: " << error_code.message() << std::endl;
-        ec.clear();
-    }
-
-    if (const auto error_code = acceptor_.bind(endpoint, ec)) {
-        throw std::runtime_error("Failed to bind to endpoint " + ip + ":" + std::to_string(port) + ". Error: " + error_code.message());
-    }
-
-    if (const auto error_code = acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec)) {
-        throw std::runtime_error("Acceptor failed to listen: " + error_code.message());
-    }
-
-    std::cout << "Success: Server is listening on " << endpoint << std::endl;
+    std::cout << "Success: Server listening on " << endpoint << " with " << acceptors_.size() << " acceptors (SO_REUSEPORT)." << std::endl;
 }
 
 /**

@@ -25,12 +25,13 @@ target_sources(aizix PRIVATE
         src/core/client/websocket_connection.cpp
         src/core/client/websocket_client.cpp
         src/utils/config/ConfigLoader.cpp
-
         src/App.cpp
         src/lib/ada.cpp
 
 )
-add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
+add_compile_definitions(
+        BOOST_ASIO_HAS_IO_URING
+        SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
 
 target_include_directories(aizix
         PUBLIC
@@ -43,6 +44,7 @@ target_include_directories(aizix
 )
 
 # --- 查找所有依赖 ---
+find_package(liburing REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(Boost REQUIRED)
@@ -52,6 +54,7 @@ find_package(libnuma REQUIRED)
 
 # --- 正确地链接库 ---
 target_link_libraries(aizix PUBLIC
+        liburing::liburing
         boost::boost
         openssl::openssl
         ZLIB::ZLIB

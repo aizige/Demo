@@ -91,7 +91,7 @@ private
     /**
     * @brief 主监听协程，一个无限循环，负责接受新连接。
     */
-    boost::asio::awaitable<void> listener();
+    boost::asio::awaitable<void> listener(boost::asio::ip::tcp::acceptor& acceptor);
 
 
     /**
@@ -114,6 +114,7 @@ private
     static int alpn_select_callback(SSL* ssl, const unsigned char** out, unsigned char* out_len, const unsigned char* in, unsigned int in_len, void* arg);
 
 
+
     // 处理单个连接的协程 (将在 Worker 线程上运行)
     // 包含 SSL 握手、ALPN 协商和 Session 启动逻辑
     boost::asio::awaitable<void> handle_connection(boost::asio::ip::tcp::socket socket);
@@ -126,9 +127,9 @@ private
     boost::asio::any_io_executor work_executor_;
     /// @brief 用于创建和配置所有 TLS 连接的 SSL 上下文。
     boost::asio::ssl::context ssl_context_;
-    /// @brief 负责在指定端口上监听和接受传入的 TCP 连接。
-    /// 绑定到 Main IO Context
-    tcp::acceptor acceptor_;
+
+    /// @brief 负责在指定端口上监听和接受传入的 TCP 连接。 列表长度等于 io_threads 的数量
+    std::vector<boost::asio::ip::tcp::acceptor> acceptors_;
 
 
     /// @brief 标志位，指示服务器当前是否应在 SSL/TLS 模式下运行。
