@@ -180,6 +180,7 @@ bool Http2Connection::is_usable() const {
  * @brief 优雅地关闭连接
  */
 boost::asio::awaitable<void> Http2Connection::close() {
+
     // 使用原子 exchange 确保关闭消息只发送一次
     if (close_called_.exchange(true)) {
         co_return;
@@ -197,6 +198,7 @@ boost::asio::awaitable<void> Http2Connection::close() {
 
 
 asio::awaitable<bool> Http2Connection::ping() {
+
     // 如果连接不可用或正忙，则认为 ping "成功" (因为连接池不应移除它)
     update_ping_used_time();
 

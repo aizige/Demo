@@ -12,6 +12,8 @@
 #include <aizix/utils/config/AizixConfig.hpp>
 #include <aizix/http/router.hpp>
 #include <aizix/core/h2_session.hpp>
+#include <aizix/core/HttpSession.hpp>
+#include <aizix/core/HttpsSession.hpp>
 #include <aizix/utils/cert_checker.hpp>  // 证书检查工具
 
 #include <fstream>
@@ -44,10 +46,7 @@ Server::Server(aizix::App& app, const AizixConfig& config)
       work_executor_(app.worker_pool_executor()),
       ssl_context_(boost::asio::ssl::context::tlsv12_server), // 先用 io_context 构造 acceptor
       use_ssl_(config.server.ssl->enabled),
-      // Strand 保护全局集合，绑定在 Main Context 上
-      h2_strand_(boost::asio::make_strand(app.get_main_ioc())),
-      https_strand_(boost::asio::make_strand(app.get_main_ioc())),
-      h1_strand_(boost::asio::make_strand(app.get_main_ioc())),
+
       max_request_body_size_bytes_(config.server.max_request_size_bytes),
       http2_enabled_(config.server.http2_enabled),
       tls_versions_(config.server.ssl->tls_versions),
@@ -127,175 +126,166 @@ void Server::set_tls(const std::string& cert_file, const std::string& key_file) 
  * 这是一个非阻塞操作，它会为每个 Acceptor 启动一个监听协程来处理新连接
  */
 void Server::run() {
-    // 遍历所有 acceptor，在它们各自绑定的 io_context 上启动监听器
-    for (auto& acceptor : acceptors_) {
-        // 获取该 acceptor 绑定的 executor (即对应的 io_context)
+    // 遍历所有 acceptor
+    for (size_t i = 0; i < acceptors_.size(); ++i) {
+        auto& acceptor = acceptors_[i];
+        // 获取该线程专属的 Context 指针
+        // thread_contexts_ 在 setup_acceptor 中已经按顺序初始化
+        ThreadContext* ctx = thread_contexts_[i].get();
+
         auto& ioc = acceptor.get_executor();
 
-        // 在对应的线程上启动协程
-        boost::asio::co_spawn(ioc, listener(acceptor), boost::asio::detached);
+        // 传递 ctx 指针
+        boost::asio::co_spawn(ioc, listener(acceptor, ctx), boost::asio::detached);
     }
     SPDLOG_INFO("Server running with SO_REUSEPORT on {} threads.", acceptors_.size());
 }
 
+
 /**
+ * @brief 分布式优雅停机
  *
- * @brief [修复后] 异步地、优雅地关闭服务器上的所有活跃会话。
- * 这个协程是服务器优雅停机流程的关键部分。它会执行以下步骤：
- * 立即关闭 acceptor，停止接受任何新的客户端连接。
- * 安全地从会话管理列表中收集所有当前活跃的会话。
- * 并发地为每个活跃会话启动一个独立的 graceful_shutdown 协程。
- * 异步地等待所有这些关闭任务都完成后，此协程才会返回。
- * @note 调用者应该 co_await 这个函数，以确保在继续执行后续的清理
- * 操作（如停止 `io_context`）之前，所有网络会话都已完全关闭。
- * @note 目前此方法只处理 Http2Session。如果未来添加了其他需要
- * 优雅关闭的会话类型 (如 H2cSession)，应考虑引入一个
- * 通用的 IStoppable 接口来统一管理和关闭所有会话，
- * 以避免此函数中的代码重复。
- * @return 一个协程句柄，表示整个关闭流程。
+ * 难点：如何安全地停止并销毁运行在多个线程上的成千上万个协程？
+ * 解决方案：
+ * 1. 禁止新连接 (Close Acceptors)。
+ * 2. 广播任务：要求每个线程清理自己的 Session。
+ * 3. 引用计数栅栏 (active_coroutine_count)：主线程必须等待所有子协程（包括 detached 的关闭任务）
+ *    彻底析构栈内存后，才能返回。否则 App 析构导致 io_context 销毁，会导致 SEGV。
  */
 boost::asio::awaitable<void> Server::stop() {
-    // 设置标志位，通知 listener 不要再处理新连接了
+    // 1. 设置停止标志，通知 listener、handle_connection 不要再处理新连接了
     is_stopping_ = true;
 
-    // 1. 关闭所有 Acceptor，立即停止接受新连接，防止在关闭过程中有新会话建立。
+    // 2. 立即关闭所有 Acceptor，即刻停止接受新连接，防止在关闭过程中有新会话建立。
     SPDLOG_INFO("Stopping {} acceptors...", acceptors_.size());
     for (auto& acceptor : acceptors_) {
         if (acceptor.is_open()) {
             boost::system::error_code ec;
-            auto error_code = acceptor.close(ec); // 忽略错误
-
+            acceptor.close(ec); // 忽略错误
         }
     }
     SPDLOG_INFO("Server stopped accepting new connections.");
 
-    // ========================================================================
-    //  HTTP/1.1 普通会话的安全关闭
-    // ========================================================================
-    {
-        auto [e_ptr, sessions_snapshot] = co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<HttpSession>>> {
-            std::vector<std::shared_ptr<HttpSession>> snapshot;
-            snapshot.reserve(http_sessions_.size());
-            for (const auto& s : http_sessions_) {
-                snapshot.push_back(s);
+    // 3. 准备收集所有线程的关闭任务
+    const auto& io_contexts = app_.get_io_contexts();
+    std::vector<boost::asio::awaitable<void>> stop_tasks;
+    stop_tasks.reserve(io_contexts.size());
+
+    // 4. 为每个 IO 线程派发清理任务
+    for (size_t i = 0; i < io_contexts.size(); ++i) {
+        ThreadContext* ctx = thread_contexts_[i].get();
+        auto& ioc = *io_contexts[i];
+
+        // 在目标 IO 线程上执行清理逻辑
+        // 这是一个运行在目标 IO 线程上的主控协程
+        auto task = co_spawn(ioc, [ctx, i]() -> boost::asio::awaitable<void> {
+            // --- Step A: 暴力关闭 HTTP/1 和 HTTPS ---
+            // 它们通常无状态或不支持应用层 GOAWAY，直接断开 TCP
+            // 关闭 HTTP/1
+            for (auto& s : ctx->h1_sessions) s->stop();
+            ctx->h1_sessions.clear();
+
+            // 关闭 HTTPS
+            for (auto& s : ctx->https_sessions) s->stop();
+            ctx->https_sessions.clear();
+
+            // --- Step B: 收集活跃的 H2 Session ---
+            // 将 weak_ptr 转为 shared_ptr，只有活着的 session 才需要优雅关闭
+            std::vector<std::shared_ptr<Http2Session>> h2_alive;
+            for (auto& w : ctx->h2_sessions) {
+                if (auto s = w.lock()) h2_alive.push_back(s);
             }
-            http_sessions_.clear();
-            co_return snapshot;
-        }, boost::asio::as_tuple(boost::asio::use_awaitable));
 
-        // 在 strand 外部（并发地）调用 stop
-        for (const auto& s : sessions_snapshot) {
-            s->stop();
-        }
-        SPDLOG_INFO("Stopped {} HTTP sessions.", sessions_snapshot.size());
-    }
+            // 清空容器，断开引用
+            ctx->h2_sessions.clear();
 
-    // ========================================================================
-    //  HTTPS 会话的安全关闭
-    // ========================================================================
-    {
-        auto [e_ptr, sessions_snapshot] = co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<HttpsSession>>> {
-            std::vector<std::shared_ptr<HttpsSession>> snapshot;
-            snapshot.reserve(https_sessions_.size());
-            for (const auto& s : https_sessions_) {
-                snapshot.push_back(s);
-            }
-            https_sessions_.clear();
-            co_return snapshot;
-        }, boost::asio::as_tuple(boost::asio::use_awaitable));
+            // 如果没有 H2 会话，本线程的任务直接结束
+            if (h2_alive.empty()) co_return;
 
-        if (e_ptr) {
-            SPDLOG_ERROR("Error retrieving HTTPS sessions snapshot.");
-        } else {
-            for (const auto& s : sessions_snapshot) s->stop();
-            SPDLOG_INFO("Stopped {} HTTPS TLS sessions.", sessions_snapshot.size());
-        }
-    }
+            // 如果有活跃的 H2 会话，启动并行关闭流程
+            if (!h2_alive.empty()) {
+                SPDLOG_INFO("Thread-{} shutting down {} H2 sessions...", i, h2_alive.size());
 
-    // ========================================================================
-    //  HTTP/2 会话的安全收集与优雅等待
-    // ========================================================================
-    // 获取快照
+                auto ex = co_await boost::asio::this_coro::executor;
 
-    auto [e_ptr, h2_sessions_to_stop] = co_await boost::asio::co_spawn(
-        h2_strand_,
-        [&]() -> boost::asio::awaitable<std::vector<std::shared_ptr<Http2Session>>> {
-            std::vector<std::shared_ptr<Http2Session>> snapshot;
-            for (const auto& weak_session : h2_sessions_) {
-                if (auto session = weak_session.lock()) {
-                    snapshot.push_back(session);
+                // Channel 用于同步：等待所有 detached 协程发回“我做完了”的信号
+                auto completion_channel = std::make_shared<boost::asio::experimental::channel<void(boost::system::error_code)>>(ex, h2_alive.size());
+
+                // --- Step C: 为每个 H2 Session 启动一个 Detached 协程进行关闭 ---
+                for (const auto& session : h2_alive) {
+                    co_spawn(ex,
+                             [session, completion_channel, i, ctx]() -> boost::asio::awaitable<void> {
+                                 // RAII 计数器保护
+                                 // 只要这个协程还在栈上（还在运行或析构中），计数器就 > 0
+                                 // 计数器 +1
+                                 ++ctx->active_coroutine_count;
+                                 // 计数器 -1 (无论如何都会执行)
+                                 auto _ = Finally([ctx] { --ctx->active_coroutine_count; });
+
+                                 // 尝试优雅关闭
+                                 // 我们给优雅关闭本身加一个超时，而不是在外部加总超时
+                                 // 这样每个协程都是独立的，都能保证在有限时间内结束
+                                 boost::asio::steady_timer self_timer(co_await boost::asio::this_coro::executor);
+                                 self_timer.expires_after(5s);
+
+                                 try {
+                                     // 调用 Session 的优雅关闭 (发送 GOAWAY, 等待 Stream 结束), 竞争：优雅关闭 vs 超时
+                                     const auto res = co_await (session->graceful_shutdown() || self_timer.async_wait(boost::asio::use_awaitable));
+                                     if (res.index() == 1) session->stop(); // 自身超时，强制关闭
+                                 } catch (const std::exception& e) {
+                                     SPDLOG_DEBUG("Thread-{} H2 shutdown error: {}", i, e.what());
+                                     // 如果优雅关闭失败，强制关闭
+                                     session->stop();
+                                 } catch (...) {
+                                     SPDLOG_ERROR("Thread-{} H2 shutdown unknown error.", i);
+                                     session->stop();
+                                 }
+                                 // 无论成功失败，发送完成信号
+                                 co_await completion_channel->async_send(boost::system::error_code{}, boost::asio::use_awaitable);
+                             },
+                             boost::asio::detached
+                    );
+                }
+
+                // --- Step D: 等待收到所有信号 ---
+                // 此时，所有 detached 协程的逻辑已跑完，但栈变量可能还在析构中
+                for (size_t k = 0; k < h2_alive.size(); ++k) {
+                    co_await completion_channel->async_receive(boost::asio::use_awaitable);
                 }
             }
-            h2_sessions_.clear();
-            co_return snapshot;
-        }, boost::asio::as_tuple(boost::asio::use_awaitable));
 
-    // 如果出错或 H2 会话列表为空，直接返回
-    if (e_ptr || h2_sessions_to_stop.empty()) {
-        co_return;
+            // --- Step E: 最后的防线 (Reference Counting Barrier) ---
+            // 即使收到了所有信号，detached 协程的栈帧可能还没完全释放。
+            // 必须轮询计数器直到归零。如果这里直接返回，io_context 销毁会导致 Use-After-Free 崩溃。
+            if (ctx->active_coroutine_count > 0) {
+                SPDLOG_DEBUG("Thread-{} waiting for {} coroutines to die...", i, ctx->active_coroutine_count);
+                boost::asio::steady_timer flush_timer(co_await boost::asio::this_coro::executor);
+                while (ctx->active_coroutine_count > 0) {
+                    // 短轮询，等待栈展开完成
+                    flush_timer.expires_after(10ms);
+                    co_await flush_timer.async_wait(boost::asio::use_awaitable);
+                }
+            }
+            SPDLOG_DEBUG("Thread-{} clean exit.", i);
+        }, boost::asio::use_awaitable);
+
+        stop_tasks.push_back(std::move(task));
     }
 
-
-    // --- 并行等待所有 H2 会话优雅关闭 (代码逻辑复用你原有的 Channel 机制) ---
-
-    auto ex = co_await boost::asio::this_coro::executor;
-    auto completion_channel = std::make_shared<boost::asio::experimental::channel<void(boost::system::error_code)>>(
-        ex, h2_sessions_to_stop.size()
-    );
-
-    SPDLOG_INFO("Waiting for {} H2 sessions to graceful shutdown...", h2_sessions_to_stop.size());
-
-    for (const auto& session : h2_sessions_to_stop) {
-        // 获取 endpoint 字符串用于日志，需防范 session 已失效（虽然 shared_ptr 保证了存活）
-        std::string endpoint_str = "unknown";
-        try { endpoint_str = session->remote_endpoint().address().to_string(); } catch (...) {
-        }
-
-        boost::asio::co_spawn(ex,
-                              [session, channel_ptr = completion_channel, endpoint_str]() -> boost::asio::awaitable<void> {
-                                  try {
-                                      // 执行优雅关闭
-                                      co_await session->graceful_shutdown();
-                                  } catch (const std::exception& e) {
-                                      SPDLOG_WARN("H2 shutdown exception [{}]: {}", endpoint_str, e.what());
-                                  }
-                                  // 无论成功失败，发送完成信号
-                                  co_await channel_ptr->async_send(boost::system::error_code{}, boost::asio::use_awaitable);
-                              },
-                              boost::asio::detached
-        );
+    // 4. 主线程阻塞等待所有任务完成
+    for (auto& task : stop_tasks) {
+        co_await std::move(task);
     }
 
-    // 等待所有信号返回
-    // 设置 10 秒总超时
-    auto wait_logic = [&]() -> boost::asio::awaitable<void> {
-        for (size_t i = 0; i < h2_sessions_to_stop.size(); ++i) {
-            co_await completion_channel->async_receive(boost::asio::use_awaitable);
-        }
-    };
-
-    boost::asio::steady_timer stop_timer(co_await boost::asio::this_coro::executor);
-    stop_timer.expires_after(10s);
-
-    // 等待 "所有任务完成" 或者 "超时"
-    const auto result = co_await (
-        wait_logic() ||
-        stop_timer.async_wait(boost::asio::use_awaitable)
-    );
-
-    if (result.index() == 1) {
-        SPDLOG_WARN("Server stop timed out. Some H2 sessions might not have closed gracefully.");
-    } else {
-        SPDLOG_INFO("All sessions stopped gracefully.");
-    }
+    SPDLOG_INFO("All sessions stopped gracefully across all threads.");
 }
 
 
 /**
- * @brief 主监听协程
- * 职责单一化：只负责 Accept，然后立即分发给 Worker
+ * @brief 监听协程
+ * 职责单一化：只负责 Accept，然后立即分连接
  */
-boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& acceptor) {
+boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& acceptor, ThreadContext* ctx) {
     // 获取当前协程的执行器，用于派生新的协程
     const auto exec = co_await boost::asio::this_coro::executor;
 
@@ -313,7 +303,7 @@ boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& ac
             // 因为 acceptor 已经绑定到了当前线程的 io_context，
             // 且使用了 SO_REUSEPORT，内核会把连接分发到这里。
 
-            // 构造一个 socket，绑定到当前 executor (当前 io_context)
+            // 构造一个 socket，绑定到当前线程的 executor (当前 io_context)
             tcp::socket socket(exec);
 
             // 异步等待并接受一个新的 TCP 连接
@@ -340,10 +330,12 @@ boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& ac
                 continue;
             }
 
+            // 启动连接处理协程
+            // 使用 detached 模式，因为每个连接独立运行，不阻塞 listener
             boost::asio::co_spawn(
                 exec, // 使用了 SO_REUSEPORT 继续在当前线程运行
-                [this, s = std::move(socket)]() mutable -> boost::asio::awaitable<void> {
-                    return handle_connection(std::move(s));
+                [this, s = std::move(socket),ctx]() mutable -> boost::asio::awaitable<void> {
+                    return handle_connection(std::move(s), ctx);
                 },
                 boost::asio::detached
             );
@@ -355,34 +347,39 @@ boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& ac
 }
 
 /**
- * @brief 连接处理协程 (运行在 Worker Thread)
- * 包含原 listener 中繁重的握手和 Session 创建逻辑
+ * @brief 连接处理协程
  */
-boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::socket socket) {
+boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::socket socket, ThreadContext* ctx) {
     try {
-        // 性能优化: 禁用 Nagle 算法开启TCP_NODELAY，这对 HTTP/2/1 性能至关重要
+        // [RAII 计数器]
+        // 确保此协程存在期间，ThreadContext 中的 active_coroutine_count 不为 0
+        // 这会阻止 Server::stop() 提前退出，防止崩溃
+        ++ctx->active_coroutine_count; // 计数器 +1
+        // 使用 finally 确保协程退出时计数器 -1
+        auto _ = Finally([ctx] { --ctx->active_coroutine_count; });
+
+        // 早期检查：如果正在停止，直接退出，不要进行握手
+        if (is_stopping_) co_return;
+
+        // 性能优化: TCP_NODELAY 对 HTTP/2 性能至关重要 (减少小包延迟)
         boost::system::error_code ec;
         socket.set_option(boost::asio::ip::tcp::no_delay(true), ec);
         if (ec) {
             SPDLOG_WARN("Failed to set TCP_NODELAY: {}", ec.message());
         }
 
-        SPDLOG_INFO("Handle connection start. Socket open: {}", socket.is_open());
+        // SPDLOG_INFO("Handle connection start. Socket open: {}", socket.is_open());
 
         if (!use_ssl_) {
+            // ... HTTP/1 处理 ...
             if (is_stopping_) co_return;
-
 
             const auto session = std::make_shared<HttpSession>(
                 std::move(socket), router_, work_executor_,
                 max_request_body_size_bytes_, initial_timeout_ms_, keep_alive_timeout);
 
-            // 注册到全局集合
-            // 使用 co_spawn 临时跳到 Main H1 Strand  上执行，执行完后 co_await 返回
-            co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<void> {
-                if (!is_stopping_) http_sessions_.insert(session);
-                co_return;
-            }, boost::asio::use_awaitable);
+            // 无锁插入
+            ctx->h1_sessions.insert(session);
 
             // 启动/运行 Session(当前线程)
             try {
@@ -391,11 +388,8 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
                 SPDLOG_ERROR("HttpSession run error: {}", e.what());
             }
 
-            // 清理集合 (切回 Main Strand)
-            co_await boost::asio::co_spawn(h1_strand_, [&]() -> boost::asio::awaitable<void> {
-                http_sessions_.erase(session);
-                co_return;
-            }, boost::asio::use_awaitable);
+            // 无锁移除
+            ctx->h1_sessions.erase(session);
 
             co_return;
         }
@@ -433,8 +427,10 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
             co_return; // 握手失败，放弃此连接
         }
 
-        // 握手是个耗时操作，握手回来后，服务器可能已经 stop 了
-        // 必须检查！否则会发生上述的 Use-After-Free 崩溃
+        // 握手是耗时的，握手回来后再次检查是否停止
+        // 如果此时 Server 已经开始 stop，这个连接就没有注册到 sessions 列表中
+        // 我们必须在这里拦截它，否则它会变成“僵尸连接”导致崩溃
+        // 必须检查！否则会发生 Use-After-Free 崩溃
         if (is_stopping_) co_return;
 
         // 3. ALPN 协议协商：检查客户端和服务器共同选择的应用层协议
@@ -456,12 +452,9 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
             // 这样我们就有了一个可以安全地从集合中移除自身的 token
             const auto weak_session_ptr = std::weak_ptr<Http2Session>(session);
 
-            //  H2 Strand 插入
-            // 注册 (Main Strand)
-            co_await boost::asio::co_spawn(h2_strand_, [&]() -> boost::asio::awaitable<void> {
-                if (!is_stopping_) h2_sessions_.insert(weak_session_ptr);
-                co_return;
-            }, boost::asio::use_awaitable);
+
+            // --- 直接注册 ---
+            ctx->h2_sessions.insert(weak_session_ptr);
 
             SPDLOG_INFO("H2: 注册完成，准备 Start...");
 
@@ -470,13 +463,11 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
                 co_await session->start();
             } catch (const std::exception& e) {
                 SPDLOG_DEBUG("H2 error: {}", e.what());
+                throw;
             }
 
-            // 清理 (Main h2 Strand)
-            co_await boost::asio::co_spawn(h2_strand_, [&]() -> boost::asio::awaitable<void> {
-                h2_sessions_.erase(weak_session_ptr);
-                co_return;
-            }, boost::asio::use_awaitable);
+            // 直接清理
+            ctx->h2_sessions.erase(weak_session_ptr);
         } else {
             // 回退到处理 HTTPS的逻辑
 
@@ -484,22 +475,18 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
             const auto session = std::make_shared<HttpsSession>(std::move(tls_stream), router_, work_executor_, max_request_body_size_bytes_, initial_timeout_ms_, keep_alive_timeout);
 
             // 注册
-            co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<void> {
-                if (!is_stopping_) https_sessions_.insert(session);
-                co_return;
-            }, boost::asio::use_awaitable);
+            ctx->https_sessions.insert(session);
 
             //  启动session
             try {
                 co_await session->run();
-            } catch (...) {
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR("Https Session run error: {}", e.what());
+                throw;
             }
 
-            // 清理
-            co_await boost::asio::co_spawn(https_strand_, [&]() -> boost::asio::awaitable<void> {
-                https_sessions_.erase(session);
-                co_return;
-            }, boost::asio::use_awaitable);
+            // --- 直接移除 ---
+            ctx->https_sessions.erase(session);
         }
     } catch (...) {
         throw;
@@ -507,7 +494,10 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
 }
 
 /**
- * @brief [私有] 配置并启动 TCP acceptor。
+ * @brief 初始化 Acceptor vector数组 (SO_REUSEPORT)
+ *
+ * 传统的 "One Acceptor dispatch to Workers" 模式在高并发下存在锁竞争和跨线程开销。
+ * 这里为 App 中的 **每个 IO 线程** 创建一个独立的 acceptor，并全部监听 **同一个端口**。
  */
 void Server::setup_acceptor(const uint16_t port, const std::string& ip) {
     boost::system::error_code ec;
@@ -519,40 +509,45 @@ void Server::setup_acceptor(const uint16_t port, const std::string& ip) {
     }
     const tcp::endpoint endpoint(address, port);
 
-    // 获取所有 IO Context (包含 Main 和 Workers)
+    // 获取 App 管理的所有 IO Context (每个都绑定了一个 OS 线程)
     const auto& io_contexts = app_.get_io_contexts();
+
+    // 预分配 vector
     acceptors_.reserve(io_contexts.size());
+    thread_contexts_.reserve(io_contexts.size());
 
     // 遍历每一个 io_context
     for (const auto& ioc : io_contexts) {
-        // 在 vector 中就地构造 acceptor，绑定到当前的 ioc
+        // 1. 初始化 Acceptor，绑定到特定的 io_context
         acceptors_.emplace_back(*ioc);
         auto& acceptor = acceptors_.back();
 
-        // 打开协议
+        // 2. 初始化该线程的无锁上下文
+        thread_contexts_.push_back(std::make_unique<ThreadContext>());
+
+        // 3. 打开并配置 Socket
         acceptor.open(endpoint.protocol(), ec);
         if (ec) throw std::runtime_error("Acceptor open failed: " + ec.message());
-
-        // 设置 SO_REUSEADDR (允许重启后快速绑定端口)
+        // 配置 Socket 选项
         acceptor.set_option(boost::asio::socket_base::reuse_address(true), ec);
         if (ec) {
             std::cerr << "Warning: Failed to set reuse_address option: " << ec.message() << std::endl; // 通常这不是一个致命错误，可以只打印警告
             ec.clear();
         }
 
-        // --- 核心：设置 SO_REUSEPORT ---
-        // 允许多个 socket 绑定到完全相同的 IP:PORT
-        // 注意：Boost.Asio 的 socket_option 封装可能不包含 reuse_port，需要手动定义或使用系统定义
+        // --- 设置 SO_REUSEPORT ---
+        // 允许不同线程的 socket 绑定到完全相同的 IP:PORT。
+        // Linux 内核会自动进行负载均衡 (Sharding)，将连接分发给不同线程的 accept 队列。
         #if defined(SO_REUSEPORT)
         // 使用 setsockopt 的底层封装
         using reuse_port = boost::asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>;
         acceptor.set_option(reuse_port(true), ec);
         if (ec) {
-            SPDLOG_CRITICAL("SO_REUSEPORT set failed! Kernel might be too old. Error: {}", ec.message());
-            throw std::runtime_error("SO_REUSEPORT required but failed to set.");
+            SPDLOG_CRITICAL("SO_REUSEPORT set failed! Kernel too old? Error: {}", ec.message());
+            throw std::runtime_error("SO_REUSEPORT required.");
         }
         #else
-        #error "SO_REUSEPORT is not supported on this platform. Cannot use multi-acceptor design."
+        #error "SO_REUSEPORT not supported on this platform."
         #endif
 
         // 绑定

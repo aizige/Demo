@@ -100,6 +100,8 @@ boost::asio::awaitable<HttpResponse> HttpConnection::execute(const HttpRequest& 
  * @return boost::asio::awaitable<bool> 如果连接健康则 co_return true，否则 co_return false。
  */
 boost::asio::awaitable<bool> HttpConnection::ping() {
+    co_await boost::asio::dispatch(socket_.get_executor(),boost::asio::use_awaitable);
+
     // 1. 前置检查：如果连接已被标记为不可用，PING 必须立即失败。
     if (!is_usable()) {
         co_return false;
@@ -197,6 +199,7 @@ bool HttpConnection::is_usable() const {
  * 所以在协程中同步调用它们是安全且常见的做法。
  */
 boost::asio::awaitable<void> HttpConnection::close() {
+    co_await boost::asio::dispatch(socket_.get_executor(),boost::asio::use_awaitable);
     // 1. 立即将连接在逻辑上标记为不可用。
     keep_alive_ = false;
 

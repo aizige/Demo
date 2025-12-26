@@ -52,7 +52,7 @@ enum class ProtocolKnowledge {
 };
 
 struct ProtocolInfo {
-    ProtocolKnowledge knowledge;
+    ProtocolKnowledge knowledge = ProtocolKnowledge::Unknown;
     std::chrono::steady_clock::time_point last_updated;
 };
 

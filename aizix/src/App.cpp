@@ -6,15 +6,13 @@
 #include <iostream>
 #include <numa.h>
 #include <fmt/ranges.h>
-
 #include <aizix/App.hpp>
-
 #include <aizix/core/client/http_client.hpp>
 #include <aizix/core/client/websocket_client.hpp>
-
 #include <aizix/utils/logger_manager.hpp>
 #include <aizix/utils/thread_utils.hpp>
 #include <aizix/utils/config/ConfigLoader.hpp>
+#include <nghttp2/nghttp2.h>
 
 
 /// =================================================================================

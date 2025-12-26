@@ -26,7 +26,7 @@ cert_private_key = "./dev-cert/server.key"            # certificate_private_key_
 tls_versions = ["TLSv1.3", "TLSv1.2"]                        # 服务端Tls版本。tls_version数组最大size为2。Tls版本范围示例：["TLSv1.3","TLSv1.1"]这将支持TLSv1.1、TLSv1.2、TLSv1.3。["TLSv1.3"]：将只支持TLSv1.3
 
 [client]
-http2_enabled = true  # 启用HTTP2客户端(启用后对于Https连接，优先使用H2协议发起请求)
+http2_enabled = false  # 启用HTTP2客户端(启用后对于Https连接，优先使用H2协议发起请求)
 ssl_verify = false     # false 表示跳过证书验证，仅用于测试环境
 max_redirects_ = 3    # 最大重定向次数.默认3，(≤ 0则关闭重定向)
 connect_timeout_ms = 10000        # 连接建立超时	TCP + TLS 握手阶段的最大等待时间（如 10000ms）

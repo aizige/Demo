@@ -39,7 +39,7 @@ public:
     @param max_request_body_size_bytes 最大允许的 HTTP 请求体大小 （bytes）
     @param keep_alive_timeout keep alive超时时间.
     */
-    Http2Session(StreamPtr stream,boost::asio::any_io_executor work_executor, Router& router, size_t max_request_body_size_bytes, std::chrono::milliseconds keep_alive_timeout);
+    Http2Session(StreamPtr stream, boost::asio::any_io_executor work_executor, Router& router, size_t max_request_body_size_bytes, std::chrono::milliseconds keep_alive_timeout);
     /**
     @brief 析构函数。
     负责释放 nghttp2 会话资源。
@@ -60,8 +60,8 @@ public:
    * @param keep_alive_timeout keep alive超时时间.
     *@return Http2Session 的 std::shared_ptr 实例。
     */
-    static std::shared_ptr<Http2Session> create(StreamPtr stream, boost::asio::any_io_executor work_executor,Router& r, size_t max_request_body_size_bytes, std::chrono::milliseconds keep_alive_timeout) {
-        return std::make_shared<Http2Session>(std::move(stream),  std::move(work_executor),r, max_request_body_size_bytes, keep_alive_timeout);
+    static std::shared_ptr<Http2Session> create(StreamPtr stream, boost::asio::any_io_executor work_executor, Router& r, size_t max_request_body_size_bytes, std::chrono::milliseconds keep_alive_timeout) {
+        return std::make_shared<Http2Session>(std::move(stream), std::move(work_executor), r, max_request_body_size_bytes, keep_alive_timeout);
     }
 
     /**
@@ -78,25 +78,32 @@ public:
     * @return 一个可等待的 Asio awaitable。
     */
     boost::asio::awaitable<void> graceful_shutdown(uint32_t error_code = NGHTTP2_NO_ERROR);
+
     /**
-    @brief 获取客户端的远程网络端点（IP 和端口）。
-    @return tcp::endpoint 对象。
+     * @brief 强制立即关闭连接。
+     * 用于服务器停机时的超时强制清理，或者遇到致命错误时。
+     * 线程安全：会自动调度到 strand 上执行。
+     */
+    void stop();
+
+    /**
+     * @brief 获取客户端的远程网络端点（IP 和端口）。
+     * @return tcp::endpoint 对象。
     */
     tcp::endpoint remote_endpoint() const;
 
 private:
     /**
- * @brief 初始化 nghttp2 会话，设置所有必需的回调函数。
- */
+     * @brief 初始化 nghttp2 会话，设置所有必需的回调函数。
+     */
     void init_session();
     /**
- * @brief 核心协程之一：会话循环（读取循环）。
- *        - 负责从 TCP/TLS 套接字异步读取数据。
- *        - 将读取到的数据送入 nghttp2 引擎进行解析。
- *        - 管理连接的空闲超时。
- */
+     * @brief 核心协程之一：会话循环（读取循环）。
+     *        - 负责从 TCP/TLS 套接字异步读取数据。
+     *        - 将读取到的数据送入 nghttp2 引擎进行解析。
+     *        - 管理连接的空闲超时。
+     */
     boost::asio::awaitable<void> session_loop();
-
 
 
     /**
@@ -104,7 +111,7 @@ private:
      *        - 从 nghttp2 引擎获取待发送的数据。
      *        - 将数据异步写入 TCP/TLS 套接字。
      */
-    boost::asio::awaitable<void> do_write() ;
+    boost::asio::awaitable<void> do_write();
 
     /**
      * @brief 处理单个 HTTP/2 请求流。
@@ -134,8 +141,6 @@ private:
     boost::asio::awaitable<void> idle_timer_loop();
 
 
-
-
     // --- nghttp2 C-style 回调函数 ---
     // 这些是静态函数，因为 C 库不知道如何调用 C++ 成员函数。
     // `void* user_data` 参数被用来传递 `this` 指针，从而在回调内部可以访问 Http2Session 实例。
@@ -150,9 +155,9 @@ private:
      */
     struct StreamContext {
         std::vector<std::pair<std::string, std::string>> headers; // 存储解析出的原始请求头
-        std::string body; // 存储接收到的请求体数据
-        size_t body_size = 0; // 跟踪 body 大小
-        bool is_rejected = false; // 标记此流是否已因超限被拒绝
+        std::string body;                                         // 存储接收到的请求体数据
+        size_t body_size = 0;                                     // 跟踪 body 大小
+        bool is_rejected = false;                                 // 标记此流是否已因超限被拒绝
     };
 
 
@@ -163,29 +168,27 @@ private:
      */
     struct ProviderPack {
         std::shared_ptr<std::string> content; // 指向响应体字符串的共享指针，以管理其生命周期，防止在异步发送完成前被析构。
-        size_t offset = 0; // 用于跟踪已发送数据量的偏移量，以实现高效的发送。
+        size_t offset = 0;                    // 用于跟踪已发送数据量的偏移量，以实现高效的发送。
     };
 
     // --- 成员变量 ---
 
-    StreamPtr stream_; // 指向 SSL/TLS 流的共享指针，代表了与客户端的连接。
-    boost::asio::any_io_executor work_executor_; // 注入进来的thread_pool executor
-    Router& router_; // 对服务器主路由器的引用。
-    boost::asio::strand<boost::asio::any_io_executor> strand_; // strand 保证所有对 session 共享状态的操作都在同一个逻辑线程上，避免数据竞争。
-    nghttp2_session* session_; // 指向 nghttp2 会话实例的裸指针，由 nghttp2 库管理。
-    std::unordered_map<int32_t, StreamContext> streams_; // 存储活跃的请求流上下文，键是 stream_id。
+    StreamPtr stream_;                                                         // 指向 SSL/TLS 流的共享指针，代表了与客户端的连接。
+    boost::asio::any_io_executor work_executor_;                               // 注入进来的thread_pool executor
+    Router& router_;                                                           // 对服务器主路由器的引用。
+    boost::asio::strand<boost::asio::any_io_executor> strand_;                 // strand 保证所有对 session 共享状态的操作都在同一个逻辑线程上，避免数据竞争。
+    nghttp2_session* session_;                                                 // 指向 nghttp2 会话实例的裸指针，由 nghttp2 库管理。
+    std::unordered_map<int32_t, StreamContext> streams_;                       // 存储活跃的请求流上下文，键是 stream_id。
     std::unordered_map<int32_t, std::shared_ptr<ProviderPack>> provider_pack_; // 存储响应数据提供者，确保响应体在发送完成前一直有效。
 
     boost::asio::steady_timer idle_timer_; // 用于实现连接空闲超时的计时器。
-    size_t active_streams_ = 0; // 当前活跃的流数量。
+    size_t active_streams_ = 0;            // 当前活跃的流数量。
 
     size_t max_request_body_size_bytes_;
     std::chrono::milliseconds keep_alive_ms_;
 
     // 用于唤醒 writer_loop 的机制
     boost::asio::steady_timer write_trigger_; // 一个定时器，通过取消它来立即触发一次写操作，比使用 channel 更轻量。
-    bool write_in_progress_ = false; // 一个标志位，防止 writer_loop 的重入。
-
-
+    bool write_in_progress_ = false;          // 一个标志位，防止 writer_loop 的重入。
 };
 #endif // AIZIX_HTTP2_SESSION_HPP

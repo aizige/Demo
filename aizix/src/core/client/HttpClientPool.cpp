@@ -444,6 +444,7 @@ void HttpClientPool::add_connection_to_pool_h2(const std::string& key, const std
         h2_pool_[key].push_back(conn);
         SPDLOG_DEBUG("将 {} 添加到h2_pool中，当前连接数量{}", key, h2_pool_[key].size());
     } else {
+        // H1 创建后直接给请求者，不入池；用完归还才入池
         //pool_[key].push_back(conn);
         //SPDLOG_DEBUG("将 {} 添加到h1_pool中，当前连接数量{}", key, pool_[key].size());
     }

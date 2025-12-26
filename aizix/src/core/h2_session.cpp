@@ -156,7 +156,7 @@ boost::asio::awaitable<void> Http2Session::writer_loop() {
             if (write_in_progress_) continue; // 防止重入
             write_in_progress_ = true;
             // 使用互斥标志和 RAII guard 确保同一时间只有一个 do_write 循环在运行。确保在协程退出时（无论是正常还是异常）都能重置标志位
-            auto guard = Finally([this] { write_in_progress_ = false; });
+            auto _ = Finally([this] { write_in_progress_ = false; });
 
             // 清空队列 循环
             // 一旦被唤醒，就持续写，直到 nghttp2 的发送缓冲区被清空。
@@ -490,6 +490,29 @@ boost::asio::awaitable<void> Http2Session::graceful_shutdown(uint32_t error_code
     // 注意：我们不在此处等待写操作完成。关闭流程的其他部分（如 session_loop 退出）会处理后续的 socket 关闭。
 }
 
+void Http2Session::stop() {
+    // 使用 dispatch 确保在 strand 上下文中执行，保证线程安全
+    // 捕获 shared_from_this() 确保在执行期间 Session 不会被析构
+    boost::asio::dispatch(strand_, [self = shared_from_this()]() {
+        boost::system::error_code ec;
+
+        // 检查 stream 是否有效 (假设 stream_ 是智能指针)
+        if (self->stream_) {
+            // 获取底层的 TCP socket (next_layer) 并强制关闭
+            auto& socket = self->stream_->next_layer();
+
+            if (socket.is_open()) {
+                socket.close(ec);
+                if (ec) {
+                    SPDLOG_DEBUG("Force stop: socket close error: {}", ec.message());
+                } else {
+                    SPDLOG_DEBUG("Force stop: Connection closed successfully.");
+                }
+            }
+        }
+    });
+}
+
 /// @brief 获取远程客户端的端点信息
 boost::asio::ip::tcp::endpoint Http2Session::remote_endpoint() const {
     try {
@@ -501,6 +524,7 @@ boost::asio::ip::tcp::endpoint Http2Session::remote_endpoint() const {
         return {};
     }
 }
+
 
 
 boost::asio::awaitable<void> Http2Session::idle_timer_loop() {

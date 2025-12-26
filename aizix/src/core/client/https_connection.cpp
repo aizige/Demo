@@ -41,6 +41,8 @@ HttpsConnection::HttpsConnection(StreamPtr stream, std::string pool_key)
  * @return boost::asio::awaitable<bool> 如果 PING 成功则 co_return true，否则 co_return false。
  */
 boost::asio::awaitable<bool> HttpsConnection::ping() {
+    co_await boost::asio::dispatch(stream_->get_executor(),boost::asio::use_awaitable);
+
     // 1. 前置检查：如果连接已标记为不可用，或正在处理业务请求，则无需 PING。
     if (!is_usable()) {
         co_return false;
@@ -187,6 +189,8 @@ bool HttpsConnection::is_usable() const {
  * @brief 异步地、主动地关闭此 HTTPS 连接。
  */
 boost::asio::awaitable<void> HttpsConnection::close() {
+    co_await boost::asio::dispatch(stream_->get_executor(),boost::asio::use_awaitable);
+
     // 立即将连接在逻辑上标记为不可用。
     keep_alive_ = false;
 
