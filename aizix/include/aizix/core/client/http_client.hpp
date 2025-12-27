@@ -8,16 +8,29 @@
 #include <utility>
 
 #include <aizix/core/client/ihttp_client.hpp>
-#include <aizix/core/client/HttpClientPool.hpp>
 #include <aizix/http/http_common_types.hpp>
+
+
+struct AizixConfig;
+
+struct ParsedUrl {
+    std::string scheme; // 是带:格式的。(例如: https:,而非: https) 以Ada的scheme格式为准
+    std::string host;
+    uint16_t port;
+    std::string target;
+};
+
+class IConnection;
+namespace aizix { class App; }
 
 class HttpClient final : public IHttpClient {
 public:
     /**
      * @brief 构造函数。
-     * @param manager 一个 ConnectionManager 的共享指针，HttpClient 将使用它来获取和管理连接。
+    * @param app 应用程序实例引用。HttpClient 将通过它动态获取当前线程的连接池。
+    * @param config 配置
      */
-    explicit HttpClient(std::shared_ptr<HttpClientPool> manager);
+    explicit HttpClient(aizix::App& app);
 
     boost::asio::awaitable<HttpResponse> get(std::string_view url, const Headers& headers) override;
     boost::asio::awaitable<HttpResponse> post(std::string_view url, const std::string& body, const Headers& headers) override;
@@ -25,27 +38,22 @@ public:
 
 private:
     using InternalResponse = std::pair<HttpResponse, std::shared_ptr<IConnection>>;
+
     // 内部辅助函数，用于解析 URL
     // 返回 scheme, host, port, target
-    struct ParsedUrl {
-        std::string scheme; // 是带:格式的。(例如: https:,而非: https) 以Ada的scheme格式为准
-        std::string host;
-        uint16_t port;
-        std::string target;
-    };
-
     static ParsedUrl parse_url(std::string_view url_strv);
     static std::string resolve_url(const std::string& base_url, const std::string& location);
+
     // 统一的内部执行函数
     [[nodiscard]] boost::asio::awaitable<InternalResponse> execute_internal(const HttpRequest& request, const ParsedUrl& target) const;
 
 
-    /// @brief 指向连接管理器的共享指针。
-    std::shared_ptr<HttpClientPool> manager_;
+    /// @brief 引用 App 实例，用于访问 Per-Thread Pool
+    aizix::App& app_;
 
 
     /// @brief 允许的最大重定向次数，防止无限循环。
     /// @note  值小于等于0则关闭自动处理 HTTP 重定向 (3xx 状态码)
-    uint8_t max_redirects_ = 3;
+    uint8_t max_redirects_;
 };
 #endif // AIZIX_HTTP_CLIENT_HPP

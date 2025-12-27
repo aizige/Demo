@@ -15,6 +15,11 @@
 #include <nghttp2/nghttp2.h>
 
 
+// 线程局部存储：存储当前线程专属的 HttpClientPool 指针
+// 默认初始化为空
+thread_local std::shared_ptr<HttpClientPool> t_local_http_client_pool = nullptr;
+
+
 /// =================================================================================
 ///                          架构设计说明 (Architecture Overview)
 /// =================================================================================
@@ -52,7 +57,7 @@
  */
 aizix::App::App(const std::string& config_path)
     : config_(ConfigLoader::load(config_path)),
-      compute_ioc_(config_.server.worker_threads),                   // 初始化 Worker Context
+      compute_ioc_(config_.server.worker_threads),       // 初始化 Worker Context
       compute_work_guard_(make_work_guard(compute_ioc_)) // 初始化 Work Guard，锁住 worker_ioc_
 {
     // 2. 初始化 IO Context 池 (One Loop Per Thread 核心)
@@ -69,7 +74,7 @@ aizix::App::App(const std::string& config_path)
         // hint: 1 表示这是一个单线程 loop，asio 可以据此优化
         auto ioc = std::make_shared<boost::asio::io_context>(1);
         io_context_pool_.push_back(ioc);
-        io_work_guards_.emplace_back(make_work_guard(*ioc));  // 创建 guard 防止 run() 在无任务时退出
+        io_work_guards_.emplace_back(make_work_guard(*ioc)); // 创建 guard 防止 run() 在无任务时退出
     }
 
     // 3. 初始化信号集 (必须绑定到主线程 io-0)
@@ -105,6 +110,30 @@ boost::asio::io_context& aizix::App::get_ioc() {
     const size_t index = next_io_context_.fetch_add(1, std::memory_order_relaxed);
     return *io_context_pool_[index % io_context_pool_.size()];
 }
+
+
+/**
+ * @brief 获取当前线程专属的 HttpClientPool。
+ * @warning 必须在 IO 线程中调用！
+ */
+std::shared_ptr<HttpClientPool> aizix::App::get_local_client_pool() {
+    // 如果你在非 IO 线程调用（如 main 或 compute），这里可能是 nullptr
+    // 这是一个必须遵守的规约：只能在 IO 线程发请求
+    if (!t_local_http_client_pool) {
+        // 可以在这里加个 fallback 或者报错
+        // SPDLOG_WARN("Accessing HttpClientPool from non-IO thread!");
+        throw std::runtime_error("Accessing HttpClientPool from non-IO thread");
+    }
+    return t_local_http_client_pool;
+}
+
+///  初始化 TLS 变量
+void aizix::App::init_thread_local_pool(size_t thread_index) {
+    if (thread_index < http_client_pools_.size()) {
+        t_local_http_client_pool = http_client_pools_[thread_index];
+    }
+}
+
 
 // NOLINTNEXTLINE(readability-make-member-function-const)
 void aizix::App::addController(const std::vector<std::shared_ptr<aizix::HttpController>>& controllers) {
@@ -272,6 +301,9 @@ void aizix::App::setup_threading() {
             const std::string thread_name = "io-" + std::to_string(thread_index);
             ThreadUtils::set_current_thread_name(thread_name);
 
+            // 在线程启动之初，初始化 TLS
+           this->init_thread_local_pool(thread_index);
+
             // 如果探测到 CPU 核心列表不为空，并且当前线程索引没有超出核心列表的范围，则绑定该 I/O 线程到指定 CPU
             if (!all_cpu_cores_.empty() && thread_index < all_cpu_cores_.size()) {
                 // 分配 CPU 核心
@@ -340,14 +372,19 @@ void aizix::App::setup_threading() {
  */
 void aizix::App::init_services() {
     // 注入 App 自身引用，以便 Server 和 Client 获取 IO Context
-    server_ = std::make_unique<Server>(*this, config_);
+    server_ = std::make_unique<Server>(*this);
 
-    // HttpClientPool 绑定到 Main Loop 用于管理全局连接池状态
-    http_client_pool_ = std::make_shared<HttpClientPool>(*this, config_);
+    //  为每个 IO Context 创建一个独立的 HttpClientPool
+    http_client_pools_.reserve(io_context_pool_.size());
+    for (const auto& ioc : io_context_pool_) {
+        // 每个 Pool 绑定到特定的 ioc，且 config 共享
+        http_client_pools_.push_back(std::make_shared<HttpClientPool>(*ioc, config_));
+    }
+
 
     // 依赖注入链
-    http_client_ = std::make_shared<HttpClient>(http_client_pool_);
-    ws_client_ = std::make_shared<WebSocketClient>(*this, config_.client.ssl_verify);
+    http_client_ = std::make_shared<HttpClient>(*this);
+    ws_client_ = std::make_shared<WebSocketClient>(*this);
 }
 
 /**
@@ -368,13 +405,13 @@ void aizix::App::setup_signal_handling() {
 
             // 在 Main Loop 上启动停止协程
             co_spawn(get_main_ioc(), [&]() -> boost::asio::awaitable<void> {
-                // 1. 关闭入口
+                // 1. 关闭 server 入口
                 SPDLOG_INFO("Shutting down server sessions...");
                 co_await server_->stop();
 
-                // 2. 关闭出口
+                // 2. 关闭 Http Client 出口 (并行)
                 SPDLOG_INFO("Shutting down client connections...");
-                co_await http_client_pool_->stop();
+                co_await stop_client_pools();
 
                 // 3. 停止计算线程
                 SPDLOG_INFO("Stopping compute pool...");
@@ -391,6 +428,31 @@ void aizix::App::setup_signal_handling() {
             }, boost::asio::detached);
         }
     });
+}
+
+/// 并行停止所有 Client Pools
+boost::asio::awaitable<void> aizix::App::stop_client_pools() {
+    SPDLOG_INFO("Stopping {} http client pools...", http_client_pools_.size());
+
+    std::vector<boost::asio::awaitable<void>> tasks;
+    tasks.reserve(http_client_pools_.size());
+
+    // 遍历所有 Pool，dispatch 到它们各自的 IO 线程去执行 stop
+    for (size_t i = 0; i < http_client_pools_.size(); ++i) {
+        auto& pool = http_client_pools_[i];
+        auto& ioc = *io_context_pool_[i];
+
+        // 必须在 pool 所属的线程执行 stop
+        tasks.push_back(boost::asio::co_spawn(ioc, [pool]() -> boost::asio::awaitable<void> {
+            co_await pool->stop();
+        }, boost::asio::use_awaitable));
+    }
+
+    // 等待所有 Pool 停止
+    for (auto& task : tasks) {
+        co_await std::move(task);
+    }
+    SPDLOG_INFO("All http client pools stopped.");
 }
 
 /**
@@ -419,8 +481,10 @@ int aizix::App::run() {
         SPDLOG_INFO("Server started on port {}. I/O threads: {}, Worker threads: {}. Press Ctrl+C to shut down.",
                     config_.server.port, config_.server.io_threads, config_.server.worker_threads);
 
-        // 主线程 io-0 作为第一个 IO 线程
+        // 主线程 name 配置 io-0 作为第一个 IO 线程
         ThreadUtils::set_current_thread_name("io-0");
+        // 主线程也要初始化 TLS
+        this->init_thread_local_pool(0);
 
         if (!all_cpu_cores_.empty()) {
             // 主线程使用第一个核心 (index 0)

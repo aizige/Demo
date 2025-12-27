@@ -56,6 +56,8 @@ namespace aizix {
 
         // --- 核心资源访问 (Getters) ---
 
+        const AizixConfig& config() const { return config_; }
+
         /// @brief 获取 Server 实例 (用于路由配置等)
         /// @note 此函数不要设为 const (获取server可能要修改)
         // ReSharper disable once CppMemberFunctionMayBeConst
@@ -76,8 +78,8 @@ namespace aizix {
         /// 用于绑定全局单例组件（如 Service 请求分发）、监听器（Acceptor）和信号集（Signals）。
         /// 它是 io_context_pool_ 的第 0 个元素。
         boost::asio::io_context& get_main_ioc() const { return *io_context_pool_[0]; }
-
         const std::vector<std::shared_ptr<boost::asio::io_context>>& get_io_contexts() const { return io_context_pool_; }
+
 
         // 3. Worker Pool 获取
         // ReSharper disable once CppMemberFunctionMayBeConst
@@ -90,9 +92,20 @@ namespace aizix {
         // ReSharper disable once CppMemberFunctionMayBeConst
         boost::asio::any_io_executor worker_pool_executor() { return compute_ioc_.get_executor(); }
 
+
+
         // --- 客户端组件获取 ---
+        /// @brief 获取当前线程专属的 HttpClientPool。
+        /// @warning 必须在 IO 线程中调用！
+        /// @return 当前线程的 Pool 指针。如果不在 IO 线程调用，行为未定义(可能返回空)。
+        std::shared_ptr<HttpClientPool> get_local_client_pool();
+
+        /// @brief 供 setup_threading 使用的 helper，用于初始化 thread_local 变量
+        void init_thread_local_pool(size_t thread_index);
+
         std::shared_ptr<IHttpClient> httpClient() { return http_client_; }
         std::shared_ptr<WebSocketClient> webSocketClient() { return ws_client_; }
+
 
         /**
          * @brief 启动应用程序主循环
@@ -113,10 +126,14 @@ namespace aizix {
         void init_services();         // 初始化 Server 和 Client
         void setup_signal_handling(); // 优雅关机, 监听Ctrl+C
 
+        // 并行停止所有 Client Pool
+        boost::asio::awaitable<void> stop_client_pools();
+
 
         // --- 静态辅助函数 ---
         static void bind_thread_to_core(size_t core_id);
         static std::vector<std::vector<int>> get_numa_topology();
+
 
 
         // =========================================================
@@ -128,9 +145,9 @@ namespace aizix {
 
         // 2. 线程池资源 (IO 和 Compute)
 
-        // --- 网络 IO 线程池 (One Loop Per Thread) ---
+        // --- IO 线程池 (One Loop Per Thread) ---
         // 使用 shared_ptr 管理，避免 vector 扩容时的对象拷贝问题
-        std::vector<std::shared_ptr<boost::asio::io_context>> io_context_pool_; // 网络 IO 线程池 (One Loop Per Thread)
+        std::vector<std::shared_ptr<boost::asio::io_context>> io_context_pool_; // IO 线程池 (One Loop Per Thread)
         std::vector<WorkGuard> io_work_guards_;                                 // IO Work Guards (防止每个 ioc 退出)
         std::atomic<size_t> next_io_context_{0};                                //  轮询索引
 
@@ -145,7 +162,7 @@ namespace aizix {
 
         // 4. 核心服务组件 (依赖上面的 ioc)
         std::unique_ptr<Server> server_;
-        std::shared_ptr<HttpClientPool> http_client_pool_;
+        std::vector<std::shared_ptr<HttpClientPool>> http_client_pools_;  // 存储所有 IO 线程对应的 Pool 实例
         std::shared_ptr<HttpClient> http_client_;
         std::shared_ptr<WebSocketClient> ws_client_;
 

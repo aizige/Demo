@@ -15,7 +15,7 @@ namespace aizix { class App; }
 
 class WebSocketClient : public std::enable_shared_from_this<WebSocketClient> {
 public:
-    explicit WebSocketClient(aizix::App& app, bool ssl_verify);
+    explicit WebSocketClient(aizix::App& app);
 
     /**
      * @brief 异步连接到一个 WebSocket 端点。

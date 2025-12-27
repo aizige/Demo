@@ -43,9 +43,8 @@ public:
      * @brief 构造函数
      * - 初始化 SSL 上下文，并为每个 IO 线程预创建 Acceptor。
      * @param app 传入 App 引用以获取 io_context  池
-     * @param config 配置文件
      */
-    Server(aizix::App& app, const AizixConfig& config);
+    Server(aizix::App& app);
 
 
     /**

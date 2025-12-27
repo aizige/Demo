@@ -17,13 +17,15 @@
 #include <system_error>
 #include <boost/beast/core/error.hpp> // 引用 http::error
 #include <boost/asio/error.hpp>       // 引用 boost::asio::error
+
+#include "aizix/App.hpp"
 /**
  * @brief HttpClient 的构造函数。
- * @param manager 一个 ConnectionManager 的共享指针，HttpClient 将依赖它来获取和管理连接。
+ * @param app aizix::App引用
  */
-HttpClient::HttpClient(std::shared_ptr<HttpClientPool> manager)
-    : manager_(std::move(manager)),
-      max_redirects_(manager_->max_redirects) {
+HttpClient::HttpClient(aizix::App& app)
+    : app_(app),
+      max_redirects_(app.config().client.max_redirects) {
 }
 
 // 实现接口中的 get 方法
@@ -99,6 +101,13 @@ std::string HttpClient::resolve_url(const std::string& base_url, const std::stri
 boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std::string_view url, const std::string& body, const Headers& headers) {
     int redirects_left = max_redirects_;
 
+    // 获取当前线程的 Pool
+    // 因为我们需要在重定向循环中释放旧连接，或者在函数结束时释放最终连接
+    auto pool = app_.get_local_client_pool();
+    if (!pool) {
+        throw std::runtime_error("HttpClient: Must run on IO thread");
+    }
+
     try {
         // --- 状态管理：使用string_view/指针和 optional 实现“写时复制” ---
         // 将请求参数保存起来，以便在循环中修改
@@ -125,10 +134,10 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
         std::optional<InternalResponse> result_pair;
 
         // 使用 Finally guard 确保只要 result_pair 有值，连接就会被释放
-        auto connection_guard = Finally([&] {
+        [[maybe_unused]] auto connection_guard  = Finally([&] {
             if (result_pair && result_pair->second) {
                 // result_pair->second 就是连接
-                manager_->release_connection(result_pair->second);
+                pool->release_connection(result_pair->second);
             }
         });
 
@@ -176,10 +185,11 @@ boost::asio::awaitable<HttpResponse> HttpClient::execute(http::verb method, std:
             // 在重定向循环中，我们需要手动管理上一个连接的释放
             if (result_pair) {
                 // 如果这不是第一次循环，说明我们有一个来自上一次重定向的连接需要释放
-                manager_->release_connection(result_pair->second);
-                result_pair.reset(); // 清空 optional
+                pool->release_connection(result_pair->second);
+                result_pair.reset(); // 清空 optional，防止 double free
             }
 
+            // 调用 execute_internal (它会返回 connection 并不自动释放)
             result_pair.emplace(co_await execute_internal(req, target));
 
             HttpResponse& res = result_pair->first;
@@ -307,7 +317,7 @@ bool is_retryable_network_error(const std::error_code& ec) {
 
 
 /**
- * @brief [私有] 负责单次请求的执行，并包含对“陈旧连接”的自动重试逻辑。
+ * @brief 负责单次请求的执行，并包含对“陈旧连接”的自动重试逻辑。
  *
  * 此协程的核心职责是：获取一个连接，用它执行请求，并在遇到特定的、
  * 可恢复的网络错误时，自动进行有限次数的重试。
@@ -328,21 +338,31 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
     while (true) {
         std::shared_ptr<IConnection> conn;
 
+        // 动态获取当前线程的 Pool
+        // 这必须在 IO 线程中运行
+        auto pool = app_.get_local_client_pool();
+        if (!pool) {
+            throw std::runtime_error("HttpClient: Must be called from an IO thread.");
+        }
+
         try {
             // --- 成功路径 ---
-            const auto [connection, is_reused] = co_await manager_->get_connection(target.scheme, target.host, target.port);
+
+            // 1. 获取连接 (pool 是本地的，无锁)
+            const auto [connection, is_reused] = co_await pool->get_connection(target.scheme, target.host, target.port);
             conn = connection;
 
+            // 注意：get_connection 内置了创建逻辑，如果没拿到，说明没得救
             if (!conn) {
-                const std::string key = std::string(target.scheme) + "//" + std::string(target.host) + ":" + std::to_string(target.port);
-                conn = co_await manager_->create_new_connection(key, target.scheme, target.host, target.port);
-                if (!conn) { continue; }
+                throw std::runtime_error("Failed to acquire connection");
             }
 
-            auto conn_guard = Finally([this, conn = conn]() {
-                manager_->release_connection(conn);
+            // 2. RAII 归还
+            auto conn_guard = Finally([pool, conn = conn]() {
+                pool->release_connection(conn);
             });
 
+            // 3. 执行请求
             HttpResponse response = co_await conn->execute(request);
 
             conn_guard.disarm();
@@ -379,6 +399,7 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
 }
 
 
+
 /**
  * @brief 使用 ada-url 库安全、高效地解析 URL 字符串。
  *
@@ -394,7 +415,7 @@ boost::asio::awaitable<HttpClient::InternalResponse> HttpClient::execute_interna
  * @return ParsedUrl 一个包含 scheme, host, port, target 的结构体。
  * @throws std::runtime_error 如果 URL 格式无效且无法修复。
  */
-HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
+ParsedUrl HttpClient::parse_url(std::string_view url_strv) {
     // has_value()或者 if (url) 确保对象内部有有效值，是访问 ada::url_aggregator 成员（比如 is_valid）之前必须检查的第一步。
     // is_valid：在确定对象有效后，进一步判断 URL 是否满足Url有效性规则。
     // 如果未先检查 has_value()或者 if (url) 而直接调用 is_valid，当解析失败时程序可能崩溃（因为在无效的 tl::expected 上调用其成员是未定义行为）。

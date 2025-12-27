@@ -14,7 +14,6 @@
 #include <aizix/core/h2_session.hpp>
 #include <aizix/core/HttpSession.hpp>
 #include <aizix/core/HttpsSession.hpp>
-#include <aizix/utils/cert_checker.hpp>  // 证书检查工具
 
 #include <fstream>
 #include <iostream>
@@ -39,26 +38,24 @@ using namespace boost::asio::experimental::awaitable_operators;
 /**
  * @brief 构造函数 (带 IP 和端口)。
  * @param app 应用程序实例引用 (用于获取 IO Context 池)
- * @param config 配置文件
  */
-Server::Server(aizix::App& app, const AizixConfig& config)
+Server::Server(aizix::App& app)
     : app_(app), // 保存 App 引用
       work_executor_(app.worker_pool_executor()),
       ssl_context_(boost::asio::ssl::context::tlsv12_server), // 先用 io_context 构造 acceptor
-      use_ssl_(config.server.ssl->enabled),
-
-      max_request_body_size_bytes_(config.server.max_request_size_bytes),
-      http2_enabled_(config.server.http2_enabled),
-      tls_versions_(config.server.ssl->tls_versions),
+      use_ssl_(app.config().server.ssl->enabled),
+      max_request_body_size_bytes_(app.config().server.max_request_size_bytes),
+      http2_enabled_(app.config().server.http2_enabled),
+      tls_versions_(app.config().server.ssl->tls_versions),
       initial_timeout_ms_(std::chrono::seconds(10s)),
-      keep_alive_timeout(config.server.keep_alive_ms) {
+      keep_alive_timeout(app.config().server.keep_alive_ms) {
     // 1. 设置 TLS (如果启用)
-    if (config.server.ssl && config.server.ssl->enabled) {
-        set_tls(config.server.ssl->cert.value(), config.server.ssl->cert_private_key.value());
+    if (app.config().server.ssl && app.config().server.ssl->enabled) {
+        set_tls(app.config().server.ssl->cert.value(), app.config().server.ssl->cert_private_key.value());
     }
 
     // 2. 初始化所有 Acceptor (SO_REUSEPORT 核心逻辑)
-    setup_acceptor(config.server.port, config.server.ip_v4);
+    setup_acceptor(app.config().server.port, app.config().server.ip_v4);
 }
 
 /**
@@ -114,11 +111,8 @@ void Server::set_tls(const std::string& cert_file, const std::string& key_file) 
     } catch (std::exception& e) {
         use_ssl_ = false;
         SPDLOG_ERROR("开启SSL失败，已经默认使用HTTP: {}", e.what());
-        throw std::runtime_error("TLS configuration failed. Server cannot start in HTTPS mode.");
+        throw std::runtime_error("TLS 配置失败。服务器无法以 HTTPS 模式启动。");
     }
-
-    // 在启动时检查证书是否包含了所有必需的域名/IP，以进行部署验证
-    CertChecker::inspect(cert_file, {"dev.myubuntu.com", "192.168.1.176"});
 }
 
 /**
@@ -138,7 +132,7 @@ void Server::run() {
         // 传递 ctx 指针
         boost::asio::co_spawn(ioc, listener(acceptor, ctx), boost::asio::detached);
     }
-    SPDLOG_INFO("Server running with SO_REUSEPORT on {} threads.", acceptors_.size());
+    SPDLOG_INFO("服务器在 {} 个 IO 线程上运行，并启用了 SO_REUSEPORT。", acceptors_.size());
 }
 
 
@@ -157,14 +151,14 @@ boost::asio::awaitable<void> Server::stop() {
     is_stopping_ = true;
 
     // 2. 立即关闭所有 Acceptor，即刻停止接受新连接，防止在关闭过程中有新会话建立。
-    SPDLOG_INFO("Stopping {} acceptors...", acceptors_.size());
+    SPDLOG_INFO("停止 {} acceptors...", acceptors_.size());
     for (auto& acceptor : acceptors_) {
         if (acceptor.is_open()) {
             boost::system::error_code ec;
             acceptor.close(ec); // 忽略错误
         }
     }
-    SPDLOG_INFO("Server stopped accepting new connections.");
+    SPDLOG_INFO("Server 已停止接受新连接");
 
     // 3. 准备收集所有线程的关闭任务
     const auto& io_contexts = app_.get_io_contexts();
@@ -204,7 +198,7 @@ boost::asio::awaitable<void> Server::stop() {
 
             // 如果有活跃的 H2 会话，启动并行关闭流程
             if (!h2_alive.empty()) {
-                SPDLOG_INFO("Thread-{} shutting down {} H2 sessions...", i, h2_alive.size());
+                SPDLOG_INFO("IO 线程 {} 正在关闭 {} 个 H2 session...", i, h2_alive.size());
 
                 auto ex = co_await boost::asio::this_coro::executor;
 
@@ -220,7 +214,7 @@ boost::asio::awaitable<void> Server::stop() {
                                  // 计数器 +1
                                  ++ctx->active_coroutine_count;
                                  // 计数器 -1 (无论如何都会执行)
-                                 auto _ = Finally([ctx] { --ctx->active_coroutine_count; });
+                                 [[maybe_unused]] auto guard = Finally([ctx] { --ctx->active_coroutine_count; });
 
                                  // 尝试优雅关闭
                                  // 我们给优雅关闭本身加一个超时，而不是在外部加总超时
@@ -233,11 +227,11 @@ boost::asio::awaitable<void> Server::stop() {
                                      const auto res = co_await (session->graceful_shutdown() || self_timer.async_wait(boost::asio::use_awaitable));
                                      if (res.index() == 1) session->stop(); // 自身超时，强制关闭
                                  } catch (const std::exception& e) {
-                                     SPDLOG_DEBUG("Thread-{} H2 shutdown error: {}", i, e.what());
+                                     SPDLOG_DEBUG("IO 线程 {} 关闭 H2 session 发生错误: {}", i, e.what());
                                      // 如果优雅关闭失败，强制关闭
                                      session->stop();
                                  } catch (...) {
-                                     SPDLOG_ERROR("Thread-{} H2 shutdown unknown error.", i);
+                                     SPDLOG_ERROR("IO 线程 {} 关闭 H2 session 发生未知错误...", i);
                                      session->stop();
                                  }
                                  // 无论成功失败，发送完成信号
@@ -258,7 +252,7 @@ boost::asio::awaitable<void> Server::stop() {
             // 即使收到了所有信号，detached 协程的栈帧可能还没完全释放。
             // 必须轮询计数器直到归零。如果这里直接返回，io_context 销毁会导致 Use-After-Free 崩溃。
             if (ctx->active_coroutine_count > 0) {
-                SPDLOG_DEBUG("Thread-{} waiting for {} coroutines to die...", i, ctx->active_coroutine_count);
+                SPDLOG_DEBUG("IO 线程 {} 正在等待 {} 个协程终止……", i, ctx->active_coroutine_count);
                 boost::asio::steady_timer flush_timer(co_await boost::asio::this_coro::executor);
                 while (ctx->active_coroutine_count > 0) {
                     // 短轮询，等待栈展开完成
@@ -266,7 +260,7 @@ boost::asio::awaitable<void> Server::stop() {
                     co_await flush_timer.async_wait(boost::asio::use_awaitable);
                 }
             }
-            SPDLOG_DEBUG("Thread-{} clean exit.", i);
+            SPDLOG_DEBUG("IO 线程 {} 退场...", i);
         }, boost::asio::use_awaitable);
 
         stop_tasks.push_back(std::move(task));
@@ -277,7 +271,7 @@ boost::asio::awaitable<void> Server::stop() {
         co_await std::move(task);
     }
 
-    SPDLOG_INFO("All sessions stopped gracefully across all threads.");
+    SPDLOG_INFO("所有 IO 线程中的所有连接均正常停止。");
 }
 
 
@@ -314,11 +308,11 @@ boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& ac
             // 接受失败，记录日志并继续等待下一个连接
             if (ec) {
                 if (ec == boost::asio::error::operation_aborted) {
-                    SPDLOG_INFO("Listener stopped (acceptor closed).");
+                    SPDLOG_INFO("Listener 函数停止 (acceptor closed)");
                     co_return;
                 }
 
-                SPDLOG_WARN("Accept failed: {}", ec.message());
+                SPDLOG_WARN("与客户端建立新的连接失败: {}", ec.message());
 
                 if (ec == boost::asio::error::no_descriptors ||
                     ec == boost::asio::error::no_buffer_space ||
@@ -341,7 +335,7 @@ boost::asio::awaitable<void> Server::listener(boost::asio::ip::tcp::acceptor& ac
             );
         } catch (const std::exception& e) {
             // 捕获异常后只打印日志，循环继续执行，确保服务器继续监听
-            SPDLOG_ERROR("Exception in listener loop iteration: {}", e.what());
+            SPDLOG_ERROR("Server 监听循环迭代中发生异常: {}", e.what());
         }
     }
 }
@@ -356,7 +350,7 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
         // 这会阻止 Server::stop() 提前退出，防止崩溃
         ++ctx->active_coroutine_count; // 计数器 +1
         // 使用 finally 确保协程退出时计数器 -1
-        auto _ = Finally([ctx] { --ctx->active_coroutine_count; });
+        [[maybe_unused]] auto guard = Finally([ctx] { --ctx->active_coroutine_count; });
 
         // 早期检查：如果正在停止，直接退出，不要进行握手
         if (is_stopping_) co_return;
@@ -365,7 +359,7 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
         boost::system::error_code ec;
         socket.set_option(boost::asio::ip::tcp::no_delay(true), ec);
         if (ec) {
-            SPDLOG_WARN("Failed to set TCP_NODELAY: {}", ec.message());
+            SPDLOG_WARN("性能优化, 设置 TCP_NODELAY 失败: {}", ec.message());
         }
 
         // SPDLOG_INFO("Handle connection start. Socket open: {}", socket.is_open());
@@ -421,7 +415,7 @@ boost::asio::awaitable<void> Server::handle_connection(boost::asio::ip::tcp::soc
             // 在原始 socket 上发送明文响应
             // 我们需要忽略写操作的错误，因为对方可能已经不等响应就关闭了连接
             co_await http::async_write(sock, resp, boost::asio::as_tuple(boost::asio::use_awaitable));
-            SPDLOG_ERROR("TLS handshake failed (likely HTTP request on HTTPS port) from {}: {}", tls_stream->next_layer().remote_endpoint().address().to_string(), ec.message());
+            SPDLOG_ERROR("TLS 握手失败（可能是 HTTP 请求在 HTTPS 端口上发起），来自 {}: {}", tls_stream->next_layer().remote_endpoint().address().to_string(), ec.message());
             // 无论如何都关闭连接
             sock.close();
             co_return; // 握手失败，放弃此连接

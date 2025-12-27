@@ -12,7 +12,7 @@
 #include <aizix/App.hpp>
 
 
-WebSocketClient::WebSocketClient(aizix::App& app, const bool ssl_verify)
+WebSocketClient::WebSocketClient(aizix::App& app)
     : app_(app),
       main_ioc_(app.get_main_ioc()), // Resolver 绑定在 Main Context
       // 初始化一个专门用于 WebSocket 的 ssl::context
@@ -27,7 +27,7 @@ WebSocketClient::WebSocketClient(aizix::App& app, const bool ssl_verify)
     }
 
     ssl_ctx_.set_default_verify_paths();
-    ssl_ctx_.set_verify_mode(ssl_verify ? boost::asio::ssl::verify_peer : boost::asio::ssl::verify_none);
+    ssl_ctx_.set_verify_mode(app_.config().client.ssl_verify ? boost::asio::ssl::verify_peer : boost::asio::ssl::verify_none);
 }
 
 std::string base64_encode(const unsigned char* input, const int length) {

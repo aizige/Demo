@@ -156,7 +156,7 @@ boost::asio::awaitable<void> Http2Session::writer_loop() {
             if (write_in_progress_) continue; // 防止重入
             write_in_progress_ = true;
             // 使用互斥标志和 RAII guard 确保同一时间只有一个 do_write 循环在运行。确保在协程退出时（无论是正常还是异常）都能重置标志位
-            auto _ = Finally([this] { write_in_progress_ = false; });
+           [[maybe_unused]]  auto guard = Finally([this] { write_in_progress_ = false; });
 
             // 清空队列 循环
             // 一旦被唤醒，就持续写，直到 nghttp2 的发送缓冲区被清空。
