@@ -14,8 +14,8 @@ port = 8080
 ip_v4 = "0.0.0.0"
 http2_enabled = true                                         # 是否开启HTTP2
 io_thread_ratio = 0.4
-io_threads = 0
-worker_threads = 0
+io_threads = 5
+worker_threads = 2
 keep_alive_ms = 180000
 max_request_size_kb = 1024
 
